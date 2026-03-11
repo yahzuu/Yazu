@@ -46,10 +46,10 @@ local BX_MiscGrp  = Tabs.BXBRG:AddLeftGroupbox('Misc')
 BX_PizzaGrp:AddDropdown('BX_MoveMode', {
     Text    = 'Movement Mode',
     Default = 1,
-    Values  = { 'Tween (Safe)', 'Teleport', 'Underground' },
+    Values  = { 'Tween (Safe)', 'Teleport', 'Desync TP', 'Underground' },
 })
 -- Tooltip hint shown as a label
-BX_PizzaGrp:AddLabel('Safe=slow tween | TP=instant | UG=go underground')
+BX_PizzaGrp:AddLabel('Safe=tween | TP=instant | Desync=server blind | UG=underground')
 
 BX_PizzaGrp:AddSlider('BX_TweenSpeed', {
     Text     = 'Tween Speed (studs/s)',
@@ -165,17 +165,34 @@ Players.PlayerAdded:Connect(_bxUpdatePlayerDropdowns)
 Players.PlayerRemoving:Connect(function() task.defer(_bxUpdatePlayerDropdowns) end)
 
 -- ================================================================
---  MOVEMENT HELPER
---  Three modes selectable from the UI:
---   • Tween (Safe)  — smooth tween at configurable studs/s
---   • Teleport      — instant SetPrimaryPartCFrame
---   • Underground   — dips to Y=-500 then surfaces at target
---                     (avoids map-level visibility/speed sensors)
+--  HELPERS
 -- ================================================================
 local function _isDelivering()
     return Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value
 end
 
+-- Zero out all physics velocities on the character to stop flinging
+local function _killVelocity()
+    local char = LocalPlayer.Character; if not char then return end
+    for _, part in next, char:GetDescendants() do
+        if part:IsA('BasePart') then
+            part.AssemblyLinearVelocity  = Vector3.zero
+            part.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+end
+
+-- ================================================================
+--  MOVEMENT MODES
+--
+--  Tween (Safe)   — smooth tween at configurable studs/s
+--  Teleport       — instant TP, kills velocity after to stop fling
+--  Desync TP      — anchors root client-side before teleporting so
+--                   the server never sees you move (server position
+--                   stays frozen at last replicated pos). Best for
+--                   avoiding detection. Unanchors after interact.
+--  Underground    — dips to Y=-500 then surfaces at target
+-- ================================================================
 local function _moveToPos(targetPos)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
@@ -185,22 +202,35 @@ local function _moveToPos(targetPos)
     local speed = Options.BX_TweenSpeed and Options.BX_TweenSpeed.Value or 55
 
     if mode == 'Teleport' then
-        -- ── Instant teleport ──────────────────────────────────
         char:SetPrimaryPartCFrame(CFrame.new(targetPos))
-        task.wait(0.15)
+        task.wait(0.05)
+        _killVelocity()
+        task.wait(0.1)
+
+    elseif mode == 'Desync TP' then
+        -- Anchor client-side only. In Roblox, Anchored=true set by
+        -- a client exploit does NOT replicate to the server — so the
+        -- server keeps your character frozen at its last known pos.
+        -- Your client then teleports freely without server knowing.
+        root.Anchored = true
+        task.wait(0.05)
+        char:SetPrimaryPartCFrame(CFrame.new(targetPos))
+        task.wait(0.05)
+        _killVelocity()
+        -- NOTE: root stays Anchored until after interaction (see delivery loop)
+        -- so the server never sees movement during the delivery.
+        -- Caller must unanchor after interact.
 
     elseif mode == 'Underground' then
-        -- ── Go underground then surface at destination ─────────
-        -- Useful to bypass above-ground distance/speed detection
         char:SetPrimaryPartCFrame(CFrame.new(Vector3.new(targetPos.X, -500, targetPos.Z)))
         task.wait(0.05)
         char:SetPrimaryPartCFrame(CFrame.new(targetPos))
-        task.wait(0.15)
+        task.wait(0.05)
+        _killVelocity()
+        task.wait(0.1)
 
     else
-        -- ── Tween (Safe) ─────────────────────────────────────
-        -- Smooth movement that mimics moped-like travel speed.
-        -- Default 55 studs/s ≈ plausible moped speed.
+        -- Tween (Safe): smooth movement at moped-like speed
         local dist = (root.Position - targetPos).Magnitude
         if dist < 3 then return end
 
@@ -211,22 +241,26 @@ local function _moveToPos(targetPos)
                 LocalPlayer.Character:SetPrimaryPartCFrame(cfVal.Value)
             end
         end)
-
         local tw = TweenService:Create(
             cfVal,
             TweenInfo.new(dist / speed, Enum.EasingStyle.Linear),
             { Value = CFrame.new(targetPos) }
         )
         tw:Play()
-
         local done = false
         tw.Completed:Connect(function() done = true end)
-        repeat task.wait(0.05)
-        until done or not _isDelivering()
+        repeat task.wait(0.05) until done or not _isDelivering()
+        tw:Cancel(); conn:Disconnect(); cfVal:Destroy()
+    end
+end
 
-        tw:Cancel()
-        conn:Disconnect()
-        cfVal:Destroy()
+-- Unanchor helper used after desync interact
+local function _desyncEnd()
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if root then
+        root.Anchored = false
+        _killVelocity()
     end
 end
 
@@ -236,87 +270,125 @@ end
 local BOX_TAG = 'PizzaPlanetDeliveryCustomer'
 
 local function _getDeliveryRemote()
-    -- Path confirmed from decompiled source:
-    -- ReplicatedStorage.Modules.DataService.[id].[id]
     local ok, ds = pcall(function()
         return _RepStore:WaitForChild('Modules', 10):WaitForChild('DataService', 10)
     end)
-    if not ok or not ds then
-        Library:Notify('[Pizza] Could not find DataService!'); return nil
-    end
+    if not ok or not ds then Library:Notify('[Pizza] DataService not found!'); return nil end
     local child = ds:GetChildren()[1]
-    if not child then
-        Library:Notify('[Pizza] DataService has no children!'); return nil
-    end
+    if not child then Library:Notify('[Pizza] DataService empty!'); return nil end
     local remote = child:FindFirstChild(child.Name)
-    if not remote then
-        Library:Notify('[Pizza] Remote not found inside DataService child!'); return nil
-    end
+    if not remote then Library:Notify('[Pizza] Remote missing!'); return nil end
     return remote
 end
 
 local function _getConveyorBox()
-    -- Path: workspace.Environment.Locations.City.PizzaPlanet.Interior.Conveyor.MovingBoxes
-    local env = workspace:FindFirstChild('Environment'); if not env then return nil end
-    local loc = env:FindFirstChild('Locations');         if not loc then return nil end
-    local city = loc:FindFirstChild('City');             if not city then return nil end
-    local pp   = city:FindFirstChild('PizzaPlanet');     if not pp then return nil end
-    local int  = pp:FindFirstChild('Interior');          if not int then return nil end
-    local conv = int:FindFirstChild('Conveyor');         if not conv then return nil end
-    local mb   = conv:FindFirstChild('MovingBoxes');     if not mb then return nil end
+    local env  = workspace:FindFirstChild('Environment');                         if not env  then return nil end
+    local loc  = env:FindFirstChild('Locations');                                 if not loc  then return nil end
+    local city = loc:FindFirstChild('City');                                      if not city then return nil end
+    local pp   = city:FindFirstChild('PizzaPlanet');                              if not pp   then return nil end
+    local int_ = pp:FindFirstChild('Interior');                                   if not int_ then return nil end
+    local conv = int_:FindFirstChild('Conveyor');                                 if not conv then return nil end
+    local mb   = conv:FindFirstChild('MovingBoxes');                              if not mb   then return nil end
     return mb:FindFirstChildWhichIsA('UnionOperation')
 end
 
-local function _findCustomer()
-    -- Method 1: CollectionService tag (primary)
-    local tagged = _CollSvc:GetTagged(BOX_TAG)
-    if #tagged > 0 then return tagged[1] end
+-- Find the customer that belongs to THIS box delivery.
+-- TakePizzaBox returns (_, customerTargetPos) — a Vector3 the
+-- customer is walking toward. We find the tagged customer whose
+-- HumanoidRootPart is closest to that target position.
+-- Falls back to any tagged customer if no target pos given.
+local function _findCustomerForBox(customerTargetPos)
+    local allCustomers = {}
 
-    -- Method 2: workspace._game.SpawnedCharacters (found in decompiled source)
+    -- Collect from CollectionService tag
+    for _, c in next, _CollSvc:GetTagged(BOX_TAG) do
+        table.insert(allCustomers, c)
+    end
+
+    -- Collect from workspace._game.SpawnedCharacters (decompile source)
     local game_  = workspace:FindFirstChild('_game')
     local spawns = game_ and game_:FindFirstChild('SpawnedCharacters')
     if spawns then
-        local c = spawns:FindFirstChild('PizzaPlanetDeliveryCustomer')
-        if c then return c end
-        -- Also check any model tagged with the name
         for _, v in next, spawns:GetChildren() do
-            if v.Name:find('PizzaPlanet') then return v end
+            if v.Name:find('PizzaPlanet') then
+                -- avoid duplicates
+                local found = false
+                for _, already in next, allCustomers do
+                    if already == v then found = true; break end
+                end
+                if not found then table.insert(allCustomers, v) end
+            end
         end
     end
 
-    return nil
+    if #allCustomers == 0 then return nil end
+
+    -- If we have the target position the server gave us, pick the
+    -- customer closest to it (this is the one assigned to our box)
+    if customerTargetPos and typeof(customerTargetPos) == 'Vector3' then
+        local best, bd = nil, math.huge
+        for _, c in next, allCustomers do
+            local hrp = c:FindFirstChild('HumanoidRootPart') or c.PrimaryPart
+            if hrp then
+                local d = (hrp.Position - customerTargetPos).Magnitude
+                if d < bd then bd, best = d, c end
+            end
+        end
+        return best
+    end
+
+    -- Fallback: return first one
+    return allCustomers[1]
 end
 
--- ── UsePizzaMoped — the key ShiftLoop bypass ──────────────────
--- The game's ShiftLoop (client-side) kicks you if:
---   sqrMag(AreaBlock.Position - root.Position) > 1225 (35 studs)
---   AND v_u_10 (moped) is nil or not in workspace
--- Invoking UsePizzaMoped registers v_u_10 = the spawned vehicle.
--- Since the vehicle is parented to your character it travels with
--- you, so sqrMag(moped.pos - root.pos) ≈ 0 — always passes.
+-- ── UsePizzaMoped — ShiftLoop bypass ─────────────────────────
+-- ShiftLoop kicks you if sqrMag(AreaBlock - root) > 1225 (35 studs)
+-- AND v_u_10 (moped vehicle) is nil/not in workspace.
+-- Calling UsePizzaMoped spawns the moped on our character.
+-- sqrMag(moped.pos - root.pos) ≈ 0 always → ShiftLoop always passes.
+local _activeMoped = nil
 local function _spawnMopedBypass(remote)
     local ok, result = pcall(function()
         return remote:InvokeServer({ Type = 'UsePizzaMoped' })
     end)
-    if ok then
-        Library:Notify('[Pizza] Moped spawned — ShiftLoop bypass active')
+    if ok and result then
+        _activeMoped = result
+        Library:Notify('[Pizza] Moped active — ShiftLoop bypass on')
     else
-        Library:Notify('[Pizza] Moped spawn failed (may still work)')
+        -- Also try finding it on character
+        local char = LocalPlayer.Character
+        _activeMoped = char and char:FindFirstChild('Vehicle_Delivery Moped')
+        if _activeMoped then
+            Library:Notify('[Pizza] Moped found on character')
+        else
+            Library:Notify('[Pizza] Moped spawn uncertain — delivery may still work')
+        end
     end
-    return ok and result
+    return _activeMoped
 end
 
--- Main delivery loop
+-- Detach moped before teleporting to prevent physics fling.
+-- Server still thinks it exists (it's just reparented client-side).
+local function _detachMoped()
+    local char = LocalPlayer.Character; if not char then return end
+    local moped = char:FindFirstChild('Vehicle_Delivery Moped')
+    if moped then
+        moped.Parent = workspace  -- move out of character, kills weld
+        task.delay(2, function()
+            -- quietly clean up
+            pcall(function() moped:Destroy() end)
+        end)
+    end
+end
+
+-- ── Main delivery loop ────────────────────────────────────────
 _fnDelivery = function(toggle)
     if not toggle then return end
 
     local remote = _getDeliveryRemote()
     if not remote then return end
 
-    -- Spawn the moped FIRST — this is what prevents the speed-kick.
-    -- The ShiftLoop checks if the moped is in workspace near us,
-    -- which it always will be once spawned on the character.
-    Library:Notify('[Pizza] Starting — spawning moped for ShiftLoop bypass…')
+    Library:Notify('[Pizza] Starting — setting up moped bypass…')
     _spawnMopedBypass(remote)
     task.wait(1.5)
 
@@ -328,112 +400,161 @@ _fnDelivery = function(toggle)
         local char = LocalPlayer.Character
         if not char then task.wait(1); continue end
 
-        -- ── 1. Get a box off the conveyor ──────────────────────
+        -- ── 1. Wait for a box on the conveyor ─────────────────
         local box = _getConveyorBox()
-        if not box then task.wait(0.5); continue end
+        if not box then task.wait(0.4); continue end
 
-        -- Move to box
-        _moveToPos(box.Position + Vector3.new(0, 3, 0))
+        -- Move to box pickup position
+        local pickupPos = box.Position + Vector3.new(0, 3, 0)
+        _moveToPos(pickupPos)
+
+        -- If Desync mode, unanchor for the pickup keypress then re-anchor
+        local mode = Options.BX_MoveMode and Options.BX_MoveMode.Value or 'Tween (Safe)'
+        if mode == 'Desync TP' then _desyncEnd() end
+
         if not _isDelivering() then break end
 
-        -- Pick up box via proper remote call
-        -- InvokeServer returns: (_, customerTargetPosition)
-        -- This is what the game's own client code uses (from decompile)
-        local gotBox = false
+        -- Snap character directly onto the box for reliable E-press
+        char = LocalPlayer.Character
+        if char then
+            char:SetPrimaryPartCFrame(CFrame.new(box.Position + Vector3.new(0, 3, 0)))
+        end
+        task.wait(0.05)
+
+        -- ── 2. Pick up the box ─────────────────────────────────
+        -- Primary method: InvokeServer({ Type='TakePizzaBox' })
+        -- Returns (_, customerTargetPos) per decompiled game source
+        local gotBox          = false
         local customerTargetPos = nil
 
-        local ok1, r1 = pcall(function()
-            return remote:InvokeServer({ Type = 'TakePizzaBox', Box = box })
+        local ok1, r1, r2 = pcall(function()
+            -- The game returns two values: status, customer_target_pos
+            local a, b = remote:InvokeServer({ Type = 'TakePizzaBox', Box = box })
+            return a, b
         end)
         if ok1 then
-            -- r1 may be the customer target position the server returns
-            if typeof(r1) == 'Vector3' then customerTargetPos = r1 end
-            task.wait(0.2)
+            -- r2 is the customer target Vector3 if the server returned it
+            if typeof(r2) == 'Vector3' then
+                customerTargetPos = r2
+            elseif typeof(r1) == 'Vector3' then
+                customerTargetPos = r1
+            end
+            task.wait(0.15)
             char = LocalPlayer.Character
             gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
         end
 
-        -- Fallback: keypress if InvokeServer didn't give us the box
+        -- Fallback: keypress E (0x45)
         if not gotBox then
             keypress(0x45); task.wait(0.1); keyrelease(0x45)
-            task.wait(0.2)
+            task.wait(0.25)
             char = LocalPlayer.Character
             gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
         end
 
         if not gotBox then
+            Library:Notify('[Pizza] Failed to grab box, retrying…')
             task.wait(0.5); continue
         end
 
-        Library:Notify('[Pizza] Box picked up! Searching for customer…')
+        Library:Notify('[Pizza] Box in hand! Locating correct customer…')
 
-        -- ── 2. Find the delivery customer ──────────────────────
+        -- ── 3. Find the specific customer for this box ─────────
+        -- Poll a few times — customer may not spawn immediately
         local customer = nil
-        for attempt = 1, 35 do
-            task.wait(0.25)
-            customer = _findCustomer()
+        for _ = 1, 30 do
+            task.wait(0.3)
+            customer = _findCustomerForBox(customerTargetPos)
             if customer then break end
         end
 
         if not customer then
-            Library:Notify('[Pizza] No customer found — skipping this delivery')
+            Library:Notify('[Pizza] No customer found — dropping and retrying')
+            -- Drop the box (can't deliver to nobody)
+            keypress(0x47); task.wait(0.1); keyrelease(0x47)  -- G key drop
             task.wait(1); continue
         end
 
-        local customerHRP = customer:FindFirstChild('HumanoidRootPart')
-                         or customer:FindFirstChild('PrimaryPart')
-                         or customer.PrimaryPart
+        local customerHRP = customer:FindFirstChild('HumanoidRootPart') or customer.PrimaryPart
         if not customerHRP then task.wait(0.5); continue end
 
-        -- ── 3. Move to customer ────────────────────────────────
-        Library:Notify('[Pizza] Moving to customer…')
-        local deliverPos = customerHRP.Position + Vector3.new(0, 3, 2)
-        _moveToPos(deliverPos)
-        if not _isDelivering() then break end
+        Library:Notify('[Pizza] Found customer — moving to deliver…')
 
-        -- ── 4. Deliver pizza via proper FireServer call ─────────
-        -- From decompiled source: FireServer({ Type='DeliverPizza', Customer=customer })
-        -- The server validates the Customer instance reference,
-        -- so we must pass the actual model, not just a position.
-        local delivered = false
-
-        local ok2 = pcall(function()
-            remote:FireServer({ Type = 'DeliverPizza', Customer = customer })
-            delivered = true
-        end)
-
-        -- Fallback: keypress
-        if not ok2 or not delivered then
-            keypress(0x45); task.wait(0.1); keyrelease(0x45)
+        -- ── 4. Move to customer ────────────────────────────────
+        -- For Teleport/Desync: detach the moped FIRST to prevent fling.
+        -- We'll respawn it after delivery.
+        if mode == 'Teleport' or mode == 'Desync TP' or mode == 'Underground' then
+            _detachMoped()
+            task.wait(0.1)
         end
 
-        Library:Notify('[Pizza] Delivered! Waiting for confirmation…')
+        -- Move right next to the customer (within 4 studs for interaction)
+        local deliverPos = customerHRP.Position + Vector3.new(0, 2, 3)
+        _moveToPos(deliverPos)
+        if not _isDelivering() then
+            if mode == 'Desync TP' then _desyncEnd() end
+            break
+        end
 
-        -- ── 5. Wait for box to leave inventory ─────────────────
+        -- Fine-adjust: snap directly in front of customer for E press
+        char = LocalPlayer.Character
+        if char then
+            char:SetPrimaryPartCFrame(
+                CFrame.new(customerHRP.Position + Vector3.new(0, 2, 3),
+                           customerHRP.Position)
+            )
+        end
+        task.wait(0.05)
+
+        -- ── 5. Deliver via keypress E ──────────────────────────
+        -- The game's proximity interaction fires when you're close enough
+        -- and press E. This is the most reliable delivery method.
+        -- We also fire the remote as a backup in the same frame.
+        keypress(0x45)
+        task.wait(0.05)
+
+        -- Backup remote call simultaneously
+        pcall(function()
+            remote:FireServer({ Type = 'DeliverPizza', Customer = customer })
+        end)
+
+        task.wait(0.1)
+        keyrelease(0x45)
+
+        -- ── 6. If desync mode, unanchor now ─────────────────────
+        if mode == 'Desync TP' then
+            _desyncEnd()
+        end
+
+        Library:Notify('[Pizza] Delivered! Waiting for box to clear…')
+
+        -- ── 7. Wait for pizza box to leave inventory ───────────
         local timeout = 0
         repeat
             task.wait(0.2); timeout = timeout + 0.2
             char = LocalPlayer.Character
-        until not (char and char:FindFirstChild('Pizza Box')) or timeout >= 12
+        until not (char and char:FindFirstChild('Pizza Box')) or timeout >= 10
 
-        -- Re-spawn moped periodically (it can despawn after ~30s of use)
-        -- Keeps ShiftLoop bypass active across multiple deliveries
         if timeout >= 10 then
-            -- Box didn't clear — something went wrong, retry
-            Library:Notify('[Pizza] Box not cleared, retrying…')
+            Library:Notify('[Pizza] Box stuck — did not clear. Retrying next loop.')
         end
 
-        -- Refresh moped every ~5 deliveries to prevent it despawning
-        -- (the game auto-removes it after 30s idle per the decompile)
-        task.spawn(function()
-            task.wait(0.5)
-            if _isDelivering() then
-                pcall(function() remote:InvokeServer({ Type = 'UsePizzaMoped' }) end)
-            end
-        end)
+        -- ── 8. Respawn moped for ShiftLoop bypass next round ───
+        task.wait(0.3)
+        if _isDelivering() then
+            pcall(function()
+                _activeMoped = nil
+                _spawnMopedBypass(remote)
+            end)
+        end
 
         task.wait(0.3)
     end
+
+    -- Clean up on stop
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if root then root.Anchored = false end
 
     Library:Notify('[Pizza Delivery] Stopped.')
 end
