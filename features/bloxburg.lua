@@ -18,6 +18,7 @@ local LocalPlayer  = Services.LocalPlayer
 local _HttpSvc     = Services.HttpService
 local _RepStore    = Services.ReplicatedStorage
 local _CollSvc     = Services.CollectionService
+local VIM = game:GetService("VirtualInputManager")
 
 local _bxFW, _bxNet
 local _bxReady = false
@@ -350,37 +351,26 @@ end
 --  GRAB BOX — E keypress via fireproximityprompt
 --  Moves next to the box, then fires the ProximityPrompt (same as pressing E)
 -- ================================================================
+-- ================================================================
+--  GRAB BOX — VIM 'E' Keypress
+-- ================================================================
 local function _grabBox(box)
     local char = LocalPlayer.Character
     if not char then return false end
 
-    -- Find the ProximityPrompt on or inside the box
-    local prompt = box:FindFirstChildWhichIsA('ProximityPrompt', true)
-    if not prompt then
-        dbg('GRAB', 'No ProximityPrompt found on box — searching conveyor parent…')
-        -- Fallback: check parent conveyor container
-        local parent = box.Parent
-        if parent then
-            prompt = parent:FindFirstChildWhichIsA('ProximityPrompt', true)
-        end
-    end
-
-    if not prompt then
-        dbg('GRAB', 'FAILED — no ProximityPrompt anywhere near box')
-        return false
-    end
-
-    dbg('GRAB', 'Found prompt: ' .. prompt:GetFullName())
-
-    -- Snap close to the box so the prompt range is satisfied
+    -- Snap close to the box
     local snapPos = Vector3.new(box.Position.X, box.Position.Y + 3, box.Position.Z)
     char:SetPrimaryPartCFrame(CFrame.new(snapPos))
     _killVelocity()
-    task.wait(0.15)
+    
+    -- Wait a moment for Bloxburg's local script to register you are near the box
+    task.wait(0.2)
 
-    -- Fire the E keypress
-    dbg('GRAB', 'fireproximityprompt → ' .. prompt:GetFullName())
-    fireproximityprompt(prompt)
+    -- Simulate pressing and releasing 'E'
+    dbg('GRAB', 'Simulating E keypress via VIM')
+    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+    task.wait(0.1)
+    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
 
     -- Wait for server to put box in inventory
     task.wait(0.5)
@@ -389,33 +379,17 @@ local function _grabBox(box)
     local gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
     dbg('GRAB', 'Pizza Box in inventory: ' .. tostring(gotBox))
 
-    if char then
-        local names = {}
-        for _, c in next, char:GetChildren() do table.insert(names, c.Name) end
-        dbg('GRAB', 'Char children: ' .. table.concat(names, ', '))
-    end
-
     return gotBox
 end
 
 -- ================================================================
---  DELIVER PIZZA — E keypress via fireproximityprompt
---  Moves next to the customer, then fires the ProximityPrompt (same as pressing E)
+--  DELIVER PIZZA — VIM 'E' Keypress
 -- ================================================================
 local function _deliverPizza(customer, customerHRP)
     local char = LocalPlayer.Character
     if not char then return false end
 
-    -- Find the ProximityPrompt on the customer NPC
-    local prompt = customer:FindFirstChildWhichIsA('ProximityPrompt', true)
-    if not prompt then
-        dbg('DELIVER', 'No ProximityPrompt found on customer')
-        return false
-    end
-
-    dbg('DELIVER', 'Found prompt: ' .. prompt:GetFullName())
-
-    -- Snap close to the customer so the prompt range is satisfied
+    -- Snap close to the customer
     local snapPos = Vector3.new(
         customerHRP.Position.X,
         customerHRP.Position.Y + 3,
@@ -423,11 +397,15 @@ local function _deliverPizza(customer, customerHRP)
     )
     char:SetPrimaryPartCFrame(CFrame.new(snapPos))
     _killVelocity()
-    task.wait(0.15)
+    
+    -- Wait a moment for Bloxburg's prompt to pop up
+    task.wait(0.2)
 
-    -- Fire the E keypress
-    dbg('DELIVER', 'fireproximityprompt → ' .. prompt:GetFullName())
-    fireproximityprompt(prompt)
+    -- Simulate pressing and releasing 'E'
+    dbg('DELIVER', 'Simulating E keypress via VIM')
+    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+    task.wait(0.1)
+    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
 
     return true
 end
