@@ -1,12 +1,13 @@
 -- ================================================================
---  features/bloxburg.lua  [FIXED — based on Hydroxide sniff]
+--  features/bloxburg.lua  [FIXED — keypress E via fireproximityprompt]
 --
---  Key fixes from remote spy:
---   1. Pickup  payload: { Item = box }        via fw.net:FireServer()
---   2. Delivery payload: { Customer = npc }   via fw.net:FireServer()
---   3. NO Type field in either payload
---   4. Framework upvalue index is 4 (confirmed)
---   5. Customer lives at workspace._game.SpawnedCharacters.PizzaPlanetDeliveryCustomer
+--  Changes from previous version:
+--   1. _grabBox     — uses fireproximityprompt (E keypress) on conveyor box
+--   2. _deliverPizza — uses fireproximityprompt (E keypress) on customer
+--   3. Removed all FireServer remote payload logic for grab/deliver
+--   4. Removed broken FireServer hook (was causing missing argument errors)
+--   5. snapPos args removed from loop call sites
+--   5. Framework upvalue index is 4 (confirmed)
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
@@ -218,7 +219,6 @@ local function _hasMoped()
 end
 
 -- Spawn moped via fw.net:FireServer({ Type = 'UsePizzaMoped' })
--- This one keeps its Type field — it's a framework system call, not a game interaction.
 local function _spawnMoped(timeout)
     timeout = timeout or 6
     if _hasMoped() then return true end
@@ -320,7 +320,6 @@ end
 
 -- ================================================================
 --  CUSTOMER — lives at workspace._game.SpawnedCharacters.PizzaPlanetDeliveryCustomer
---  There may be multiple (numbered suffix) so we grab the first available.
 -- ================================================================
 local function _getCustomer()
     local spawns = workspace:FindFirstChild('_game')
@@ -330,7 +329,6 @@ local function _getCustomer()
         return nil
     end
 
-    -- Try exact name first, then numbered variants
     local customer = spawns:FindFirstChild('PizzaPlanetDeliveryCustomer')
     if not customer then
         for _, v in next, spawns:GetChildren() do
@@ -349,34 +347,88 @@ local function _getCustomer()
 end
 
 -- ================================================================
---  GRAB BOX  — keypress approach via fireproximityprompt
+--  GRAB BOX — E keypress via fireproximityprompt
+--  Moves next to the box, then fires the ProximityPrompt (same as pressing E)
 -- ================================================================
 local function _grabBox(box)
+    local char = LocalPlayer.Character
+    if not char then return false end
+
+    -- Find the ProximityPrompt on or inside the box
     local prompt = box:FindFirstChildWhichIsA('ProximityPrompt', true)
     if not prompt then
-        dbg('GRAB', 'No ProximityPrompt found on box')
+        dbg('GRAB', 'No ProximityPrompt found on box — searching conveyor parent…')
+        -- Fallback: check parent conveyor container
+        local parent = box.Parent
+        if parent then
+            prompt = parent:FindFirstChildWhichIsA('ProximityPrompt', true)
+        end
+    end
+
+    if not prompt then
+        dbg('GRAB', 'FAILED — no ProximityPrompt anywhere near box')
         return false
     end
-    dbg('GRAB', 'Firing prompt on: ' .. box:GetFullName())
+
+    dbg('GRAB', 'Found prompt: ' .. prompt:GetFullName())
+
+    -- Snap close to the box so the prompt range is satisfied
+    local snapPos = Vector3.new(box.Position.X, box.Position.Y + 3, box.Position.Z)
+    char:SetPrimaryPartCFrame(CFrame.new(snapPos))
+    _killVelocity()
+    task.wait(0.15)
+
+    -- Fire the E keypress
+    dbg('GRAB', 'fireproximityprompt → ' .. prompt:GetFullName())
     fireproximityprompt(prompt)
-    task.wait(0.4)
-    local char = LocalPlayer.Character
+
+    -- Wait for server to put box in inventory
+    task.wait(0.5)
+
+    char = LocalPlayer.Character
     local gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
     dbg('GRAB', 'Pizza Box in inventory: ' .. tostring(gotBox))
+
+    if char then
+        local names = {}
+        for _, c in next, char:GetChildren() do table.insert(names, c.Name) end
+        dbg('GRAB', 'Char children: ' .. table.concat(names, ', '))
+    end
+
     return gotBox
 end
 
 -- ================================================================
---  DELIVER PIZZA  — keypress approach via fireproximityprompt
+--  DELIVER PIZZA — E keypress via fireproximityprompt
+--  Moves next to the customer, then fires the ProximityPrompt (same as pressing E)
 -- ================================================================
-local function _deliverPizza(customer)
+local function _deliverPizza(customer, customerHRP)
+    local char = LocalPlayer.Character
+    if not char then return false end
+
+    -- Find the ProximityPrompt on the customer NPC
     local prompt = customer:FindFirstChildWhichIsA('ProximityPrompt', true)
     if not prompt then
         dbg('DELIVER', 'No ProximityPrompt found on customer')
         return false
     end
-    dbg('DELIVER', 'Firing prompt on: ' .. customer:GetFullName())
+
+    dbg('DELIVER', 'Found prompt: ' .. prompt:GetFullName())
+
+    -- Snap close to the customer so the prompt range is satisfied
+    local snapPos = Vector3.new(
+        customerHRP.Position.X,
+        customerHRP.Position.Y + 3,
+        customerHRP.Position.Z
+    )
+    char:SetPrimaryPartCFrame(CFrame.new(snapPos))
+    _killVelocity()
+    task.wait(0.15)
+
+    -- Fire the E keypress
+    dbg('DELIVER', 'fireproximityprompt → ' .. prompt:GetFullName())
     fireproximityprompt(prompt)
+
     return true
 end
 
@@ -448,9 +500,8 @@ _fnDelivery = function(toggle)
             break
         end
 
--- Step 3 — was: _grabBox(box, snapPos)
+        -- 3. Grab box via E keypress (fireproximityprompt)
         local gotBox = _grabBox(box)
-
 
         if not gotBox then
             Library:Notify('[Pizza] Box grab failed — retrying…')
@@ -508,8 +559,8 @@ _fnDelivery = function(toggle)
             break
         end
 
-        -- Step 6 — was: _deliverPizza(customer, customerHRP.Position)
-        local delivered = _deliverPizza(customer)
+        -- 6. Deliver via E keypress (fireproximityprompt)
+        local delivered = _deliverPizza(customer, customerHRP)
         if delivered then
             Library:Notify('[Pizza] Delivered!')
             dbg('LOOP', 'Delivery sent.')
@@ -571,7 +622,6 @@ task.spawn(function()
         return
     end
 
-    -- Upvalue 4 confirmed from scan
     local ok2, fw = pcall(getupvalue, m, 4)
     if not ok2 or type(fw) ~= 'table' then
         Library:Notify('[BXBRG] Could not get fw from upvalue 4!')
@@ -596,29 +646,9 @@ task.spawn(function()
 
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
 
--- ── EndShift suppression ──────────────────────────────────
-    local _oldFS = _bxNet.FireServer
-    local _hookActive = false
-    _bxNet.FireServer = function(self, data, ...)
-        -- Only intercept plain table payloads; let all other game calls pass untouched
-        if not _hookActive
-        and type(data) == 'table'
-        and rawget(data, 'Type') == 'EndShift'
-        and Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then
-            dbg('HOOK', 'EndShift suppressed')
-            return
-        end
-        -- Re-entrancy guard prevents the hook from triggering itself recursively
-        _hookActive = true
-        local results = table.pack(pcall(_oldFS, self, data, ...))
-        _hookActive = false
-        if not results[1] then
-            dbg('HOOK', 'FireServer passthrough error: ' .. tostring(results[2]))
-            return
-        end
-        return table.unpack(results, 2, results.n)
-    end
-    dbg('BOOT', 'EndShift suppression installed.')
+    -- NOTE: FireServer hook removed — was causing missing argument errors
+    -- in unrelated game systems (VehicleService, Analytics, CharacterHandler).
+    -- Grab and Deliver now use fireproximityprompt (E keypress) instead.
 
     -- ── Save House ────────────────────────────────────────────
     _fnSaveHouse = function(player)
