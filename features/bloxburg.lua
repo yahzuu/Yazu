@@ -623,15 +623,27 @@ task.spawn(function()
 
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
 
-    -- ── EndShift suppression ──────────────────────────────────
+-- ── EndShift suppression ──────────────────────────────────
     local _oldFS = _bxNet.FireServer
+    local _hookActive = false
     _bxNet.FireServer = function(self, data, ...)
-        if data and data.Type == 'EndShift'
+        -- Only intercept plain table payloads; let all other game calls pass untouched
+        if not _hookActive
+        and type(data) == 'table'
+        and rawget(data, 'Type') == 'EndShift'
         and Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then
             dbg('HOOK', 'EndShift suppressed')
             return
         end
-        return _oldFS(self, data, ...)
+        -- Re-entrancy guard prevents the hook from triggering itself recursively
+        _hookActive = true
+        local results = table.pack(pcall(_oldFS, self, data, ...))
+        _hookActive = false
+        if not results[1] then
+            dbg('HOOK', 'FireServer passthrough error: ' .. tostring(results[2]))
+            return
+        end
+        return table.unpack(results, 2, results.n)
     end
     dbg('BOOT', 'EndShift suppression installed.')
 
