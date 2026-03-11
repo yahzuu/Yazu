@@ -349,62 +349,35 @@ local function _getCustomer()
 end
 
 -- ================================================================
---  GRAB BOX
---  Correct payload (from Hydroxide): { Item = box }
---  via fw.net:FireServer() — NO Type field
+--  GRAB BOX  — keypress approach via fireproximityprompt
 -- ================================================================
-local function _grabBox(box, snapPos)
+local function _grabBox(box)
+    local prompt = box:FindFirstChildWhichIsA('ProximityPrompt', true)
+    if not prompt then
+        dbg('GRAB', 'No ProximityPrompt found on box')
+        return false
+    end
+    dbg('GRAB', 'Firing prompt on: ' .. box:GetFullName())
+    fireproximityprompt(prompt)
+    task.wait(0.4)
     local char = LocalPlayer.Character
-    if not char or not _bxNet then return false end
-
-    dbg('GRAB', 'Snapping to box snap pos: ' .. tostring(snapPos))
-    char:SetPrimaryPartCFrame(CFrame.new(snapPos))
-    _killVelocity()
-    task.wait(0.15)
-
-    dbg('GRAB', 'Firing { Item = box } to fw.net:FireServer')
-    local ok, err = pcall(function()
-        _bxNet:FireServer({ Item = box })
-    end)
-    dbg('GRAB', 'FireServer result: ok=' .. tostring(ok) .. (ok and '' or ' err=' .. tostring(err)))
-
-    -- Give server time to put box in inventory
-    task.wait(0.3)
-
-    char = LocalPlayer.Character
     local gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
     dbg('GRAB', 'Pizza Box in inventory: ' .. tostring(gotBox))
-
-    if char then
-        local names = {}
-        for _, c in next, char:GetChildren() do table.insert(names, c.Name) end
-        dbg('GRAB', 'Char children: ' .. table.concat(names, ', '))
-    end
-
     return gotBox
 end
 
 -- ================================================================
---  DELIVER PIZZA
---  Correct payload (from Hydroxide): { Customer = npcInstance }
---  via fw.net:FireServer() — NO Type field
+--  DELIVER PIZZA  — keypress approach via fireproximityprompt
 -- ================================================================
-local function _deliverPizza(customer, snapPos)
-    local char = LocalPlayer.Character
-    if not char or not _bxNet then return false end
-
-    dbg('DELIVER', 'Snapping to customer: ' .. tostring(snapPos))
-    char:SetPrimaryPartCFrame(CFrame.new(snapPos))
-    _killVelocity()
-    task.wait(0.15)
-
-    dbg('DELIVER', 'Firing { Customer = ' .. customer.Name .. ' } to fw.net:FireServer')
-    local ok, err = pcall(function()
-        _bxNet:FireServer({ Customer = customer })
-    end)
-    dbg('DELIVER', 'FireServer result: ok=' .. tostring(ok) .. (ok and '' or ' err=' .. tostring(err)))
-
-    return ok
+local function _deliverPizza(customer)
+    local prompt = customer:FindFirstChildWhichIsA('ProximityPrompt', true)
+    if not prompt then
+        dbg('DELIVER', 'No ProximityPrompt found on customer')
+        return false
+    end
+    dbg('DELIVER', 'Firing prompt on: ' .. customer:GetFullName())
+    fireproximityprompt(prompt)
+    return true
 end
 
 -- ================================================================
@@ -475,9 +448,9 @@ _fnDelivery = function(toggle)
             break
         end
 
-        -- 3. Grab box
-        local snapPos = Vector3.new(box.Position.X, box.Position.Y + 3, box.Position.Z)
-        local gotBox = _grabBox(box, snapPos)
+-- Step 3 — was: _grabBox(box, snapPos)
+        local gotBox = _grabBox(box)
+
 
         if not gotBox then
             Library:Notify('[Pizza] Box grab failed — retrying…')
@@ -535,8 +508,8 @@ _fnDelivery = function(toggle)
             break
         end
 
-        -- 6. Deliver
-        local delivered = _deliverPizza(customer, customerHRP.Position)
+        -- Step 6 — was: _deliverPizza(customer, customerHRP.Position)
+        local delivered = _deliverPizza(customer)
         if delivered then
             Library:Notify('[Pizza] Delivered!')
             dbg('LOOP', 'Delivery sent.')
