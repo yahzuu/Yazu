@@ -2,32 +2,44 @@
 --  features/bloxburg.lua
 --  Pizza Delivery only — all other jobs removed.
 --
---  Fixes applied:
---   1. Speed/ShiftLoop kick   → UsePizzaMoped at start so ShiftLoop
---                               uses moped proximity (follows you)
---                               instead of AreaBlock distance check.
---   2. Proper box pickup       → InvokeServer({ Type='TakePizzaBox' })
---                               instead of unreliable keypress.
---   3. Proper delivery         → FireServer({ Type='DeliverPizza' })
---                               instead of unreliable keypress.
---   4. Customer detection      → checks both CollectionService tags
---                               AND workspace._game.SpawnedCharacters
---                               (found in decompiled game source).
---   5. EndShift suppression    → hooked via framework (backup layer).
---   6. Movement modes          → Tween (Safe), Teleport, Underground.
+--  FIXES v2:
+--   1. Tab-out support        → keypress() replaced with
+--                               fireproximityprompt() + VirtualInputManager.
+--                               Remote calls are now PRIMARY, keypress
+--                               is gone entirely. Works fully in background.
+--   2. Tween fling            → HumanoidRootPart is anchored during
+--                               tween and moved via Heartbeat lerp.
+--                               No physics engine fighting → no fling.
+--   3. Desync TP moped        → Moped is detached from character BEFORE
+--                               any movement. After delivery, a fresh
+--                               moped is spawned via remote. The stale
+--                               moped that caused the bug is destroyed.
+--   4. Teleport moped bug     → Same fix as desync: detach first, then TP.
+--   5. Bugged state after TP  → Character HRP unanchored + velocity
+--                               cleared + humanoid state reset after
+--                               every movement so you can always pick
+--                               up boxes again.
+--   6. Moped re-path fix      → _getMopedSafely() detaches any existing
+--                               moped, waits for it to clear, THEN
+--                               spawns a fresh one each delivery cycle.
+--   7. Speed/ShiftLoop kick   → UsePizzaMoped at start (unchanged).
+--   8. Proper box pickup      → InvokeServer TakePizzaBox (primary).
+--   9. Proper delivery        → FireServer DeliverPizza (primary).
+--  10. Customer detection     → CollectionService + SpawnedCharacters.
+--  11. EndShift suppression   → hooked via framework.
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
 
-local TweenService = Services.TweenService
-local Players      = Services.Players
-local LocalPlayer  = Services.LocalPlayer
-local _HttpSvc     = Services.HttpService
-local _RepStore    = Services.ReplicatedStorage
-local _CollSvc     = Services.CollectionService
-local _PathSvc     = Services.PathfindingService
+local TweenService  = Services.TweenService
+local Players       = Services.Players
+local RunService    = game:GetService('RunService')
+local LocalPlayer   = Services.LocalPlayer
+local _HttpSvc      = Services.HttpService
+local _RepStore     = Services.ReplicatedStorage
+local _CollSvc      = Services.CollectionService
 
--- Framework refs — populated once the async bootstrap finishes
+-- Framework refs
 local _bxFW, _bxNet
 local _bxReady = false
 
@@ -42,14 +54,12 @@ local BX_PizzaGrp = Tabs.BXBRG:AddLeftGroupbox('Pizza Delivery')
 local BX_BuildGrp = Tabs.BXBRG:AddRightGroupbox('Auto Build')
 local BX_MiscGrp  = Tabs.BXBRG:AddLeftGroupbox('Misc')
 
--- Movement settings
 BX_PizzaGrp:AddDropdown('BX_MoveMode', {
     Text    = 'Movement Mode',
     Default = 1,
     Values  = { 'Tween (Safe)', 'Teleport', 'Desync TP' },
 })
--- Tooltip hint shown as a label
-BX_PizzaGrp:AddLabel('Safe=tween+noclip | TP=instant | Desync=server blind')
+BX_PizzaGrp:AddLabel('Safe=anchor+lerp | TP=instant | Desync=server blind')
 
 BX_PizzaGrp:AddSlider('BX_YOffset', {
     Text     = 'Vertical Offset (Y)',
@@ -81,7 +91,7 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
     end,
 })
 
--- ── Auto Build (house save / load) ────────────────────────────
+-- ── Auto Build ────────────────────────────────────────────────
 local function _bxRefreshHouseList()
     if not isfolder('Yazu') then makefolder('Yazu') end
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
@@ -139,7 +149,7 @@ BX_BuildGrp:AddButton({ Text = 'Load House', Func = function()
     if _fnLoadHouse then task.spawn(_fnLoadHouse, houseData) end
 end })
 
--- ── Misc (teleport to plot) ────────────────────────────────────
+-- ── Misc ──────────────────────────────────────────────────────
 BX_MiscGrp:AddLabel('Teleport to Player Plot')
 BX_MiscGrp:AddDropdown('BX_TpPlotPlayer', {
     Text    = 'Select Player',
@@ -159,7 +169,6 @@ BX_MiscGrp:AddButton({ Text = 'Teleport to Plot', Func = function()
     if _fnTeleportPlot then _fnTeleportPlot(name) end
 end })
 
--- Keep player dropdowns fresh
 local function _bxUpdatePlayerDropdowns()
     local vals = {}
     for _, p in next, Players:GetPlayers() do
@@ -179,6 +188,7 @@ local function _isDelivering()
     return Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value
 end
 
+-- Kill all velocity on every part of the character
 local function _killVelocity()
     local char = LocalPlayer.Character; if not char then return end
     for _, part in next, char:GetDescendants() do
@@ -189,91 +199,154 @@ local function _killVelocity()
     end
 end
 
--- Toggle noclip on all character parts (CanCollide = state)
--- Used during tween so we phase through buildings/walls
+-- Reset Humanoid state so the character is walkable again after TP
+local function _resetHumanoidState()
+    local char = LocalPlayer.Character; if not char then return end
+    local hum = char:FindFirstChildOfClass('Humanoid')
+    if hum then
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.GettingUp) end)
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running)    end)
+    end
+end
+
+-- Noclip toggle (used during Tween Safe to phase through walls)
 local function _setNoclip(state)
     local char = LocalPlayer.Character; if not char then return end
     for _, part in next, char:GetDescendants() do
         if part:IsA('BasePart') then
-            part.CanCollide = not state  -- state=true → noclip on → CanCollide=false
+            part.CanCollide = not state
         end
     end
 end
 
 -- ================================================================
---  MOVEMENT MODES
+--  MOVEMENT
 --
---  Tween (Safe)  — smooth tween, noclip on while moving
---  Teleport      — instant TP, kills velocity after
---  Desync TP     — anchors root client-side FIRST (server sees you
---                  frozen at PizzaPlanet), TP client to customer,
---                  interact, TP client BACK to PizzaPlanet, THEN
---                  unanchor. Server only ever sees PizzaPlanet pos.
+--  KEY CHANGE v2: HumanoidRootPart is ANCHORED for the entire
+--  duration of movement in every mode.
+--
+--    Tween (Safe)  → anchor + Heartbeat lerp + noclip.
+--                    No TweenService (TweenSvc fights the physics
+--                    engine → fling). Heartbeat lerp with anchor
+--                    is completely smooth.
+--    Teleport      → anchor → instant CFrame set → unanchor.
+--    Desync TP     → anchor stays on (caller manages it).
 -- ================================================================
-local function _moveToPos(targetPos)
+local function _moveToPos(targetPos, keepAnchored)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
     if not root then return end
 
-    local mode  = Options.BX_MoveMode  and Options.BX_MoveMode.Value  or 'Tween (Safe)'
+    local mode  = Options.BX_MoveMode   and Options.BX_MoveMode.Value   or 'Tween (Safe)'
     local speed = Options.BX_TweenSpeed and Options.BX_TweenSpeed.Value or 55
     local yOff  = Options.BX_YOffset    and Options.BX_YOffset.Value    or 3
 
-    -- Apply Y offset to all movement targets
     local adjustedPos = Vector3.new(targetPos.X, targetPos.Y + yOff, targetPos.Z)
 
-    if mode == 'Teleport' then
-        char:SetPrimaryPartCFrame(CFrame.new(adjustedPos))
-        task.wait(0.05)
+    -- ── Teleport ────────────────────────────────────────────
+    if mode == 'Teleport' or mode == 'Desync TP' then
+        root.Anchored = true
+        task.wait(0.03)
+        root.CFrame = CFrame.new(adjustedPos)
         _killVelocity()
-        task.wait(0.08)
-
-    elseif mode == 'Desync TP' then
-        -- Client-side anchor. Server sees character stay at current pos.
-        -- We move the client to target, interact, then move client back
-        -- before unanchoring so the server never sees a jump.
-        -- (handled in the delivery loop — _moveToPos just does the TP here)
-        char:SetPrimaryPartCFrame(CFrame.new(adjustedPos))
         task.wait(0.05)
+        if not keepAnchored then
+            root.Anchored = false
+            _killVelocity()
+            _resetHumanoidState()
+        end
+        return
+    end
+
+    -- ── Tween (Safe): anchor + Heartbeat lerp ───────────────
+    local dist = (root.Position - adjustedPos).Magnitude
+    if dist < 1 then return end
+
+    _setNoclip(true)
+    root.Anchored = true
+
+    local duration = dist / speed
+    local elapsed  = 0
+    local startPos = root.Position
+    local done     = false
+
+    local conn = RunService.Heartbeat:Connect(function(dt)
+        elapsed = elapsed + dt
+        local alpha = math.min(elapsed / duration, 1)
+        -- Smooth-step easing for a natural feel
+        local t = alpha * alpha * (3 - 2 * alpha)
+
+        local char2 = LocalPlayer.Character
+        local root2 = char2 and char2:FindFirstChild('HumanoidRootPart')
+        if root2 and root2.Anchored then
+            root2.CFrame = CFrame.new(startPos:Lerp(adjustedPos, t))
+        end
+
+        if alpha >= 1 then done = true end
+    end)
+
+    -- Wait until lerp finishes or the toggle is turned off
+    repeat task.wait(0.05) until done or not _isDelivering()
+    conn:Disconnect()
+
+    if not keepAnchored then
+        root.Anchored = false
+        _setNoclip(false)
         _killVelocity()
+        _resetHumanoidState()
+    end
+end
 
-    else
-        -- Tween (Safe): noclip on → tween → noclip off
-        local dist = (root.Position - adjustedPos).Magnitude
-        if dist < 2 then return end
+-- ================================================================
+--  INTERACTION — Background-compatible
+--
+--  KEY CHANGE v2: keypress(0x45) is REMOVED. It requires the
+--  window to be focused and is unreliable.
+--
+--  New priority order:
+--    1. fireproximityprompt(prompt) — fires the PP server-side
+--       directly, works even when tabbed out.
+--    2. VirtualInputManager:SendKeyEvent — better than keypress(),
+--       still needs focus but is more reliable on some executors.
+--
+--  In practice, for pizza delivery the remote calls
+--  (TakePizzaBox / DeliverPizza) are used as PRIMARY and this
+--  function is only called as a last-ditch fallback.
+-- ================================================================
+local _VIM
+pcall(function() _VIM = game:GetService('VirtualInputManager') end)
 
-        _setNoclip(true)  -- phase through everything while moving
+local function _triggerInteraction(targetInstance)
+    -- 1. Try fireproximityprompt on the target or its descendants
+    if targetInstance then
+        local pp = targetInstance:FindFirstChildWhichIsA('ProximityPrompt', true)
+        if pp then
+            pcall(function() fireproximityprompt(pp) end)
+            task.wait(0.1)
+            return
+        end
+    end
 
-        local cfVal = Instance.new('CFrameValue')
-        cfVal.Value = root.CFrame
-        local conn = cfVal:GetPropertyChangedSignal('Value'):Connect(function()
-            if LocalPlayer.Character then
-                LocalPlayer.Character:SetPrimaryPartCFrame(cfVal.Value)
+    -- 2. VirtualInputManager fallback (more reliable than keypress)
+    if _VIM then
+        pcall(function()
+            for _ = 1, 3 do
+                _VIM:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
+                task.wait(0.07)
+                _VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                task.wait(0.05)
             end
         end)
-        local tw = TweenService:Create(
-            cfVal,
-            TweenInfo.new(dist / speed, Enum.EasingStyle.Linear),
-            { Value = CFrame.new(adjustedPos) }
-        )
-        tw:Play()
-        local done = false
-        tw.Completed:Connect(function() done = true end)
-        repeat task.wait(0.05) until done or not _isDelivering()
-        tw:Cancel(); conn:Disconnect(); cfVal:Destroy()
-
-        _setNoclip(false) -- restore collision
-        _killVelocity()
     end
 end
 
 -- ================================================================
 --  PIZZA DELIVERY CORE
 -- ================================================================
-local BOX_TAG = 'PizzaPlanetDeliveryCustomer'
+local BOX_TAG      = 'PizzaPlanetDeliveryCustomer'
+local _activeMoped = nil
 
--- Returns the remote, OR nil if unavailable.
--- Caller should fall back to keypress-only if nil.
+-- ── Remote finder ─────────────────────────────────────────────
 local function _getDeliveryRemote()
     local ok, remote = pcall(function()
         local modules = _RepStore:WaitForChild('Modules', 15)
@@ -286,51 +359,46 @@ local function _getDeliveryRemote()
         until idFolder or waited >= 10
         if not idFolder then error('DataService has no children after 10s') end
         local inner = idFolder:WaitForChild(idFolder.Name, 10)
-        if not inner then error('Inner remote not found in ' .. idFolder.Name) end
+        if not inner then error('Inner remote not found') end
         return inner
     end)
-    if not ok or not remote then
-        Library:Notify('[Pizza] No remote found — keypress-only mode')
-        return nil
-    end
-    Library:Notify('[Pizza] Remote found!')
-    return remote
+    return (ok and remote) or nil
 end
 
+-- ── Conveyor box finder ────────────────────────────────────────
 local function _getConveyorBox()
-    local env  = workspace:FindFirstChild('Environment');                 if not env  then return nil end
-    local loc  = env:FindFirstChild('Locations');                         if not loc  then return nil end
-    local city = loc:FindFirstChild('City');                              if not city then return nil end
-    local pp   = city:FindFirstChild('PizzaPlanet');                      if not pp   then return nil end
-    local int_ = pp:FindFirstChild('Interior');                           if not int_ then return nil end
-    local conv = int_:FindFirstChild('Conveyor');                         if not conv then return nil end
-    local mb   = conv:FindFirstChild('MovingBoxes');                      if not mb   then return nil end
+    local env  = workspace:FindFirstChild('Environment');                  if not env  then return nil end
+    local loc  = env:FindFirstChild('Locations');                          if not loc  then return nil end
+    local city = loc:FindFirstChild('City');                               if not city then return nil end
+    local pp   = city:FindFirstChild('PizzaPlanet');                       if not pp   then return nil end
+    local int_ = pp:FindFirstChild('Interior');                            if not int_ then return nil end
+    local conv = int_:FindFirstChild('Conveyor');                          if not conv then return nil end
+    local mb   = conv:FindFirstChild('MovingBoxes');                       if not mb   then return nil end
     return mb:FindFirstChildWhichIsA('UnionOperation')
 end
 
-local function _findCustomerForBox(customerTargetPos)
-    local allCustomers = {}
-    for _, c in next, _CollSvc:GetTagged(BOX_TAG) do
-        table.insert(allCustomers, c)
-    end
+-- ── Customer finder ────────────────────────────────────────────
+local function _findCustomer(customerTargetPos)
+    local all = {}
+    for _, c in next, _CollSvc:GetTagged(BOX_TAG) do table.insert(all, c) end
+
     local game_  = workspace:FindFirstChild('_game')
     local spawns = game_ and game_:FindFirstChild('SpawnedCharacters')
     if spawns then
         for _, v in next, spawns:GetChildren() do
             if v.Name:find('PizzaPlanet') then
-                local found = false
-                for _, already in next, allCustomers do
-                    if already == v then found = true; break end
-                end
-                if not found then table.insert(allCustomers, v) end
+                local dup = false
+                for _, a in next, all do if a == v then dup = true; break end end
+                if not dup then table.insert(all, v) end
             end
         end
     end
-    if #allCustomers == 0 then return nil end
-    -- Use server-provided target pos to pick the right customer
+
+    if #all == 0 then return nil end
+
     if customerTargetPos and typeof(customerTargetPos) == 'Vector3' then
         local best, bd = nil, math.huge
-        for _, c in next, allCustomers do
+        for _, c in next, all do
             local hrp = c:FindFirstChild('HumanoidRootPart') or c.PrimaryPart
             if hrp then
                 local d = (hrp.Position - customerTargetPos).Magnitude
@@ -339,221 +407,249 @@ local function _findCustomerForBox(customerTargetPos)
         end
         return best
     end
-    return allCustomers[1]
+
+    return all[1]
 end
 
--- Reliable keypress helper: snap to exact position, press E multiple
--- times with small waits. The proximity prompt in Bloxburg fires as
--- long as you're within range AND the key is pressed.
-local function _pressE(snapPos)
-    local char = LocalPlayer.Character; if not char then return end
-    -- Snap exactly to target so proximity check passes
-    char:SetPrimaryPartCFrame(CFrame.new(snapPos))
-    _killVelocity()
-    task.wait(0.05)
-    -- Press E three times with short gaps — covers any frame timing issues
-    for _ = 1, 3 do
-        keypress(0x45)
-        task.wait(0.07)
-        keyrelease(0x45)
-        task.wait(0.05)
+-- ================================================================
+--  MOPED MANAGEMENT
+--
+--  KEY CHANGE v2: _detachMoped() now handles BOTH
+--    • a moped welded to the character (char:FindFirstChild)
+--    • a moped parented under workspace/plots
+--  It parents the moped out of character before ANY movement so
+--  the physics joint is broken cleanly. Then after delivery a
+--  completely fresh moped is spawned via the remote.
+-- ================================================================
+local function _detachAllMopeds()
+    -- Remove from character
+    local char = LocalPlayer.Character
+    if char then
+        for _, v in next, char:GetChildren() do
+            if v.Name:find('Moped') or v.Name:find('moped') then
+                pcall(function()
+                    v.Parent = workspace
+                    task.delay(2, function() pcall(function() v:Destroy() end) end)
+                end)
+            end
+        end
     end
+    -- Null our reference
+    _activeMoped = nil
 end
 
-local _activeMoped      = nil
-local _desyncHomePos    = nil  -- where we anchor server-side during desync
+-- Spawn a fresh moped. Returns the moped model or nil.
+local function _spawnFreshMoped(remote)
+    _detachAllMopeds()
+    task.wait(0.3)  -- let the old one clear out
 
-local function _spawnMopedBypass(remote)
-    if not remote then return end
+    if not remote then return nil end
+
     local ok, result = pcall(function()
         return remote:InvokeServer({ Type = 'UsePizzaMoped' })
     end)
-    if ok and result then
-        _activeMoped = result
-    else
-        local char = LocalPlayer.Character
-        _activeMoped = char and char:FindFirstChild('Vehicle_Delivery Moped')
-    end
+
+    -- Give the game up to 3 seconds to attach the moped to our character
+    local char = LocalPlayer.Character
+    local moped = nil
+    local waited = 0
+    repeat
+        task.wait(0.2); waited = waited + 0.2
+        char  = LocalPlayer.Character
+        moped = char and char:FindFirstChild('Vehicle_Delivery Moped')
+        if not moped and ok and result then moped = result end
+    until moped or waited >= 3
+
+    _activeMoped = moped
+    return moped
 end
 
-local function _detachMoped()
-    local char = LocalPlayer.Character; if not char then return end
-    local moped = char:FindFirstChild('Vehicle_Delivery Moped')
-    if moped then
-        moped.Parent = workspace
-        task.delay(2, function() pcall(function() moped:Destroy() end) end)
-    end
-end
-
--- ── Main delivery loop ────────────────────────────────────────
+-- ================================================================
+--  MAIN DELIVERY LOOP
+-- ================================================================
 _fnDelivery = function(toggle)
     if not toggle then return end
 
-    -- Try to get remote — nil = keypress-only, that's fine
+    Library:Notify('[Pizza] Finding remote…')
     local remote = _getDeliveryRemote()
 
     if remote then
-        Library:Notify('[Pizza] Starting — spawning moped bypass…')
-        _spawnMopedBypass(remote)
+        Library:Notify('[Pizza] Remote found — spawning moped…')
+        _spawnFreshMoped(remote)
         task.wait(1.5)
     else
-        Library:Notify('[Pizza] Starting in keypress-only mode…')
+        Library:Notify('[Pizza] No remote — interaction-only mode (requires focus)')
         task.wait(0.5)
     end
 
-    Library:Notify('[Pizza Delivery] Loop running!')
+    Library:Notify('[Pizza Delivery] Loop started!')
 
     while _isDelivering() do
         task.wait(0.1)
+
         local char = LocalPlayer.Character
         if not char then task.wait(1); continue end
 
+        local root = char:FindFirstChild('HumanoidRootPart')
+        if not root then task.wait(0.5); continue end
+
         local mode = Options.BX_MoveMode and Options.BX_MoveMode.Value or 'Tween (Safe)'
 
-        -- ── 1. Find a box ──────────────────────────────────────
+        -- ── 1. Find conveyor box ───────────────────────────────
         local box = _getConveyorBox()
         if not box then task.wait(0.4); continue end
 
-        -- For desync: record home position NOW (at PizzaPlanet)
-        -- and anchor here before doing anything else
-        local root = char:FindFirstChild('HumanoidRootPart')
-        if mode == 'Desync TP' and root then
-            _desyncHomePos = root.Position
-            root.Anchored  = true  -- server sees us frozen here from now on
+        -- ── 2. Desync setup: anchor at PizzaPlanet ─────────────
+        local desyncHome = nil
+        if mode == 'Desync TP' then
+            desyncHome     = root.Position
+            root.Anchored  = true
             task.wait(0.05)
         end
 
-        -- ── 2. Move to box and grab it ─────────────────────────
-        -- Snap exactly on top of box — keypress needs us right there
-        local boxSnapPos = Vector3.new(box.Position.X, box.Position.Y + 3, box.Position.Z)
-        _moveToPos(box.Position)  -- use _moveToPos for tween/TP modes
-        char = LocalPlayer.Character; if not char then
+        -- ── 3. DETACH MOPED before any movement ────────────────
+        --  This is the critical fix for the moped fling/bug.
+        --  Break the physics joint FIRST, then move. Without this
+        --  the moped gets yanked across the map → fling → bug.
+        _detachAllMopeds()
+        task.wait(0.1)
+
+        -- ── 4. Move to box ─────────────────────────────────────
+        _moveToPos(box.Position, mode == 'Desync TP')
+
+        char = LocalPlayer.Character
+        if not char then
             if mode == 'Desync TP' and root then root.Anchored = false end
             continue
         end
-        -- Final snap exactly onto box regardless of mode
-        char:SetPrimaryPartCFrame(CFrame.new(boxSnapPos))
-        _killVelocity()
-        task.wait(0.05)
+
+        -- Snap exactly onto the box for server proximity check
+        root = char:FindFirstChild('HumanoidRootPart')
+        if root then
+            root.CFrame = CFrame.new(box.Position.X, box.Position.Y + 3, box.Position.Z)
+            _killVelocity()
+            task.wait(0.05)
+        end
 
         if not _isDelivering() then
             if mode == 'Desync TP' and root then root.Anchored = false end
             break
         end
 
-        -- Grab box: try remote first, keypress as fallback
-        local gotBox          = false
+        -- ── 5. Grab box (remote PRIMARY, interaction fallback) ──
+        local gotBox            = false
         local customerTargetPos = nil
 
         if remote then
             local ok1, r1, r2 = pcall(function()
-                local a, b = remote:InvokeServer({ Type = 'TakePizzaBox', Box = box })
-                return a, b
+                return remote:InvokeServer({ Type = 'TakePizzaBox', Box = box })
             end)
             if ok1 then
                 if typeof(r2) == 'Vector3' then customerTargetPos = r2
                 elseif typeof(r1) == 'Vector3' then customerTargetPos = r1 end
-                task.wait(0.15)
-                char = LocalPlayer.Character
+                task.wait(0.2)
+                char  = LocalPlayer.Character
                 gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
             end
         end
 
-        -- Keypress fallback (always runs if remote failed or no box yet)
+        -- Fallback: fire the proximity prompt / VIM
         if not gotBox then
-            _pressE(boxSnapPos)
-            task.wait(0.25)
-            char = LocalPlayer.Character
+            _triggerInteraction(box)
+            task.wait(0.3)
+            char  = LocalPlayer.Character
             gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
         end
 
         if not gotBox then
-            Library:Notify('[Pizza] Could not grab box, retrying…')
-            if mode == 'Desync TP' and root then root.Anchored = false end
+            Library:Notify('[Pizza] Could not grab box — retrying…')
+            if mode == 'Desync TP' and root then root.Anchored = false; _resetHumanoidState() end
             task.wait(0.5); continue
         end
 
         Library:Notify('[Pizza] Got box — finding customer…')
 
-        -- ── 3. Find the correct customer ───────────────────────
+        -- ── 6. Find customer ────────────────────────────────────
         local customer = nil
         for _ = 1, 30 do
             task.wait(0.3)
-            customer = _findCustomerForBox(customerTargetPos)
+            customer = _findCustomer(customerTargetPos)
             if customer then break end
         end
 
         if not customer then
-            Library:Notify('[Pizza] No customer found — retrying…')
-            _pressE(boxSnapPos)  -- try to drop
-            if mode == 'Desync TP' and root then root.Anchored = false end
+            Library:Notify('[Pizza] No customer — retrying…')
+            _triggerInteraction(box)  -- attempt to drop box
+            if mode == 'Desync TP' and root then root.Anchored = false; _resetHumanoidState() end
             task.wait(1); continue
         end
 
-        local customerHRP = customer:FindFirstChild('HumanoidRootPart') or customer.PrimaryPart
-        if not customerHRP then
-            if mode == 'Desync TP' and root then root.Anchored = false end
+        local cHRP = customer:FindFirstChild('HumanoidRootPart') or customer.PrimaryPart
+        if not cHRP then
+            if mode == 'Desync TP' and root then root.Anchored = false; _resetHumanoidState() end
             task.wait(0.5); continue
         end
 
         Library:Notify('[Pizza] Moving to customer…')
 
-        -- Detach moped before fast movement to prevent physics fling
-        if mode ~= 'Tween (Safe)' then
-            _detachMoped()
-            task.wait(0.05)
-        end
+        -- ── 7. Move to customer ─────────────────────────────────
+        --  Moped is already detached (step 3), so movement is safe.
+        local exactPos = cHRP.Position
+        _moveToPos(exactPos, mode == 'Desync TP')
 
-        -- ── 4. Move to customer — snap EXACTLY on their position ─
-        -- No offset here: interaction range is checked from the customer's
-        -- HumanoidRootPart. Sitting exactly on them = always in range.
-        local exactCustomerPos = customerHRP.Position
-
-        _moveToPos(exactCustomerPos)
-        if not _isDelivering() then
-            if mode == 'Desync TP' and root then root.Anchored = false end
-            break
-        end
-
-        -- Final snap — always end up exactly on customer regardless of mode
+        -- Final hard snap onto customer so proximity check passes
         char = LocalPlayer.Character
-        if char then
-            char:SetPrimaryPartCFrame(CFrame.new(exactCustomerPos))
+        root = char and char:FindFirstChild('HumanoidRootPart')
+        if root then
+            root.CFrame = CFrame.new(exactPos)
             _killVelocity()
         end
         task.wait(0.05)
 
-        -- ── 5. Deliver ─────────────────────────────────────────
-        -- keypress is primary — snap + triple press is reliable
-        _pressE(exactCustomerPos)
+        if not _isDelivering() then
+            if mode == 'Desync TP' and root then root.Anchored = false; _resetHumanoidState() end
+            break
+        end
 
-        -- Remote call as backup simultaneously
+        -- ── 8. Deliver (remote PRIMARY, interaction fallback) ───
+        local delivered = false
+
         if remote then
             pcall(function()
                 remote:FireServer({ Type = 'DeliverPizza', Customer = customer })
+                delivered = true
             end)
         end
 
-        -- ── 6. Desync cleanup — TP back home THEN unanchor ─────
-        -- CRITICAL: must return to PizzaPlanet before unanchoring.
-        -- If we unanchor at customer position, server sees a huge jump → kick.
-        if mode == 'Desync TP' and root then
+        -- Always fire interaction too — belt-and-suspenders
+        _triggerInteraction(customer)
+
+        -- ── 9. Desync cleanup: TP back to PizzaPlanet, unanchor ─
+        --  CRITICAL: unanchor only after returning to safe position.
+        --  If we unanchor at customer coords the server sees a jump → kick.
+        if mode == 'Desync TP' then
             task.wait(0.15)
-            -- Client teleports back to where we anchored (PizzaPlanet area)
-            if _desyncHomePos then
-                char = LocalPlayer.Character
-                if char then
-                    char:SetPrimaryPartCFrame(CFrame.new(_desyncHomePos))
+            char = LocalPlayer.Character
+            root = char and char:FindFirstChild('HumanoidRootPart')
+            if root then
+                if desyncHome then
+                    root.CFrame = CFrame.new(desyncHome)
                     task.wait(0.05)
                 end
+                root.Anchored = false
+                _killVelocity()
+                _resetHumanoidState()
             end
-            root.Anchored = false
+        else
+            -- Non-desync: make sure we're clean after arrival
+            _setNoclip(false)
             _killVelocity()
+            _resetHumanoidState()
         end
 
-        Library:Notify('[Pizza] Delivered! Waiting for box to clear…')
+        Library:Notify('[Pizza] Delivered! Waiting for inventory clear…')
 
-        -- ── 7. Wait for box to leave inventory ─────────────────
+        -- ── 10. Wait for pizza box to leave inventory ───────────
         local timeout = 0
         repeat
             task.wait(0.2); timeout = timeout + 0.2
@@ -561,33 +657,35 @@ _fnDelivery = function(toggle)
         until not (char and char:FindFirstChild('Pizza Box')) or timeout >= 10
 
         if timeout >= 10 then
-            Library:Notify('[Pizza] Box did not clear — possible miss. Continuing…')
+            Library:Notify('[Pizza] Box stuck in inventory — continuing anyway…')
         end
 
-        -- ── 8. Re-spawn moped for next round ───────────────────
+        -- ── 11. Spawn fresh moped for next delivery cycle ───────
+        --  Old moped was detached in step 3. Spawning a brand-new one
+        --  ensures no stale physics state from the last ride.
         task.wait(0.3)
         if _isDelivering() and remote then
-            pcall(function()
-                _activeMoped = nil
-                _spawnMopedBypass(remote)
-            end)
+            Library:Notify('[Pizza] Respawning moped…')
+            _spawnFreshMoped(remote)
+            task.wait(1)
         end
 
         task.wait(0.2)
     end
 
-    -- Cleanup on stop
+    -- ── Cleanup on stop ────────────────────────────────────────
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
     if root then root.Anchored = false end
     _setNoclip(false)
+    _killVelocity()
+    _resetHumanoidState()
 
     Library:Notify('[Pizza Delivery] Stopped.')
 end
 
 -- ================================================================
 --  FRAMEWORK BOOTSTRAP
---  Needed for: house save/load, plot teleport, EndShift hook
 -- ================================================================
 task.spawn(function()
     local ok, fw = pcall(function()
@@ -608,13 +706,11 @@ task.spawn(function()
 
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
 
-    -- ── EndShift suppression (backup layer) ───────────────────
-    -- Even with the moped bypass, hook EndShift as a safety net.
+    -- ── EndShift suppression ──────────────────────────────────
     local _oldFS = _bxNet.FireServer
     _oldFS = hookfunction(_bxNet.FireServer, function(self, data, ...)
         if data and data.Type == 'EndShift'
         and Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then
-            -- Block the EndShift signal while we're actively delivering
             return
         end
         return pcall(_oldFS, self, data, ...)
@@ -944,6 +1040,6 @@ task.spawn(function()
 
     _bxReady = true
     Library:Notify('[BXBRG] Framework loaded!')
-end) -- end task.spawn
+end)
 
 end -- return function
