@@ -1,43 +1,7 @@
 -- ================================================================
---  features/bloxburg.lua
---  Pizza Delivery only — all other jobs removed.
---
---  Fixes v2:
---   1. Tab-out support         → All interactions use remote calls
---                               only. keypress(0x45) removed as
---                               primary — it cannot fire when the
---                               window is not focused. Remote calls
---                               (InvokeServer / FireServer) work
---                               fully in the background.
---   2. Moped fling fix         → Moped BaseParts are ANCHORED
---                               before any character movement and
---                               UNANCHORED after. This prevents the
---                               vehicle physics from going haywire
---                               while tweening / teleporting.
---   3. Moped never detached    → _detachMoped() removed entirely.
---                               The moped stays on the character
---                               at all times. Anchoring it during
---                               travel is enough to prevent fling.
---   4. Desync moped fix        → When the HumanoidRootPart is
---                               anchored server-side, we now also
---                               anchor every moped part so the
---                               entire vehicle stays frozen at
---                               PizzaPlanet as far as the server
---                               is concerned.
---   5. Teleport moped fix      → Same anchor-before-TP approach
---                               prevents physics explosion on
---                               instant moves.
---   6. Moped recovery          → Each loop iteration verifies the
---                               moped is present on the character.
---                               If missing it re-spawns via
---                               UsePizzaMoped before proceeding.
---   7. Speed/ShiftLoop kick    → UsePizzaMoped keeps moped on
---                               character; moped proximity branch
---                               in ShiftLoop keeps check passing.
---   8. Proper box pickup       → InvokeServer({Type='TakePizzaBox'})
---   9. Proper delivery         → FireServer({Type='DeliverPizza'})
---  10. Customer detection      → CollectionService tags +
---                               workspace._game.SpawnedCharacters
+--  features/bloxburg.lua  [DEBUG BUILD]
+--  Debug prints added to trace remote calls and logic flow.
+--  All debug lines are prefixed with [DBG] for easy filtering.
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
@@ -50,13 +14,20 @@ local _RepStore    = Services.ReplicatedStorage
 local _CollSvc     = Services.CollectionService
 local _PathSvc     = Services.PathfindingService
 
--- Framework refs — populated once the async bootstrap finishes
 local _bxFW, _bxNet
 local _bxReady = false
 
 local _fnDelivery, _fnSaveHouse, _fnLoadHouse, _fnTeleportPlot
 
 local function _notReady() Library:Notify('Still loading Bloxburg framework…') end
+
+-- ================================================================
+--  DEBUG HELPER
+--  Prints to console AND sends a short notify for critical events.
+-- ================================================================
+local function dbg(tag, msg)
+    print(string.format('[DBG][%s] %s', tag, tostring(msg)))
+end
 
 -- ================================================================
 --  UI
@@ -94,10 +65,12 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
     Text     = 'Pizza Delivery',
     Default  = false,
     Callback = function(v)
+        dbg('TOGGLE', 'BX_PizzaDelivery set to: ' .. tostring(v))
         if _fnDelivery then
             task.spawn(_fnDelivery, v)
         else
             Library:Notify('Still loading…')
+            dbg('TOGGLE', '_fnDelivery is nil — framework not ready yet')
         end
     end,
 })
@@ -209,11 +182,9 @@ local function _killVelocity()
     end
 end
 
--- Toggle noclip on character parts only (NOT moped — handled separately)
 local function _setCharNoclip(state)
     local char = LocalPlayer.Character; if not char then return end
     for _, part in next, char:GetDescendants() do
-        -- Skip the moped — we anchor it instead
         if part:IsA('BasePart') and not part:FindFirstAncestorWhichIsA('Tool') then
             local mopedParent = part:FindFirstAncestor('Vehicle_Delivery Moped')
             if not mopedParent then
@@ -225,17 +196,15 @@ end
 
 -- ================================================================
 --  MOPED MANAGEMENT
---  The moped must NEVER be detached from the character.
---  Instead we anchor every BasePart in it before any movement and
---  unanchor after arrival. This prevents physics explosions while
---  keeping the vehicle present (required for the ShiftLoop check).
 -- ================================================================
-
--- Anchor or unanchor every BasePart inside the moped model.
 local function _setMopedAnchored(state)
     local char = LocalPlayer.Character; if not char then return end
     local moped = char:FindFirstChild('Vehicle_Delivery Moped')
-    if not moped then return end
+    if not moped then
+        dbg('MOPED', 'SetMopedAnchored(' .. tostring(state) .. ') — moped not found on character!')
+        return
+    end
+    dbg('MOPED', 'SetMopedAnchored(' .. tostring(state) .. ') — OK')
     for _, part in next, moped:GetDescendants() do
         if part:IsA('BasePart') then
             part.Anchored = state
@@ -247,40 +216,48 @@ local function _setMopedAnchored(state)
     end
 end
 
--- Returns true if the moped is on the character and in workspace.
 local function _hasMoped()
     local char = LocalPlayer.Character
     if not char then return false end
     local moped = char:FindFirstChild('Vehicle_Delivery Moped')
-    return moped ~= nil and moped:IsDescendantOf(workspace)
+    local result = moped ~= nil and moped:IsDescendantOf(workspace)
+    dbg('MOPED', '_hasMoped() = ' .. tostring(result))
+    return result
 end
 
--- Spawn / recover the moped via UsePizzaMoped.
--- Waits up to `timeout` seconds for it to appear on the character.
 local function _spawnMoped(remote, timeout)
     timeout = timeout or 6
+    dbg('MOPED', '_spawnMoped() called. Already has moped: ' .. tostring(_hasMoped()))
     if _hasMoped() then return true end
-    if not remote then return false end
-
-    local ok = pcall(function()
-        remote:InvokeServer({ Type = 'UsePizzaMoped' })
-    end)
-    if not ok then
-        Library:Notify('[Pizza] UsePizzaMoped invoke failed')
+    if not remote then
+        dbg('MOPED', '_spawnMoped() FAILED — remote is nil!')
         return false
     end
 
-    -- Wait for moped to attach to character
+    dbg('MOPED', 'Invoking UsePizzaMoped on remote: ' .. tostring(remote:GetFullName()))
+    local ok, err = pcall(function()
+        remote:InvokeServer({ Type = 'UsePizzaMoped' })
+    end)
+    if not ok then
+        dbg('MOPED', 'UsePizzaMoped InvokeServer ERROR: ' .. tostring(err))
+        Library:Notify('[Pizza] UsePizzaMoped invoke failed')
+        return false
+    end
+    dbg('MOPED', 'UsePizzaMoped invoke sent. Waiting for moped to attach…')
+
     local elapsed = 0
     while elapsed < timeout do
         task.wait(0.25)
         elapsed = elapsed + 0.25
+        dbg('MOPED', 'Waiting for moped… elapsed=' .. elapsed .. 's')
         if _hasMoped() then
             Library:Notify('[Pizza] Moped ready!')
+            dbg('MOPED', 'Moped attached to character successfully!')
             return true
         end
     end
 
+    dbg('MOPED', 'Moped did NOT appear after ' .. timeout .. 's timeout.')
     Library:Notify('[Pizza] Moped did not appear within ' .. timeout .. 's')
     return false
 end
@@ -291,45 +268,45 @@ end
 local function _moveToPos(targetPos)
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
-    if not root then return end
+    if not root then
+        dbg('MOVE', '_moveToPos() aborted — no HumanoidRootPart')
+        return
+    end
 
     local mode  = Options.BX_MoveMode  and Options.BX_MoveMode.Value  or 'Tween (Safe)'
     local speed = Options.BX_TweenSpeed and Options.BX_TweenSpeed.Value or 55
     local yOff  = Options.BX_YOffset    and Options.BX_YOffset.Value    or 3
-
     local adjustedPos = Vector3.new(targetPos.X, targetPos.Y + yOff, targetPos.Z)
 
-    -- Always anchor the moped BEFORE any movement to prevent fling
+    dbg('MOVE', string.format('_moveToPos() mode=%s target=%s adjusted=%s', mode, tostring(targetPos), tostring(adjustedPos)))
+
     _setMopedAnchored(true)
 
     if mode == 'Teleport' then
-        -- ── Teleport ──────────────────────────────────────────
-        -- Moped is anchored → TP the character → unanchor after.
+        dbg('MOVE', 'Teleporting character to ' .. tostring(adjustedPos))
         char:SetPrimaryPartCFrame(CFrame.new(adjustedPos))
         task.wait(0.05)
         _killVelocity()
         task.wait(0.08)
+        dbg('MOVE', 'Teleport complete.')
 
     elseif mode == 'Desync TP' then
-        -- ── Desync TP ─────────────────────────────────────────
-        -- Character root is already anchored server-side by the
-        -- outer loop before calling _moveToPos.
-        -- We just move the CLIENT visual here.
+        dbg('MOVE', 'Desync TP — moving client visual to ' .. tostring(adjustedPos))
         char:SetPrimaryPartCFrame(CFrame.new(adjustedPos))
         task.wait(0.05)
         _killVelocity()
+        dbg('MOVE', 'Desync TP complete.')
 
     else
-        -- ── Tween (Safe) ──────────────────────────────────────
         local dist = (root.Position - adjustedPos).Magnitude
+        dbg('MOVE', 'Tween mode. Distance to target: ' .. string.format('%.2f', dist) .. ' studs')
         if dist < 2 then
+            dbg('MOVE', 'Already close enough — skipping tween.')
             _setMopedAnchored(false)
             return
         end
 
-        -- Noclip character (not moped — moped is anchored)
         _setCharNoclip(true)
-
         local cfVal = Instance.new('CFrameValue')
         cfVal.Value = root.CFrame
         local conn = cfVal:GetPropertyChangedSignal('Value'):Connect(function()
@@ -342,18 +319,20 @@ local function _moveToPos(targetPos)
             TweenInfo.new(dist / speed, Enum.EasingStyle.Linear),
             { Value = CFrame.new(adjustedPos) }
         )
+        dbg('MOVE', string.format('Tween started. ETA=%.2fs', dist / speed))
         tw:Play()
         local done = false
         tw.Completed:Connect(function() done = true end)
         repeat task.wait(0.05) until done or not _isDelivering()
         tw:Cancel(); conn:Disconnect(); cfVal:Destroy()
+        dbg('MOVE', 'Tween finished. done=' .. tostring(done))
 
         _setCharNoclip(false)
         _killVelocity()
     end
 
-    -- Unanchor moped after movement is complete
     _setMopedAnchored(false)
+    dbg('MOVE', '_moveToPos() complete.')
 end
 
 -- ================================================================
@@ -361,58 +340,131 @@ end
 -- ================================================================
 local BOX_TAG = 'PizzaPlanetDeliveryCustomer'
 
+-- ── Remote discovery ──────────────────────────────────────────
 local function _getDeliveryRemote()
+    dbg('REMOTE', 'Starting remote discovery…')
+
+    -- Step 1: find ReplicatedStorage.Modules
+    local modules = _RepStore:FindFirstChild('Modules')
+    if not modules then
+        dbg('REMOTE', 'FAIL — ReplicatedStorage.Modules does not exist!')
+    else
+        dbg('REMOTE', 'Found Modules folder: ' .. modules:GetFullName())
+    end
+
+    -- Step 2: wait for Modules if not yet present
     local ok, remote = pcall(function()
-        local modules = _RepStore:WaitForChild('Modules', 15)
-        local ds      = modules:WaitForChild('DataService', 15)
+        local mods = _RepStore:WaitForChild('Modules', 15)
+        dbg('REMOTE', 'Modules WaitForChild result: ' .. tostring(mods and mods:GetFullName() or 'NIL'))
+
+        local ds = mods:WaitForChild('DataService', 15)
+        dbg('REMOTE', 'DataService WaitForChild result: ' .. tostring(ds and ds:GetFullName() or 'NIL'))
+
+        -- Log all children of DataService so we can see what's actually inside
+        local dsChildren = ds:GetChildren()
+        dbg('REMOTE', 'DataService child count: ' .. #dsChildren)
+        for i, child in next, dsChildren do
+            dbg('REMOTE', string.format('  DataService child[%d] = %s (class: %s)', i, child.Name, child.ClassName))
+        end
+
         local idFolder
         local waited = 0
         repeat
             task.wait(0.2); waited = waited + 0.2
             idFolder = ds:GetChildren()[1]
+            dbg('REMOTE', 'Polling for DataService[1]… waited=' .. waited .. 's idFolder=' .. tostring(idFolder and idFolder.Name or 'nil'))
         until idFolder or waited >= 10
-        if not idFolder then error('DataService has no children after 10s') end
+
+        if not idFolder then
+            dbg('REMOTE', 'FAIL — DataService still empty after 10s!')
+            error('DataService has no children after 10s')
+        end
+
+        dbg('REMOTE', 'idFolder found: ' .. idFolder:GetFullName() .. ' (class: ' .. idFolder.ClassName .. ')')
+
+        -- Log all children of idFolder
+        local ifChildren = idFolder:GetChildren()
+        dbg('REMOTE', 'idFolder child count: ' .. #ifChildren)
+        for i, child in next, ifChildren do
+            dbg('REMOTE', string.format('  idFolder child[%d] = %s (class: %s)', i, child.Name, child.ClassName))
+        end
+
         local inner = idFolder:WaitForChild(idFolder.Name, 10)
-        if not inner then error('Inner remote not found in ' .. idFolder.Name) end
+        dbg('REMOTE', 'Inner remote WaitForChild("' .. idFolder.Name .. '") result: ' .. tostring(inner and inner:GetFullName() or 'NIL'))
+
+        if not inner then
+            error('Inner remote not found in ' .. idFolder.Name)
+        end
+
+        dbg('REMOTE', 'SUCCESS — remote path: ' .. inner:GetFullName() .. ' class: ' .. inner.ClassName)
         return inner
     end)
+
     if not ok or not remote then
+        dbg('REMOTE', 'Remote discovery FAILED. ok=' .. tostring(ok) .. ' remote=' .. tostring(remote))
         Library:Notify('[Pizza] No remote found — cannot deliver without remote')
         return nil
     end
+
+    dbg('REMOTE', 'Remote discovery COMPLETE: ' .. tostring(remote:GetFullName()))
     Library:Notify('[Pizza] Remote found!')
     return remote
 end
 
+-- ── Conveyor box ──────────────────────────────────────────────
 local function _getConveyorBox()
-    local env  = workspace:FindFirstChild('Environment');              if not env  then return nil end
-    local loc  = env:FindFirstChild('Locations');                      if not loc  then return nil end
-    local city = loc:FindFirstChild('City');                           if not city then return nil end
-    local pp   = city:FindFirstChild('PizzaPlanet');                   if not pp   then return nil end
-    local int_ = pp:FindFirstChild('Interior');                        if not int_ then return nil end
-    local conv = int_:FindFirstChild('Conveyor');                      if not conv then return nil end
-    local mb   = conv:FindFirstChild('MovingBoxes');                   if not mb   then return nil end
-    return mb:FindFirstChildWhichIsA('UnionOperation')
+    local env  = workspace:FindFirstChild('Environment')
+    if not env  then dbg('BOX', 'FAIL — workspace.Environment missing');             return nil end
+    local loc  = env:FindFirstChild('Locations')
+    if not loc  then dbg('BOX', 'FAIL — Environment.Locations missing');             return nil end
+    local city = loc:FindFirstChild('City')
+    if not city then dbg('BOX', 'FAIL — Locations.City missing');                    return nil end
+    local pp   = city:FindFirstChild('PizzaPlanet')
+    if not pp   then dbg('BOX', 'FAIL — City.PizzaPlanet missing');                  return nil end
+    local int_ = pp:FindFirstChild('Interior')
+    if not int_ then dbg('BOX', 'FAIL — PizzaPlanet.Interior missing');              return nil end
+    local conv = int_:FindFirstChild('Conveyor')
+    if not conv then dbg('BOX', 'FAIL — Interior.Conveyor missing');                 return nil end
+    local mb   = conv:FindFirstChild('MovingBoxes')
+    if not mb   then dbg('BOX', 'FAIL — Conveyor.MovingBoxes missing');              return nil end
+    local box  = mb:FindFirstChildWhichIsA('UnionOperation')
+    if box then
+        dbg('BOX', 'Conveyor box found: ' .. box:GetFullName() .. ' pos=' .. tostring(box.Position))
+    else
+        dbg('BOX', 'No UnionOperation found in MovingBoxes (none on conveyor yet)')
+    end
+    return box
 end
 
+-- ── Customer finder ───────────────────────────────────────────
 local function _findCustomerForBox(customerTargetPos)
     local allCustomers = {}
-    for _, c in next, _CollSvc:GetTagged(BOX_TAG) do
+    local tagged = _CollSvc:GetTagged(BOX_TAG)
+    dbg('CUSTOMER', 'CollectionService tagged "' .. BOX_TAG .. '" count: ' .. #tagged)
+    for _, c in next, tagged do
+        dbg('CUSTOMER', '  Tagged customer: ' .. c:GetFullName())
         table.insert(allCustomers, c)
     end
     local game_  = workspace:FindFirstChild('_game')
     local spawns = game_ and game_:FindFirstChild('SpawnedCharacters')
     if spawns then
+        dbg('CUSTOMER', 'SpawnedCharacters found. Scanning for PizzaPlanet NPCs…')
         for _, v in next, spawns:GetChildren() do
             if v.Name:find('PizzaPlanet') then
                 local found = false
                 for _, already in next, allCustomers do
                     if already == v then found = true; break end
                 end
-                if not found then table.insert(allCustomers, v) end
+                if not found then
+                    dbg('CUSTOMER', '  Added SpawnedCharacter: ' .. v.Name)
+                    table.insert(allCustomers, v)
+                end
             end
         end
+    else
+        dbg('CUSTOMER', 'WARNING — workspace._game.SpawnedCharacters not found!')
     end
+    dbg('CUSTOMER', 'Total customers found: ' .. #allCustomers)
     if #allCustomers == 0 then return nil end
     if customerTargetPos and typeof(customerTargetPos) == 'Vector3' then
         local best, bd = nil, math.huge
@@ -420,40 +472,41 @@ local function _findCustomerForBox(customerTargetPos)
             local hrp = c:FindFirstChild('HumanoidRootPart') or c.PrimaryPart
             if hrp then
                 local d = (hrp.Position - customerTargetPos).Magnitude
+                dbg('CUSTOMER', '  Customer ' .. c.Name .. ' dist=' .. string.format('%.2f', d))
                 if d < bd then bd, best = d, c end
             end
         end
+        if best then dbg('CUSTOMER', 'Best customer: ' .. best.Name .. ' dist=' .. string.format('%.2f', bd)) end
         return best
     end
     return allCustomers[1]
 end
 
 -- ================================================================
---  REMOTE-ONLY INTERACTIONS (work when tabbed out)
---
---  keypress() requires the Roblox window to be focused.
---  InvokeServer() and FireServer() are network calls — they execute
---  regardless of window focus, so tab-out delivery works.
---
---  We still snap the character to the interaction position first so
---  the server-side proximity check passes.
+--  REMOTE INTERACTIONS
 -- ================================================================
 
--- Snap to position and invoke TakePizzaBox via remote.
--- Returns: gotBox (bool), customerTargetPos (Vector3 or nil)
+-- Grab box via TakePizzaBox InvokeServer
 local function _grabBox(remote, box, snapPos)
     local char = LocalPlayer.Character
-    if not char then return false, nil end
+    if not char then
+        dbg('GRAB', '_grabBox() aborted — no character')
+        return false, nil
+    end
 
-    -- Snap character exactly onto box so server proximity check passes
+    dbg('GRAB', 'Snapping to box position: ' .. tostring(snapPos))
     char:SetPrimaryPartCFrame(CFrame.new(snapPos))
     _killVelocity()
     task.wait(0.1)
 
     if not remote then
+        dbg('GRAB', 'FAIL — remote is nil, cannot invoke TakePizzaBox')
         Library:Notify('[Pizza] No remote — cannot grab box')
         return false, nil
     end
+
+    dbg('GRAB', 'Invoking TakePizzaBox on: ' .. remote:GetFullName())
+    dbg('GRAB', '  Payload: { Type = "TakePizzaBox", Box = ' .. tostring(box and box:GetFullName() or 'nil') .. ' }')
 
     local customerTargetPos = nil
     local ok1, r1, r2 = pcall(function()
@@ -461,77 +514,125 @@ local function _grabBox(remote, box, snapPos)
         return a, b
     end)
 
+    dbg('GRAB', 'TakePizzaBox invoke result: ok=' .. tostring(ok1))
     if ok1 then
-        if typeof(r2) == 'Vector3' then customerTargetPos = r2
-        elseif typeof(r1) == 'Vector3' then customerTargetPos = r1 end
+        dbg('GRAB', '  r1=' .. tostring(r1) .. ' (type: ' .. typeof(r1) .. ')')
+        dbg('GRAB', '  r2=' .. tostring(r2) .. ' (type: ' .. typeof(r2) .. ')')
+        if typeof(r2) == 'Vector3' then
+            customerTargetPos = r2
+            dbg('GRAB', '  customerTargetPos from r2: ' .. tostring(r2))
+        elseif typeof(r1) == 'Vector3' then
+            customerTargetPos = r1
+            dbg('GRAB', '  customerTargetPos from r1: ' .. tostring(r1))
+        else
+            dbg('GRAB', '  WARNING — no Vector3 returned, customerTargetPos will be nil')
+        end
         task.wait(0.2)
+    else
+        dbg('GRAB', '  TakePizzaBox InvokeServer ERROR: ' .. tostring(r1))
     end
 
     char = LocalPlayer.Character
     local gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
+    dbg('GRAB', 'Pizza Box in character inventory: ' .. tostring(gotBox))
+
+    -- Extra diagnostics: list character children for visibility
+    if char then
+        local childNames = {}
+        for _, c in next, char:GetChildren() do table.insert(childNames, c.Name) end
+        dbg('GRAB', 'Character children: ' .. table.concat(childNames, ', '))
+    end
+
     return gotBox, customerTargetPos
 end
 
--- Snap to customer and fire DeliverPizza via remote.
+-- Deliver pizza via DeliverPizza FireServer
 local function _deliverPizza(remote, customer, snapPos)
     local char = LocalPlayer.Character
-    if not char then return false end
+    if not char then
+        dbg('DELIVER', '_deliverPizza() aborted — no character')
+        return false
+    end
 
-    -- Snap exactly onto customer so server proximity check passes
+    dbg('DELIVER', 'Snapping to customer position: ' .. tostring(snapPos))
     char:SetPrimaryPartCFrame(CFrame.new(snapPos))
     _killVelocity()
     task.wait(0.1)
 
     if not remote then
+        dbg('DELIVER', 'FAIL — remote is nil, cannot fire DeliverPizza')
         Library:Notify('[Pizza] No remote — cannot deliver')
         return false
     end
 
-    -- Fire delivery to server — works tabbed out
-    local ok = pcall(function()
+    dbg('DELIVER', 'Firing DeliverPizza on: ' .. remote:GetFullName())
+    dbg('DELIVER', '  Payload: { Type = "DeliverPizza", Customer = ' .. tostring(customer and customer.Name or 'nil') .. ' }')
+
+    local ok, err = pcall(function()
         remote:FireServer({ Type = 'DeliverPizza', Customer = customer })
     end)
+
+    dbg('DELIVER', 'DeliverPizza FireServer result: ok=' .. tostring(ok) .. (ok and '' or ' err=' .. tostring(err)))
 
     if not ok then
         Library:Notify('[Pizza] DeliverPizza FireServer failed')
         return false
     end
 
+    dbg('DELIVER', 'DeliverPizza sent successfully.')
     return true
 end
 
--- ── Main delivery loop ─────────────────────────────────────────
+-- ================================================================
+--  MAIN DELIVERY LOOP
+-- ================================================================
 _fnDelivery = function(toggle)
-    if not toggle then return end
+    dbg('LOOP', '_fnDelivery called with toggle=' .. tostring(toggle))
+    if not toggle then
+        dbg('LOOP', 'Toggle is false — exiting.')
+        return
+    end
 
     local remote = _getDeliveryRemote()
     if not remote then
         Library:Notify('[Pizza] Cannot start — no remote found.')
-        -- Force toggle off
+        dbg('LOOP', 'ABORT — remote is nil after discovery.')
         if Toggles.BX_PizzaDelivery then Toggles.BX_PizzaDelivery:SetValue(false) end
         return
     end
 
+    dbg('LOOP', 'Remote confirmed: ' .. remote:GetFullName())
     Library:Notify('[Pizza] Spawning moped…')
-    _spawnMoped(remote, 8)
+    local gotMoped = _spawnMoped(remote, 8)
+    dbg('LOOP', 'Initial moped spawn result: ' .. tostring(gotMoped))
     task.wait(1)
 
     Library:Notify('[Pizza Delivery] Loop running!')
+    dbg('LOOP', '=== DELIVERY LOOP START ===')
+
+    local loopCount = 0
 
     while _isDelivering() do
         task.wait(0.1)
+        loopCount = loopCount + 1
+        dbg('LOOP', '--- Loop iteration #' .. loopCount .. ' ---')
+
         local char = LocalPlayer.Character
-        if not char then task.wait(1); continue end
+        if not char then
+            dbg('LOOP', 'No character — waiting…')
+            task.wait(1); continue
+        end
 
         local mode = Options.BX_MoveMode and Options.BX_MoveMode.Value or 'Tween (Safe)'
+        dbg('LOOP', 'Mode: ' .. mode)
 
-        -- ── 0. Ensure moped is present ─────────────────────────
-        -- This is the key recovery step: if anything went wrong
-        -- and the moped is gone, we re-spawn it before proceeding.
+        -- Step 0: Ensure moped
         if not _hasMoped() then
+            dbg('LOOP', 'STEP 0 — Moped missing! Attempting re-spawn…')
             Library:Notify('[Pizza] Moped missing — re-spawning…')
-            local gotMoped = _spawnMoped(remote, 8)
-            if not gotMoped then
+            local recovered = _spawnMoped(remote, 8)
+            dbg('LOOP', 'Moped recovery result: ' .. tostring(recovered))
+            if not recovered then
                 Library:Notify('[Pizza] Could not recover moped. Retrying…')
                 task.wait(2); continue
             end
@@ -539,54 +640,59 @@ _fnDelivery = function(toggle)
             if not char then task.wait(1); continue end
         end
 
-        -- ── 1. Find a conveyor box ─────────────────────────────
+        -- Step 1: Find box
+        dbg('LOOP', 'STEP 1 — Finding conveyor box…')
         local box = _getConveyorBox()
-        if not box then task.wait(0.4); continue end
+        if not box then
+            dbg('LOOP', 'No box available yet — waiting…')
+            task.wait(0.4); continue
+        end
+        dbg('LOOP', 'Box found: ' .. box:GetFullName())
 
         local root = char:FindFirstChild('HumanoidRootPart')
-        if not root then task.wait(0.5); continue end
+        if not root then
+            dbg('LOOP', 'No HumanoidRootPart — skipping iteration')
+            task.wait(0.5); continue
+        end
 
-        -- ── Desync: record home position and anchor everything ──
+        -- Desync: anchor everything
         local desyncHomePos = nil
         if mode == 'Desync TP' then
             desyncHomePos = root.Position
-            -- Anchor character root so server sees us frozen at PizzaPlanet
+            dbg('LOOP', 'Desync mode — anchoring root at ' .. tostring(desyncHomePos))
             root.Anchored = true
-            -- ALSO anchor the moped so the server sees it frozen here too.
-            -- (Moped is a child of character — we must freeze it explicitly.)
             _setMopedAnchored(true)
             task.wait(0.05)
         end
 
-        -- ── 2. Move to box and grab it ─────────────────────────
+        -- Step 2: Move to box and grab
+        dbg('LOOP', 'STEP 2 — Moving to box at ' .. tostring(box.Position))
         local boxSnapPos = Vector3.new(box.Position.X, box.Position.Y + 3, box.Position.Z)
         _moveToPos(box.Position)
 
         char = LocalPlayer.Character
         if not char then
-            if mode == 'Desync TP' and root then
-                root.Anchored = false; _setMopedAnchored(false)
-            end
+            dbg('LOOP', 'Character lost after moving to box')
+            if mode == 'Desync TP' and root then root.Anchored = false; _setMopedAnchored(false) end
             continue
         end
-
         if not _isDelivering() then
-            if mode == 'Desync TP' and root then
-                root.Anchored = false; _setMopedAnchored(false)
-            end
+            dbg('LOOP', 'Delivery toggled off after moving to box — breaking')
+            if mode == 'Desync TP' and root then root.Anchored = false; _setMopedAnchored(false) end
             break
         end
 
+        dbg('LOOP', 'STEP 2 — Attempting to grab box…')
         local gotBox, customerTargetPos = _grabBox(remote, box, boxSnapPos)
+        dbg('LOOP', 'Grab result: gotBox=' .. tostring(gotBox) .. ' customerTargetPos=' .. tostring(customerTargetPos))
 
         if not gotBox then
             Library:Notify('[Pizza] Could not grab box, retrying…')
+            dbg('LOOP', 'Box grab FAILED — will retry next iteration')
             if mode == 'Desync TP' and root then
-                -- Return client to home first, then unanchor
                 char = LocalPlayer.Character
                 if char and desyncHomePos then
-                    char:SetPrimaryPartCFrame(CFrame.new(desyncHomePos))
-                    task.wait(0.05)
+                    char:SetPrimaryPartCFrame(CFrame.new(desyncHomePos)); task.wait(0.05)
                 end
                 root.Anchored = false; _setMopedAnchored(false)
             end
@@ -594,17 +700,20 @@ _fnDelivery = function(toggle)
         end
 
         Library:Notify('[Pizza] Got box — finding customer…')
+        dbg('LOOP', 'Box grabbed. Now searching for customer…')
 
-        -- ── 3. Find customer ───────────────────────────────────
+        -- Step 3: Find customer
         local customer = nil
-        for _ = 1, 30 do
+        for attempt = 1, 30 do
             task.wait(0.3)
             customer = _findCustomerForBox(customerTargetPos)
+            dbg('LOOP', 'Customer search attempt ' .. attempt .. '/30: ' .. tostring(customer and customer.Name or 'nil'))
             if customer then break end
         end
 
         if not customer then
             Library:Notify('[Pizza] No customer found — retrying…')
+            dbg('LOOP', 'Customer NOT found after 30 attempts!')
             if mode == 'Desync TP' and root then
                 char = LocalPlayer.Character
                 if char and desyncHomePos then
@@ -617,6 +726,7 @@ _fnDelivery = function(toggle)
 
         local customerHRP = customer:FindFirstChild('HumanoidRootPart') or customer.PrimaryPart
         if not customerHRP then
+            dbg('LOOP', 'Customer HRP missing for: ' .. customer.Name)
             if mode == 'Desync TP' and root then
                 char = LocalPlayer.Character
                 if char and desyncHomePos then
@@ -627,13 +737,16 @@ _fnDelivery = function(toggle)
             task.wait(0.5); continue
         end
 
+        dbg('LOOP', 'Customer found: ' .. customer.Name .. ' at ' .. tostring(customerHRP.Position))
         Library:Notify('[Pizza] Moving to customer…')
 
-        -- ── 4. Move to customer ────────────────────────────────
+        -- Step 4: Move to customer
         local exactCustomerPos = customerHRP.Position
+        dbg('LOOP', 'STEP 4 — Moving to customer at ' .. tostring(exactCustomerPos))
         _moveToPos(exactCustomerPos)
 
         if not _isDelivering() then
+            dbg('LOOP', 'Delivery toggled off during move to customer — breaking')
             if mode == 'Desync TP' and root then
                 char = LocalPlayer.Character
                 if char and desyncHomePos then
@@ -644,57 +757,58 @@ _fnDelivery = function(toggle)
             break
         end
 
-        -- ── 5. Deliver via remote (no keypress needed) ─────────
+        -- Step 5: Deliver
+        dbg('LOOP', 'STEP 5 — Delivering pizza to ' .. customer.Name)
         local delivered = _deliverPizza(remote, customer, exactCustomerPos)
+        dbg('LOOP', 'Delivery result: ' .. tostring(delivered))
         if delivered then
             Library:Notify('[Pizza] Delivered!')
         else
             Library:Notify('[Pizza] Delivery remote call failed — continuing…')
         end
 
-        -- ── 6. Desync cleanup ──────────────────────────────────
-        -- CRITICAL ORDER:
-        --   a) TP client BACK to PizzaPlanet (home pos)
-        --   b) Unanchor root
-        --   c) Unanchor moped
-        -- If we unanchor at the customer position the server sees a
-        -- position jump and may kick or flag the account.
+        -- Step 6: Desync cleanup
         if mode == 'Desync TP' then
+            dbg('LOOP', 'STEP 6 — Desync cleanup: returning client to ' .. tostring(desyncHomePos))
             task.wait(0.15)
             char = LocalPlayer.Character
             if char and desyncHomePos then
-                char:SetPrimaryPartCFrame(CFrame.new(desyncHomePos))
-                task.wait(0.05)
+                char:SetPrimaryPartCFrame(CFrame.new(desyncHomePos)); task.wait(0.05)
             end
-            if root then
-                root.Anchored = false
-            end
+            if root then root.Anchored = false end
             _setMopedAnchored(false)
             _killVelocity()
+            dbg('LOOP', 'Desync cleanup complete.')
         end
 
-        -- ── 7. Wait for box to leave inventory ─────────────────
+        -- Step 7: Wait for box to clear
+        dbg('LOOP', 'STEP 7 — Waiting for Pizza Box to clear inventory…')
         local timeout = 0
         repeat
             task.wait(0.2); timeout = timeout + 0.2
             char = LocalPlayer.Character
         until not (char and char:FindFirstChild('Pizza Box')) or timeout >= 10
+        dbg('LOOP', 'Box cleared after ' .. timeout .. 's (timeout at 10s)')
 
         if timeout >= 10 then
             Library:Notify('[Pizza] Box did not clear — possible miss. Continuing…')
+            dbg('LOOP', 'WARNING — Pizza Box still in inventory after 10s!')
         end
 
-        -- ── 8. Confirm moped is still OK before next loop ──────
+        -- Step 8: Confirm moped
         task.wait(0.3)
         if _isDelivering() and not _hasMoped() then
+            dbg('LOOP', 'STEP 8 — Moped lost after delivery, re-spawning…')
             Library:Notify('[Pizza] Moped lost after delivery — re-spawning…')
             _spawnMoped(remote, 6)
         end
 
+        dbg('LOOP', 'Iteration #' .. loopCount .. ' complete.')
         task.wait(0.2)
-    end -- while _isDelivering()
+    end
 
-    -- ── Cleanup on stop ────────────────────────────────────────
+    dbg('LOOP', '=== DELIVERY LOOP ENDED ===')
+
     local char = LocalPlayer.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
     if root then root.Anchored = false end
@@ -708,21 +822,40 @@ end
 --  FRAMEWORK BOOTSTRAP
 -- ================================================================
 task.spawn(function()
+    dbg('BOOT', 'Framework bootstrap started. Waiting for ReplicatedStorage.Framework…')
+
     local ok, fw = pcall(function()
         local m = require(_RepStore:WaitForChild('Framework', 10))
+        dbg('BOOT', 'Framework module required. Type: ' .. type(m))
         return m and getupvalue(m, 3) or nil
     end)
+
+    dbg('BOOT', 'Framework pcall result: ok=' .. tostring(ok) .. ' fw=' .. tostring(fw))
+
     if not ok or not fw then
         Library:Notify('[BXBRG] Framework not found — run inside Bloxburg!')
+        dbg('BOOT', 'FAIL — Framework not found or getupvalue(m,3) returned nil.')
         return
     end
     _bxFW = fw
 
+    dbg('BOOT', 'Waiting for _bxFW.Modules and _bxFW.net…')
     local _bxMods
-    repeat task.wait()
+    local netWait = 0
+    repeat
+        task.wait(0.1)
+        netWait = netWait + 0.1
         _bxMods = _bxFW.Modules
         _bxNet  = _bxFW.net
-    until _bxMods and _bxNet
+        dbg('BOOT', 'Polling… Modules=' .. tostring(_bxMods ~= nil) .. ' net=' .. tostring(_bxNet ~= nil) .. ' t=' .. netWait)
+    until (_bxMods and _bxNet) or netWait > 30
+
+    if not _bxMods or not _bxNet then
+        dbg('BOOT', 'FAIL — Modules or net never appeared after 30s!')
+        Library:Notify('[BXBRG] Framework modules/net not found!')
+        return
+    end
+    dbg('BOOT', 'Framework Modules and net ready!')
 
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
 
@@ -731,13 +864,19 @@ task.spawn(function()
     _oldFS = hookfunction(_bxNet.FireServer, function(self, data, ...)
         if data and data.Type == 'EndShift'
         and Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then
+            dbg('HOOK', 'EndShift blocked (delivery active)')
             return
+        end
+        if data and data.Type then
+            dbg('HOOK', 'FireServer passthrough: Type=' .. tostring(data.Type))
         end
         return pcall(_oldFS, self, data, ...)
     end)
+    dbg('BOOT', 'EndShift suppression hook installed.')
 
     -- ── Save House ────────────────────────────────────────────
     _fnSaveHouse = function(player)
+        dbg('SAVE', 'Saving house for player: ' .. player.Name)
         local plot   = workspace.Plots[string.format('Plot_%s', player.Name)]
         local ground = plot.Ground
         local save   = {
@@ -948,10 +1087,12 @@ task.spawn(function()
         )
         Library:Notify(string.format('House of %s saved!', player.Name))
         _bxRefreshHouseList()
+        dbg('SAVE', 'House save complete for ' .. player.Name)
     end
 
     -- ── Load House ────────────────────────────────────────────
     _fnLoadHouse = function(houseData)
+        dbg('LOAD', 'Starting house load…')
         local myPlot   = workspace.Plots['Plot_' .. LocalPlayer.Name]
         local myGround = myPlot.Ground
         local placements = 0
@@ -961,6 +1102,7 @@ task.spawn(function()
             net = setmetatable({
                 InvokeServer = function(self, data, ...)
                     placements = placements + 1
+                    dbg('LOAD', 'InvokeServer #' .. placements .. ' Type=' .. tostring(data and data.Type or 'nil'))
                     if placements >= 4 then placements = 0; task.wait(3) end
                     local dt  = data.Type
                     local ret = { oldFW.net:InvokeServer(data) }
@@ -972,8 +1114,10 @@ task.spawn(function()
             }, { __index = oldFW.net })
         }
         local pos = fw.net:InvokeServer({ Type='ToPlot', Player=LocalPlayer })
+        dbg('LOAD', 'ToPlot result: ' .. tostring(pos))
         LocalPlayer.Character:SetPrimaryPartCFrame(pos)
         fw.net:InvokeServer({ Type='EnterBuild', Plot=myPlot })
+        dbg('LOAD', 'EnterBuild sent.')
         local function cvt3(s)
             return myGround.CFrame:PointToWorldSpace(Vector3.new(unpack(s:split(','))))
         end
@@ -1047,19 +1191,28 @@ task.spawn(function()
         end
         fw.net:FireServer({ Type='ExitBuild' })
         Library:Notify('House loaded!')
+        dbg('LOAD', 'House load complete.')
     end
 
     -- ── Teleport to plot ──────────────────────────────────────
     _fnTeleportPlot = function(name)
+        dbg('TP', 'Teleporting to plot of: ' .. name)
         local target = Players:FindFirstChild(name)
-        if not target then Library:Notify('Player not found!'); return end
+        if not target then
+            dbg('TP', 'FAIL — player not found: ' .. name)
+            Library:Notify('Player not found!'); return
+        end
+        dbg('TP', 'Invoking ToPlot for ' .. name)
         local pos = _bxFW.net:InvokeServer({ Type = 'ToPlot', Player = target })
+        dbg('TP', 'ToPlot returned: ' .. tostring(pos))
         LocalPlayer.Character:SetPrimaryPartCFrame(pos)
         Library:Notify('Teleported to ' .. name .. "'s plot")
+        dbg('TP', 'Teleport complete.')
     end
 
     _bxReady = true
+    dbg('BOOT', 'Framework bootstrap COMPLETE. _bxReady = true')
     Library:Notify('[BXBRG] Framework loaded!')
-end) -- end task.spawn
+end)
 
 end -- return function
