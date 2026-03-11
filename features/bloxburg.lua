@@ -270,14 +270,36 @@ end
 local BOX_TAG = 'PizzaPlanetDeliveryCustomer'
 
 local function _getDeliveryRemote()
-    local ok, ds = pcall(function()
-        return _RepStore:WaitForChild('Modules', 10):WaitForChild('DataService', 10)
+    -- Path from decompiled source:
+    -- ReplicatedStorage.Modules.DataService.[numericId].[numericId]
+    -- e.g. DataService > 756538457 > 756538457
+    -- We don't hardcode the ID — we wait for the first child then
+    -- wait for a same-named child inside it.
+    local ok, remote = pcall(function()
+        local modules = _RepStore:WaitForChild('Modules', 15)
+        local ds      = modules:WaitForChild('DataService', 15)
+
+        -- Wait for the numeric ID folder to appear
+        local idFolder
+        local waited = 0
+        repeat
+            task.wait(0.2); waited = waited + 0.2
+            idFolder = ds:GetChildren()[1]
+        until idFolder or waited >= 10
+
+        if not idFolder then error('DataService has no children') end
+
+        -- Inside the ID folder is a RemoteFunction/Event with the same name
+        local innerRemote = idFolder:WaitForChild(idFolder.Name, 10)
+        if not innerRemote then error('Inner remote not found inside ' .. idFolder.Name) end
+
+        return innerRemote
     end)
-    if not ok or not ds then Library:Notify('[Pizza] DataService not found!'); return nil end
-    local child = ds:GetChildren()[1]
-    if not child then Library:Notify('[Pizza] DataService empty!'); return nil end
-    local remote = child:FindFirstChild(child.Name)
-    if not remote then Library:Notify('[Pizza] Remote missing!'); return nil end
+
+    if not ok or not remote then
+        Library:Notify('[Pizza] Remote lookup failed: ' .. tostring(remote))
+        return nil
+    end
     return remote
 end
 
