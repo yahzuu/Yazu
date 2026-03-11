@@ -3,7 +3,7 @@
 --  All other files are loaded from your GitHub repo below.
 -- ================================================================
 
-local repo = 'https://raw.githubusercontent.com/yahzuu/yahzuu/main/Yazu/'
+local repo = 'https://raw.githubusercontent.com/yahzuu/Yazu/main/'
 
 local function load(path)
     return loadstring(game:HttpGet(repo .. path))()
