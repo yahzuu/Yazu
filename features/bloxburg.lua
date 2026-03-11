@@ -1,77 +1,79 @@
 -- ================================================================
 --  features/bloxburg.lua
---  Contains: All Bloxburg auto-farm, auto-build, and misc logic.
---  This is the largest file — ~600 lines but entirely self-contained.
+--  Pizza Delivery only — all other jobs removed.
+--
+--  Fixes applied:
+--   1. Speed/ShiftLoop kick   → UsePizzaMoped at start so ShiftLoop
+--                               uses moped proximity (follows you)
+--                               instead of AreaBlock distance check.
+--   2. Proper box pickup       → InvokeServer({ Type='TakePizzaBox' })
+--                               instead of unreliable keypress.
+--   3. Proper delivery         → FireServer({ Type='DeliverPizza' })
+--                               instead of unreliable keypress.
+--   4. Customer detection      → checks both CollectionService tags
+--                               AND workspace._game.SpawnedCharacters
+--                               (found in decompiled game source).
+--   5. EndShift suppression    → hooked via framework (backup layer).
+--   6. Movement modes          → Tween (Safe), Teleport, Underground.
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
 
-local TweenService    = Services.TweenService
-local Players         = Services.Players
-local LocalPlayer     = Services.LocalPlayer
-local _PathSvc        = Services.PathfindingService
-local _HttpSvc        = Services.HttpService
-local _RepStore       = Services.ReplicatedStorage
-local _CollSvc        = Services.CollectionService
-local _Heartbt        = Services.RunService.Heartbeat
+local TweenService = Services.TweenService
+local Players      = Services.Players
+local LocalPlayer  = Services.LocalPlayer
+local _HttpSvc     = Services.HttpService
+local _RepStore    = Services.ReplicatedStorage
+local _CollSvc     = Services.CollectionService
+local _PathSvc     = Services.PathfindingService
 
--- ── Forward-declare job function handles ──────────────────────
-local _bxFW, _bxNet, _bxJobs
+-- Framework refs — populated once the async bootstrap finishes
+local _bxFW, _bxNet
 local _bxReady = false
 
-local _fnDelivery, _fnBensIceCream, _fnStylezHair, _fnBloxyBurgers
-local _fnPizzaBaker, _fnFisherman, _fnMechanic, _fnLumber
-local _fnMiner, _fnJanitor, _fnSuperCashier, _fnStocker
-local _fnSaveHouse, _fnLoadHouse, _fnTeleportPlot
+local _fnDelivery, _fnSaveHouse, _fnLoadHouse, _fnTeleportPlot
 
 local function _notReady() Library:Notify('Still loading Bloxburg framework…') end
-local function _call(fnRef, v)
-    if not _bxReady then _notReady(); return end
-    if fnRef then task.spawn(fnRef, v) end
-end
 
 -- ================================================================
---  UI — BXBRG TAB  (always built immediately, no waiting)
+--  UI
 -- ================================================================
-local BX_FarmGrp  = Tabs.BXBRG:AddLeftGroupbox('Auto Farm')
+local BX_PizzaGrp = Tabs.BXBRG:AddLeftGroupbox('Pizza Delivery')
 local BX_BuildGrp = Tabs.BXBRG:AddRightGroupbox('Auto Build')
 local BX_MiscGrp  = Tabs.BXBRG:AddLeftGroupbox('Misc')
 
-BX_FarmGrp:AddToggle('BX_PizzaDelivery',      { Text = 'Pizza Delivery',      Default = false, Callback = function(v) if _fnDelivery then task.spawn(_fnDelivery, v) else Library:Notify('Still loading…') end end })
-BX_FarmGrp:AddToggle('BX_BensIceCream',       { Text = 'Bens Ice Cream',      Default = false, Callback = function(v) _call(_fnBensIceCream, v)  end })
-BX_FarmGrp:AddToggle('BX_StylezHairDresser',  { Text = 'Stylez Hair Dresser', Default = false, Callback = function(v) _call(_fnStylezHair, v)    end })
-BX_FarmGrp:AddToggle('BX_BloxyBurgers',       { Text = 'Bloxy Burgers',       Default = false, Callback = function(v) _call(_fnBloxyBurgers, v)  end })
-BX_FarmGrp:AddToggle('BX_PizzaBaker',         { Text = 'Pizza Baker',         Default = false, Callback = function(v) _call(_fnPizzaBaker, v)    end })
-BX_FarmGrp:AddToggle('BX_Fisherman',          { Text = 'Fisherman',           Default = false, Callback = function(v) _call(_fnFisherman, v)     end })
-BX_FarmGrp:AddToggle('BX_Mechanic',           { Text = 'Mechanic',            Default = false, Callback = function(v) _call(_fnMechanic, v)      end })
-BX_FarmGrp:AddToggle('BX_Lumber',             { Text = 'Lumber',              Default = false, Callback = function(v) _call(_fnLumber, v)        end })
-BX_FarmGrp:AddToggle('BX_Miner',              { Text = 'Miner',               Default = false, Callback = function(v) _call(_fnMiner, v)         end })
-BX_FarmGrp:AddToggle('BX_Janitor',            { Text = 'Janitor',             Default = false, Callback = function(v) _call(_fnJanitor, v)       end })
-BX_FarmGrp:AddToggle('BX_SupermarketCashier', { Text = 'Supermarket Cashier', Default = false, Callback = function(v) _call(_fnSuperCashier, v)  end })
-BX_FarmGrp:AddToggle('BX_SupermarketStocker', { Text = 'Supermarket Stocker', Default = false, Callback = function(v) _call(_fnStocker, v)       end })
-
--- Auto Build
-BX_BuildGrp:AddLabel('Copy House')
-BX_BuildGrp:AddDropdown('BX_CopyHousePlayer', {
-    Text = 'Select Player', Default = 1,
-    Values = (function()
-        local names = {}
-        for _, p in next, Players:GetPlayers() do if p ~= LocalPlayer then table.insert(names, p.Name) end end
-        return #names > 0 and names or {''}
-    end)(),
+-- Movement settings
+BX_PizzaGrp:AddDropdown('BX_MoveMode', {
+    Text    = 'Movement Mode',
+    Default = 1,
+    Values  = { 'Tween (Safe)', 'Teleport', 'Underground' },
 })
-BX_BuildGrp:AddButton({ Text = 'Copy House', Func = function()
-    if not _bxReady then _notReady() return end
-    local name = Options.BX_CopyHousePlayer and Options.BX_CopyHousePlayer.Value or ''
-    if name == '' then Library:Notify('No player selected!') return end
-    local target = Players:FindFirstChild(name)
-    if not target then Library:Notify('Player not found!') return end
-    if _fnSaveHouse then task.spawn(_fnSaveHouse, target) end
-end })
+-- Tooltip hint shown as a label
+BX_PizzaGrp:AddLabel('Safe=slow tween | TP=instant | UG=go underground')
 
-BX_BuildGrp:AddDivider()
-BX_BuildGrp:AddLabel('Load Saved House')
+BX_PizzaGrp:AddSlider('BX_TweenSpeed', {
+    Text     = 'Tween Speed (studs/s)',
+    Default  = 55,
+    Min      = 15,
+    Max      = 120,
+    Rounding = 0,
+})
 
+BX_PizzaGrp:AddDivider()
+
+BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
+    Text     = 'Pizza Delivery',
+    Default  = false,
+    Callback = function(v)
+        if _fnDelivery then
+            task.spawn(_fnDelivery, v)
+        else
+            Library:Notify('Still loading…')
+        end
+    end,
+})
+
+-- ── Auto Build (house save / load) ────────────────────────────
 local function _bxRefreshHouseList()
     if not isfolder('Yazu') then makefolder('Yazu') end
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
@@ -87,14 +89,41 @@ local function _bxRefreshHouseList()
     return names
 end
 
-BX_BuildGrp:AddDropdown('BX_LoadHouseFile', { Text = 'Select House File', Default = 1, Values = _bxRefreshHouseList() })
+BX_BuildGrp:AddLabel('Copy House')
+BX_BuildGrp:AddDropdown('BX_CopyHousePlayer', {
+    Text    = 'Select Player',
+    Default = 1,
+    Values  = (function()
+        local names = {}
+        for _, p in next, Players:GetPlayers() do
+            if p ~= LocalPlayer then table.insert(names, p.Name) end
+        end
+        return #names > 0 and names or {''}
+    end)(),
+})
+BX_BuildGrp:AddButton({ Text = 'Copy House', Func = function()
+    if not _bxReady then _notReady(); return end
+    local name = Options.BX_CopyHousePlayer and Options.BX_CopyHousePlayer.Value or ''
+    if name == '' then Library:Notify('No player selected!'); return end
+    local target = Players:FindFirstChild(name)
+    if not target then Library:Notify('Player not found!'); return end
+    if _fnSaveHouse then task.spawn(_fnSaveHouse, target) end
+end })
+
+BX_BuildGrp:AddDivider()
+BX_BuildGrp:AddLabel('Load Saved House')
+BX_BuildGrp:AddDropdown('BX_LoadHouseFile', {
+    Text    = 'Select House File',
+    Default = 1,
+    Values  = _bxRefreshHouseList(),
+})
 BX_BuildGrp:AddButton({ Text = 'Refresh File List', Func = _bxRefreshHouseList })
 BX_BuildGrp:AddButton({ Text = 'Load House', Func = function()
-    if not _bxReady then _notReady() return end
+    if not _bxReady then _notReady(); return end
     local file = Options.BX_LoadHouseFile and Options.BX_LoadHouseFile.Value or ''
-    if file == '' then Library:Notify('No file selected!') return end
+    if file == '' then Library:Notify('No file selected!'); return end
     local ok, data = pcall(readfile, 'Yazu/Bloxburg Houses/' .. file)
-    if not ok then Library:Notify('Error reading file!') return end
+    if not ok then Library:Notify('Error reading file!'); return end
     local houseData = _HttpSvc:JSONDecode(data)
     local bsVal    = houseData.bsValue    or 0
     local totalVal = (houseData.totalValue or 0) - (bsVal * 20)
@@ -102,27 +131,32 @@ BX_BuildGrp:AddButton({ Text = 'Load House', Func = function()
     if _fnLoadHouse then task.spawn(_fnLoadHouse, houseData) end
 end })
 
--- Misc
+-- ── Misc (teleport to plot) ────────────────────────────────────
 BX_MiscGrp:AddLabel('Teleport to Player Plot')
 BX_MiscGrp:AddDropdown('BX_TpPlotPlayer', {
-    Text = 'Select Player', Default = 1,
-    Values = (function()
+    Text    = 'Select Player',
+    Default = 1,
+    Values  = (function()
         local names = {}
-        for _, p in next, Players:GetPlayers() do if p ~= LocalPlayer then table.insert(names, p.Name) end end
+        for _, p in next, Players:GetPlayers() do
+            if p ~= LocalPlayer then table.insert(names, p.Name) end
+        end
         return #names > 0 and names or {''}
     end)(),
 })
 BX_MiscGrp:AddButton({ Text = 'Teleport to Plot', Func = function()
-    if not _bxReady then _notReady() return end
+    if not _bxReady then _notReady(); return end
     local name = Options.BX_TpPlotPlayer and Options.BX_TpPlotPlayer.Value or ''
-    if name == '' then Library:Notify('No player selected!') return end
+    if name == '' then Library:Notify('No player selected!'); return end
     if _fnTeleportPlot then _fnTeleportPlot(name) end
 end })
 
--- Player dropdown refresh
+-- Keep player dropdowns fresh
 local function _bxUpdatePlayerDropdowns()
     local vals = {}
-    for _, p in next, Players:GetPlayers() do if p ~= LocalPlayer then table.insert(vals, p.Name) end end
+    for _, p in next, Players:GetPlayers() do
+        if p ~= LocalPlayer then table.insert(vals, p.Name) end
+    end
     if #vals == 0 then vals = {''} end
     if Options.BX_CopyHousePlayer then Options.BX_CopyHousePlayer:SetValues(vals) end
     if Options.BX_TpPlotPlayer     then Options.BX_TpPlotPlayer:SetValues(vals)     end
@@ -131,93 +165,282 @@ Players.PlayerAdded:Connect(_bxUpdatePlayerDropdowns)
 Players.PlayerRemoving:Connect(function() task.defer(_bxUpdatePlayerDropdowns) end)
 
 -- ================================================================
---  PIZZA DELIVERY  (standalone, no framework needed)
+--  MOVEMENT HELPER
+--  Three modes selectable from the UI:
+--   • Tween (Safe)  — smooth tween at configurable studs/s
+--   • Teleport      — instant SetPrimaryPartCFrame
+--   • Underground   — dips to Y=-500 then surfaces at target
+--                     (avoids map-level visibility/speed sensors)
 -- ================================================================
-local BOX_TAG    = 'PizzaPlanetDeliveryCustomer'
-local TWEEN_SPEED = 28
+local function _isDelivering()
+    return Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value
+end
+
+local function _moveToPos(targetPos)
+    local char = LocalPlayer.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if not root then return end
+
+    local mode  = Options.BX_MoveMode  and Options.BX_MoveMode.Value  or 'Tween (Safe)'
+    local speed = Options.BX_TweenSpeed and Options.BX_TweenSpeed.Value or 55
+
+    if mode == 'Teleport' then
+        -- ── Instant teleport ──────────────────────────────────
+        char:SetPrimaryPartCFrame(CFrame.new(targetPos))
+        task.wait(0.15)
+
+    elseif mode == 'Underground' then
+        -- ── Go underground then surface at destination ─────────
+        -- Useful to bypass above-ground distance/speed detection
+        char:SetPrimaryPartCFrame(CFrame.new(Vector3.new(targetPos.X, -500, targetPos.Z)))
+        task.wait(0.05)
+        char:SetPrimaryPartCFrame(CFrame.new(targetPos))
+        task.wait(0.15)
+
+    else
+        -- ── Tween (Safe) ─────────────────────────────────────
+        -- Smooth movement that mimics moped-like travel speed.
+        -- Default 55 studs/s ≈ plausible moped speed.
+        local dist = (root.Position - targetPos).Magnitude
+        if dist < 3 then return end
+
+        local cfVal = Instance.new('CFrameValue')
+        cfVal.Value = root.CFrame
+        local conn = cfVal:GetPropertyChangedSignal('Value'):Connect(function()
+            if LocalPlayer.Character then
+                LocalPlayer.Character:SetPrimaryPartCFrame(cfVal.Value)
+            end
+        end)
+
+        local tw = TweenService:Create(
+            cfVal,
+            TweenInfo.new(dist / speed, Enum.EasingStyle.Linear),
+            { Value = CFrame.new(targetPos) }
+        )
+        tw:Play()
+
+        local done = false
+        tw.Completed:Connect(function() done = true end)
+        repeat task.wait(0.05)
+        until done or not _isDelivering()
+
+        tw:Cancel()
+        conn:Disconnect()
+        cfVal:Destroy()
+    end
+end
+
+-- ================================================================
+--  PIZZA DELIVERY CORE
+-- ================================================================
+local BOX_TAG = 'PizzaPlanetDeliveryCustomer'
 
 local function _getDeliveryRemote()
-    local ds = _RepStore:WaitForChild('Modules', 10):WaitForChild('DataService', 10)
+    -- Path confirmed from decompiled source:
+    -- ReplicatedStorage.Modules.DataService.[id].[id]
+    local ok, ds = pcall(function()
+        return _RepStore:WaitForChild('Modules', 10):WaitForChild('DataService', 10)
+    end)
+    if not ok or not ds then
+        Library:Notify('[Pizza] Could not find DataService!'); return nil
+    end
     local child = ds:GetChildren()[1]
-    if not child then Library:Notify('[Pizza] DataService remote not found!'); return nil end
+    if not child then
+        Library:Notify('[Pizza] DataService has no children!'); return nil
+    end
     local remote = child:FindFirstChild(child.Name)
-    if not remote then Library:Notify('[Pizza] Remote not found!'); return nil end
+    if not remote then
+        Library:Notify('[Pizza] Remote not found inside DataService child!'); return nil
+    end
     return remote
 end
 
-local function _safeMove(targetPos)
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild('HumanoidRootPart'); if not root then return end
-    local dist = (root.Position - targetPos).Magnitude; if dist < 4 then return end
-    local cfVal = Instance.new('CFrameValue'); cfVal.Value = root.CFrame
-    local conn = cfVal:GetPropertyChangedSignal('Value'):Connect(function()
-        if LocalPlayer.Character then LocalPlayer.Character:SetPrimaryPartCFrame(cfVal.Value) end
-    end)
-    local tw = TweenService:Create(cfVal, TweenInfo.new(dist / TWEEN_SPEED, Enum.EasingStyle.Linear), { Value = CFrame.new(targetPos) })
-    tw:Play()
-    local done = false; tw.Completed:Connect(function() done = true end)
-    repeat task.wait(0.05) until done or not (Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value)
-    tw:Cancel(); conn:Disconnect(); cfVal:Destroy()
-end
-
 local function _getConveyorBox()
-    local conveyor = workspace:FindFirstChild('Environment')
-        and workspace.Environment:FindFirstChild('Locations')
-        and workspace.Environment.Locations:FindFirstChild('City')
-        and workspace.Environment.Locations.City:FindFirstChild('PizzaPlanet')
-        and workspace.Environment.Locations.City.PizzaPlanet:FindFirstChild('Interior')
-        and workspace.Environment.Locations.City.PizzaPlanet.Interior:FindFirstChild('Conveyor')
-        and workspace.Environment.Locations.City.PizzaPlanet.Interior.Conveyor:FindFirstChild('MovingBoxes')
-    if not conveyor then return nil end
-    return conveyor:FindFirstChildWhichIsA('UnionOperation')
+    -- Path: workspace.Environment.Locations.City.PizzaPlanet.Interior.Conveyor.MovingBoxes
+    local env = workspace:FindFirstChild('Environment'); if not env then return nil end
+    local loc = env:FindFirstChild('Locations');         if not loc then return nil end
+    local city = loc:FindFirstChild('City');             if not city then return nil end
+    local pp   = city:FindFirstChild('PizzaPlanet');     if not pp then return nil end
+    local int  = pp:FindFirstChild('Interior');          if not int then return nil end
+    local conv = int:FindFirstChild('Conveyor');         if not conv then return nil end
+    local mb   = conv:FindFirstChild('MovingBoxes');     if not mb then return nil end
+    return mb:FindFirstChildWhichIsA('UnionOperation')
 end
 
+local function _findCustomer()
+    -- Method 1: CollectionService tag (primary)
+    local tagged = _CollSvc:GetTagged(BOX_TAG)
+    if #tagged > 0 then return tagged[1] end
+
+    -- Method 2: workspace._game.SpawnedCharacters (found in decompiled source)
+    local game_  = workspace:FindFirstChild('_game')
+    local spawns = game_ and game_:FindFirstChild('SpawnedCharacters')
+    if spawns then
+        local c = spawns:FindFirstChild('PizzaPlanetDeliveryCustomer')
+        if c then return c end
+        -- Also check any model tagged with the name
+        for _, v in next, spawns:GetChildren() do
+            if v.Name:find('PizzaPlanet') then return v end
+        end
+    end
+
+    return nil
+end
+
+-- ── UsePizzaMoped — the key ShiftLoop bypass ──────────────────
+-- The game's ShiftLoop (client-side) kicks you if:
+--   sqrMag(AreaBlock.Position - root.Position) > 1225 (35 studs)
+--   AND v_u_10 (moped) is nil or not in workspace
+-- Invoking UsePizzaMoped registers v_u_10 = the spawned vehicle.
+-- Since the vehicle is parented to your character it travels with
+-- you, so sqrMag(moped.pos - root.pos) ≈ 0 — always passes.
+local function _spawnMopedBypass(remote)
+    local ok, result = pcall(function()
+        return remote:InvokeServer({ Type = 'UsePizzaMoped' })
+    end)
+    if ok then
+        Library:Notify('[Pizza] Moped spawned — ShiftLoop bypass active')
+    else
+        Library:Notify('[Pizza] Moped spawn failed (may still work)')
+    end
+    return ok and result
+end
+
+-- Main delivery loop
 _fnDelivery = function(toggle)
     if not toggle then return end
-    local remote = _getDeliveryRemote(); if not remote then return end
-    Library:Notify('[Pizza Delivery] Starting loop…')
-    while Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value do
+
+    local remote = _getDeliveryRemote()
+    if not remote then return end
+
+    -- Spawn the moped FIRST — this is what prevents the speed-kick.
+    -- The ShiftLoop checks if the moped is in workspace near us,
+    -- which it always will be once spawned on the character.
+    Library:Notify('[Pizza] Starting — spawning moped for ShiftLoop bypass…')
+    _spawnMopedBypass(remote)
+    task.wait(1.5)
+
+    Library:Notify('[Pizza Delivery] Loop running!')
+
+    while _isDelivering() do
         task.wait(0.1)
-        local char = LocalPlayer.Character; if not char then task.wait(1); continue end
-        local box = _getConveyorBox(); if not box then task.wait(0.5); continue end
-        local result, attempts = nil, 0
-        repeat
-            attempts = attempts + 1; box = _getConveyorBox(); if not box then break end
+
+        local char = LocalPlayer.Character
+        if not char then task.wait(1); continue end
+
+        -- ── 1. Get a box off the conveyor ──────────────────────
+        local box = _getConveyorBox()
+        if not box then task.wait(0.5); continue end
+
+        -- Move to box
+        _moveToPos(box.Position + Vector3.new(0, 3, 0))
+        if not _isDelivering() then break end
+
+        -- Pick up box via proper remote call
+        -- InvokeServer returns: (_, customerTargetPosition)
+        -- This is what the game's own client code uses (from decompile)
+        local gotBox = false
+        local customerTargetPos = nil
+
+        local ok1, r1 = pcall(function()
+            return remote:InvokeServer({ Type = 'TakePizzaBox', Box = box })
+        end)
+        if ok1 then
+            -- r1 may be the customer target position the server returns
+            if typeof(r1) == 'Vector3' then customerTargetPos = r1 end
+            task.wait(0.2)
             char = LocalPlayer.Character
-            if char then char:SetPrimaryPartCFrame(CFrame.new(box.Position + Vector3.new(0, 3, 0))) end
-            task.wait(0.05); keypress(0x45); task.wait(0.05); keyrelease(0x45); task.wait(0.1)
+            gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
+        end
+
+        -- Fallback: keypress if InvokeServer didn't give us the box
+        if not gotBox then
+            keypress(0x45); task.wait(0.1); keyrelease(0x45)
+            task.wait(0.2)
             char = LocalPlayer.Character
-            if char and char:FindFirstChild('Pizza Box') then result = true end
-        until result or attempts >= 40 or not (Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value)
-        if not (Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value) then break end
-        if not result then task.wait(1); continue end
-        Library:Notify('[Pizza] Got box! Finding customer…')
-        local customer, waitAttempts = nil, 0
-        repeat
-            task.wait(0.2); waitAttempts = waitAttempts + 1
-            local tagged = _CollSvc:GetTagged(BOX_TAG)
-            if #tagged > 0 then customer = tagged[1] end
-        until customer or waitAttempts >= 25
-        if not customer then Library:Notify('[Pizza] No customer, retrying…'); task.wait(1); continue end
-        local customerHRP = customer:FindFirstChild('HumanoidRootPart') or customer.PrimaryPart
+            gotBox = char and char:FindFirstChild('Pizza Box') ~= nil
+        end
+
+        if not gotBox then
+            task.wait(0.5); continue
+        end
+
+        Library:Notify('[Pizza] Box picked up! Searching for customer…')
+
+        -- ── 2. Find the delivery customer ──────────────────────
+        local customer = nil
+        for attempt = 1, 35 do
+            task.wait(0.25)
+            customer = _findCustomer()
+            if customer then break end
+        end
+
+        if not customer then
+            Library:Notify('[Pizza] No customer found — skipping this delivery')
+            task.wait(1); continue
+        end
+
+        local customerHRP = customer:FindFirstChild('HumanoidRootPart')
+                         or customer:FindFirstChild('PrimaryPart')
+                         or customer.PrimaryPart
         if not customerHRP then task.wait(0.5); continue end
-        Library:Notify('[Pizza] Walking to customer…')
-        _safeMove(customerHRP.Position + Vector3.new(0, 3, 0))
-        if not (Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value) then break end
-        char = LocalPlayer.Character
-        if char then char:SetPrimaryPartCFrame(CFrame.new(customerHRP.Position + Vector3.new(0, 3, 2))) end
-        task.wait(0.2); keypress(0x45); task.wait(0.1); keyrelease(0x45)
-        Library:Notify('[Pizza] Delivered! Waiting for next box…')
+
+        -- ── 3. Move to customer ────────────────────────────────
+        Library:Notify('[Pizza] Moving to customer…')
+        local deliverPos = customerHRP.Position + Vector3.new(0, 3, 2)
+        _moveToPos(deliverPos)
+        if not _isDelivering() then break end
+
+        -- ── 4. Deliver pizza via proper FireServer call ─────────
+        -- From decompiled source: FireServer({ Type='DeliverPizza', Customer=customer })
+        -- The server validates the Customer instance reference,
+        -- so we must pass the actual model, not just a position.
+        local delivered = false
+
+        local ok2 = pcall(function()
+            remote:FireServer({ Type = 'DeliverPizza', Customer = customer })
+            delivered = true
+        end)
+
+        -- Fallback: keypress
+        if not ok2 or not delivered then
+            keypress(0x45); task.wait(0.1); keyrelease(0x45)
+        end
+
+        Library:Notify('[Pizza] Delivered! Waiting for confirmation…')
+
+        -- ── 5. Wait for box to leave inventory ─────────────────
         local timeout = 0
-        repeat task.wait(0.2); timeout = timeout + 0.2
-        until not (LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('Pizza Box')) or timeout >= 10
-        task.wait(0.5)
+        repeat
+            task.wait(0.2); timeout = timeout + 0.2
+            char = LocalPlayer.Character
+        until not (char and char:FindFirstChild('Pizza Box')) or timeout >= 12
+
+        -- Re-spawn moped periodically (it can despawn after ~30s of use)
+        -- Keeps ShiftLoop bypass active across multiple deliveries
+        if timeout >= 10 then
+            -- Box didn't clear — something went wrong, retry
+            Library:Notify('[Pizza] Box not cleared, retrying…')
+        end
+
+        -- Refresh moped every ~5 deliveries to prevent it despawning
+        -- (the game auto-removes it after 30s idle per the decompile)
+        task.spawn(function()
+            task.wait(0.5)
+            if _isDelivering() then
+                pcall(function() remote:InvokeServer({ Type = 'UsePizzaMoped' }) end)
+            end
+        end)
+
+        task.wait(0.3)
     end
+
     Library:Notify('[Pizza Delivery] Stopped.')
 end
 
 -- ================================================================
---  FRAMEWORK BOOTSTRAP + ALL JOB FUNCTIONS  (async)
+--  FRAMEWORK BOOTSTRAP
+--  Needed for: house save/load, plot teleport, EndShift hook
 -- ================================================================
 task.spawn(function()
     local ok, fw = pcall(function()
@@ -225,84 +448,42 @@ task.spawn(function()
         return m and getupvalue(m, 3) or nil
     end)
     if not ok or not fw then
-        Library:Notify('[BXBRG] Framework not found — run inside Bloxburg!'); return
+        Library:Notify('[BXBRG] Framework not found — run inside Bloxburg!')
+        return
     end
     _bxFW = fw
-    local _bxMods, _bxGui
+
+    local _bxMods
     repeat task.wait()
-        _bxMods = _bxFW.Modules; _bxNet = _bxFW.net
-        _bxJobs = _bxMods and _bxMods.JobHandler; _bxGui = _bxMods and _bxMods.GUIHandler
-    until _bxMods and _bxNet and _bxJobs and _bxGui
+        _bxMods = _bxFW.Modules
+        _bxNet  = _bxFW.net
+    until _bxMods and _bxNet
 
     if not isfolder('Yazu/Bloxburg Houses') then makefolder('Yazu/Bloxburg Houses') end
-    pcall(function() hookfunction(getfenv(_bxNet.FireServer).i, function() print('Ban attempt blocked') end) end)
 
-    -- Helpers
-    local function _tweenTP(position)
-        local root = LocalPlayer.Character and LocalPlayer.Character.PrimaryPart; if not root then return end
-        local path = _PathSvc:CreatePath(); path:ComputeAsync(root.Position, position)
-        local waypoints = path:GetWaypoints()
-        local cfVal = Instance.new('CFrameValue'); cfVal.Value = root.CFrame
-        local conn = cfVal:GetPropertyChangedSignal('Value'):Connect(function()
-            LocalPlayer.Character:SetPrimaryPartCFrame(cfVal.Value)
-        end)
-        for _, wp in next, waypoints do
-            local ti = TweenInfo.new((root.Position - wp.Position).Magnitude / 20, Enum.EasingStyle.Linear)
-            local tw = TweenService:Create(cfVal, ti, { Value = CFrame.new(wp.Position + Vector3.new(0,4,0)) })
-            tw:Play(); tw.Completed:Wait()
+    -- ── EndShift suppression (backup layer) ───────────────────
+    -- Even with the moped bypass, hook EndShift as a safety net.
+    local _oldFS = _bxNet.FireServer
+    _oldFS = hookfunction(_bxNet.FireServer, function(self, data, ...)
+        if data and data.Type == 'EndShift'
+        and Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then
+            -- Block the EndShift signal while we're actively delivering
+            return
         end
-        conn:Disconnect(); cfVal:Destroy()
-    end
-
-    local function _findWS(stations)
-        local best, bd = nil, math.huge
-        local root = LocalPlayer.Character and LocalPlayer.Character.PrimaryPart; if not root then return end
-        for _, v in next, stations:GetChildren() do
-            local d = (root.Position - v.PrimaryPart.Position).Magnitude
-            if d < bd and (v.InUse.Value == nil or v.InUse.Value == LocalPlayer) then bd, best = d, v end
-        end
-        return best
-    end
-
-    local function _findWSBens(stations)
-        for _, v in next, stations:GetChildren() do
-            local c = v.Occupied.Value
-            if c and c.Order.Value == '' then return v end
-        end
-    end
-
-    -- NameCall hook (auto-complete orders)
-    local _bxOldNC
-    _bxOldNC = hookmetamethod(game, '__namecall', function(...)
-        SX_VM_CNONE()
-        local args = {...}; local self = args[1]
-        if typeof(self) ~= 'Instance' then return _bxOldNC(...) end
-        if checkcaller() and getnamecallmethod() == 'FireServer' and args[2] and args[2].Order and args[2].Workstation then
-            local ws = args[2].Workstation
-            if ws.Parent.Name == 'HairdresserWorkstations' and Toggles.BX_StylezHairDresser and Toggles.BX_StylezHairDresser.Value then
-                args[2].Order = { ws.Occupied.Value.Order.Style.Value, ws.Occupied.Value.Order.Color.Value }
-            elseif ws.Parent.Name == 'CashierWorkstations' and Toggles.BX_BloxyBurgers and Toggles.BX_BloxyBurgers.Value then
-                args[2].Order = { ws.Occupied.Value.Order.Burger.Value, ws.Occupied.Value.Order.Fries.Value, ws.Occupied.Value.Order.Cola.Value }
-            elseif ws.Parent.Name == 'BakerWorkstations' and Toggles.BX_PizzaBaker and Toggles.BX_PizzaBaker.Value then
-                args[2].Order = { true, true, true, ws.Order.Value }
-            end
-        end
-        return _bxOldNC(unpack(args))
-    end)
-
-    -- Suppress EndShift during delivery
-    local oldFS = _bxNet.FireServer
-    oldFS = hookfunction(_bxNet.FireServer, function(self, data, ...)
-        if data.Type == 'EndShift' and Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then return end
-        return pcall(oldFS, self, data, ...)
+        return pcall(_oldFS, self, data, ...)
     end)
 
     -- ── Save House ────────────────────────────────────────────
     _fnSaveHouse = function(player)
         local plot   = workspace.Plots[string.format('Plot_%s', player.Name)]
         local ground = plot.Ground
-        local save   = { Walls={}, Paths={}, Floors={}, Roofs={}, Pools={}, Fences={}, Ground={ Counters={}, Objects={} }, Basements={} }
-        local function getRot(obj) return tostring(plot.PrimaryPart.CFrame:ToObjectSpace(obj)) end
+        local save   = {
+            Walls={}, Paths={}, Floors={}, Roofs={}, Pools={},
+            Fences={}, Ground={ Counters={}, Objects={} }, Basements={}
+        }
+        local function getRot(obj)
+            return tostring(plot.PrimaryPart.CFrame:ToObjectSpace(obj))
+        end
         local function getFloor(pos)
             local cf, cd = nil, math.huge
             for _, v in next, plot.House.Floor:GetChildren() do
@@ -318,17 +499,32 @@ task.spawn(function()
         local objs, cnts = {}, {}
         for _, obj in next, plot.House.Objects:GetChildren() do
             local floor = getFloor(obj.Position) or plot
-            local od = { Name=obj.Name, AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(obj), Rot=getRot(obj.CFrame), Position=tostring(ground.CFrame:PointToObjectSpace(obj.Position)) }
+            local od = {
+                Name           = obj.Name,
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(obj),
+                Rot            = getRot(obj.CFrame),
+                Position       = tostring(ground.CFrame:PointToObjectSpace(obj.Position)),
+            }
             if not objs[floor] then objs[floor] = {} end
             if obj:FindFirstChild('ItemHolder') then
                 for _, item in next, obj.ItemHolder:GetChildren() do
                     if item:FindFirstChild('RailingSegment') then
                         od.Fences = od.Fences or {}
                         local _, from = _bxFW.Shared.FenceService:GetEdgePositions(item)
-                        table.insert(od.Fences, { Name=item.Name, From=tostring(ground.CFrame:PointToObjectSpace(from)), AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(item), Segment=item.RailingSegment.Value.Name })
+                        table.insert(od.Fences, {
+                            Name           = item.Name,
+                            From           = tostring(ground.CFrame:PointToObjectSpace(from)),
+                            AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(item),
+                            Segment        = item.RailingSegment.Value.Name,
+                        })
                     else
                         od.Items = od.Items or {}
-                        table.insert(od.Items, { Name=item.Name, AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(item), Rot=getRot(item.CFrame), Position=tostring(ground.CFrame:PointToObjectSpace(item.Position)) })
+                        table.insert(od.Items, {
+                            Name           = item.Name,
+                            AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(item),
+                            Rot            = getRot(item.CFrame),
+                            Position       = tostring(ground.CFrame:PointToObjectSpace(item.Position)),
+                        })
                     end
                 end
             end
@@ -336,29 +532,57 @@ task.spawn(function()
         end
         for _, cnt in next, plot.House.Counters:GetChildren() do
             local floor = getFloor(cnt.Position) or plot
-            local cd = { Name=cnt.Name, AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(cnt), Rot=getRot(cnt.CFrame), Position=tostring(ground.CFrame:PointToObjectSpace(cnt.Position)) }
+            local cd = {
+                Name           = cnt.Name,
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(cnt),
+                Rot            = getRot(cnt.CFrame),
+                Position       = tostring(ground.CFrame:PointToObjectSpace(cnt.Position)),
+            }
             if not cnts[floor] then cnts[floor] = {} end
             if cnt:FindFirstChild('ItemHolder') then
                 for _, item in next, cnt.ItemHolder:GetChildren() do
                     cd.Items = cd.Items or {}
-                    table.insert(cd.Items, { Name=item.Name, AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(item), Rot=getRot(item.CFrame), Position=tostring(ground.CFrame:PointToObjectSpace(item.Position)) })
+                    table.insert(cd.Items, {
+                        Name           = item.Name,
+                        AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(item),
+                        Rot            = getRot(item.CFrame),
+                        Position       = tostring(ground.CFrame:PointToObjectSpace(item.Position)),
+                    })
                 end
             end
             table.insert(cnts[floor], cd)
         end
         for _, wall in next, plot.House.Walls:GetChildren() do
             if wall.Name == 'Poles' then continue end
-            local from, to = ground.CFrame:PointToObjectSpace(getPolePos(wall.BPole)), ground.CFrame:PointToObjectSpace(getPolePos(wall.FPole))
-            local wd = { From=tostring(from), To=tostring(to), AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(wall), Items={} }
+            local from = ground.CFrame:PointToObjectSpace(getPolePos(wall.BPole))
+            local to   = ground.CFrame:PointToObjectSpace(getPolePos(wall.FPole))
+            local wd   = {
+                From           = tostring(from),
+                To             = tostring(to),
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(wall),
+                Items          = {},
+            }
             if wall:FindFirstChild('ItemHolder') then
                 for _, item in next, wall.ItemHolder:GetChildren() do
-                    local id = { Name=item.Name, Position=tostring(ground.CFrame:PointToObjectSpace(item.Position)), Side=item:FindFirstChild('SideValue') and item.SideValue.Value == -1 or nil, AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(item) }
+                    local id = {
+                        Name           = item.Name,
+                        Position       = tostring(ground.CFrame:PointToObjectSpace(item.Position)),
+                        Side           = item:FindFirstChild('SideValue') and item.SideValue.Value == -1 or nil,
+                        AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(item),
+                    }
                     local cfg = _bxFW.Items:GetItem(item.Name)
-                    if cfg.Type ~= 'Windows' and cfg.Type ~= 'Doors' then id.Rot = getRot(item.CFrame) end
+                    if cfg.Type ~= 'Windows' and cfg.Type ~= 'Doors' then
+                        id.Rot = getRot(item.CFrame)
+                    end
                     if item:FindFirstChild('ItemHolder') then
                         id.Items = {}
                         for _, i2 in next, item.ItemHolder:GetChildren() do
-                            table.insert(id.Items, { Name=i2.Name, Rot=getRot(i2.CFrame), Position=tostring(ground.CFrame:PointToObjectSpace(i2.Position)), AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(i2) })
+                            table.insert(id.Items, {
+                                Name           = i2.Name,
+                                Rot            = getRot(i2.CFrame),
+                                Position       = tostring(ground.CFrame:PointToObjectSpace(i2.Position)),
+                                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(i2),
+                            })
                         end
                     end
                     table.insert(wd.Items, id)
@@ -367,38 +591,81 @@ task.spawn(function()
             table.insert(save.Walls, wd)
         end
         for _, floor in next, plot.House.Floor:GetChildren() do
-            local fd = { AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(floor), Points={}, Objects=objs[floor] or {}, Counters=cnts[floor] or {} }
-            for _, v in next, floor.PointData:GetChildren() do table.insert(fd.Points, tostring(v.Value)) end
+            local fd = {
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(floor),
+                Points         = {},
+                Objects        = objs[floor] or {},
+                Counters       = cnts[floor] or {},
+            }
+            for _, v in next, floor.PointData:GetChildren() do
+                table.insert(fd.Points, tostring(v.Value))
+            end
             table.insert(save.Floors, fd)
         end
         for _, roof in next, plot.House.Roof:GetChildren() do
-            local rd = { AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(roof), Name=roof.Name, Points={}, Items={} }
-            for _, v in next, roof.PointData:GetChildren() do table.insert(rd.Points, tostring(v.Value)) end
+            local rd = {
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(roof),
+                Name           = roof.Name,
+                Points         = {},
+                Items          = {},
+            }
+            for _, v in next, roof.PointData:GetChildren() do
+                table.insert(rd.Points, tostring(v.Value))
+            end
             if roof:FindFirstChild('ItemHolder') then
                 for _, item in next, roof.ItemHolder:GetChildren() do
-                    table.insert(rd.Items, { Name=item.Name, Position=tostring(ground.CFrame:PointToObjectSpace(item.Position)), Rot=getRot(item.CFrame), AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(item) })
+                    table.insert(rd.Items, {
+                        Name           = item.Name,
+                        Position       = tostring(ground.CFrame:PointToObjectSpace(item.Position)),
+                        Rot            = getRot(item.CFrame),
+                        AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(item),
+                    })
                 end
             end
             table.insert(save.Roofs, rd)
         end
         for _, path in next, plot.House.Paths:GetChildren() do
             if path.Name == 'Poles' then continue end
-            local f2, t2 = ground.CFrame:PointToObjectSpace(getPolePos(path.BPole)), ground.CFrame:PointToObjectSpace(getPolePos(path.FPole))
-            table.insert(save.Paths, { AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(path), From=tostring(f2), To=tostring(t2) })
+            local f2 = ground.CFrame:PointToObjectSpace(getPolePos(path.BPole))
+            local t2 = ground.CFrame:PointToObjectSpace(getPolePos(path.FPole))
+            table.insert(save.Paths, {
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(path),
+                From           = tostring(f2),
+                To             = tostring(t2),
+            })
         end
         for _, pool in next, plot.House.Pools:GetChildren() do
-            table.insert(save.Pools, { Position=tostring(ground.CFrame:ToObjectSpace(pool.HitBox.CFrame)), Size=tostring(Vector2.new(pool.HitBox.Size.X, pool.HitBox.Size.Z)), Type=pool.Name })
+            table.insert(save.Pools, {
+                Position = tostring(ground.CFrame:ToObjectSpace(pool.HitBox.CFrame)),
+                Size     = tostring(Vector2.new(pool.HitBox.Size.X, pool.HitBox.Size.Z)),
+                Type     = pool.Name,
+            })
         end
         for _, bsmt in next, plot.House.Basements:GetChildren() do
-            table.insert(save.Basements, { Position=tostring(ground.CFrame:ToObjectSpace(bsmt.HitBox.CFrame)), Size=tostring(Vector2.new(bsmt.HitBox.Size.X, bsmt.HitBox.Size.Z)), Type=bsmt.Name })
+            table.insert(save.Basements, {
+                Position = tostring(ground.CFrame:ToObjectSpace(bsmt.HitBox.CFrame)),
+                Size     = tostring(Vector2.new(bsmt.HitBox.Size.X, bsmt.HitBox.Size.Z)),
+                Type     = bsmt.Name,
+            })
         end
         for _, fence in next, plot.House.Fences:GetChildren() do
             if fence.Name == 'Poles' then continue end
             local ft, ff = _bxFW.Shared.FenceService:GetEdgePositions(fence)
-            local fd2 = { To=tostring(ground.CFrame:PointToObjectSpace(ft)), From=tostring(ground.CFrame:PointToObjectSpace(ff)), AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(fence), Name=fence.Name, Items={} }
+            local fd2 = {
+                To             = tostring(ground.CFrame:PointToObjectSpace(ft)),
+                From           = tostring(ground.CFrame:PointToObjectSpace(ff)),
+                AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(fence),
+                Name           = fence.Name,
+                Items          = {},
+            }
             if fence:FindFirstChild('ItemHolder') then
                 for _, item in next, fence.ItemHolder:GetChildren() do
-                    table.insert(fd2.Items, { AppearanceData=_bxFW.Shared.ObjectService:GetAppearanceData(item), Name=item.Name, Rot=getRot(item.CFrame), Position=tostring(ground.CFrame:PointToObjectSpace(item.Position)) })
+                    table.insert(fd2.Items, {
+                        AppearanceData = _bxFW.Shared.ObjectService:GetAppearanceData(item),
+                        Name           = item.Name,
+                        Rot            = getRot(item.CFrame),
+                        Position       = tostring(ground.CFrame:PointToObjectSpace(item.Position)),
+                    })
                 end
             end
             table.insert(save.Fences, fd2)
@@ -407,10 +674,15 @@ task.spawn(function()
         if cnts[plot] then save.Ground.Counters = cnts[plot] end
         local houses = _RepStore.Stats[player.Name].Houses
         local house
-        for _, v in next, houses:GetChildren() do if v.Value == houses.Value then house = v end end
+        for _, v in next, houses:GetChildren() do
+            if v.Value == houses.Value then house = v end
+        end
         save.totalValue = house and house.TotalValue.Value or 'Unknown'
         save.bsValue    = house and house.BSValue.Value    or 'Unknown'
-        writefile(string.format('Yazu/Bloxburg Houses/%s.json', player.Name), _HttpSvc:JSONEncode(save))
+        writefile(
+            string.format('Yazu/Bloxburg Houses/%s.json', player.Name),
+            _HttpSvc:JSONEncode(save)
+        )
         Library:Notify(string.format('House of %s saved!', player.Name))
         _bxRefreshHouseList()
     end
@@ -421,7 +693,7 @@ task.spawn(function()
         local myGround = myPlot.Ground
         local placements = 0
         local oldFW = _bxFW
-        local streamRefTypes = {'PlaceObject','PlaceWall','PlaceFloor','PlacePath','PlaceRoof'}
+        local streamRefTypes = { 'PlaceObject','PlaceWall','PlaceFloor','PlacePath','PlaceRoof' }
         local fw = {
             net = setmetatable({
                 InvokeServer = function(self, data, ...)
@@ -439,13 +711,19 @@ task.spawn(function()
         local pos = fw.net:InvokeServer({ Type='ToPlot', Player=LocalPlayer })
         LocalPlayer.Character:SetPrimaryPartCFrame(pos)
         fw.net:InvokeServer({ Type='EnterBuild', Plot=myPlot })
-        local function cvt3(s)  return myGround.CFrame:PointToWorldSpace(Vector3.new(unpack(s:split(',')))) end
-        local function cvtPts(pts) local r={} for _, v in next, pts do table.insert(r, cvt3(v)) end return r end
+        local function cvt3(s)
+            return myGround.CFrame:PointToWorldSpace(Vector3.new(unpack(s:split(','))))
+        end
+        local function cvtPts(pts)
+            local r = {}
+            for _, v in next, pts do table.insert(r, cvt3(v)) end
+            return r
+        end
         local function cvtRot(cf)
             if not cf then return end
             local c = myGround.CFrame:ToWorldSpace(CFrame.new(unpack(cf:split(','))))
             local r = -math.atan2(c.lookVector.z, c.lookVector.x) - math.pi * 0.5
-            if r < 0 then r = 2*math.pi + r end
+            if r < 0 then r = 2 * math.pi + r end
             return r
         end
         for _, wd in next, houseData.Walls do
@@ -482,8 +760,12 @@ task.spawn(function()
             for _, id in next, rd.Items or {} do local item=fw.net:InvokeServer({Type='PlaceObject',Name=id.Name,TargetModel=roof,Rot=cvtRot(id.Rot),Pos=cvt3(id.Position)}); fw.net:InvokeServer({Type='ColorObject',Object=item,UseMaterials=true,Data=id.AppearanceData}) end
             fw.net:InvokeServer({ Type='ColorObject', Object=roof, UseMaterials=true, Data=rd.AppearanceData })
         end
-        for _, poolD in next, houseData.Pools do fw.net:InvokeServer({ Type='PlacePool', Size=Vector2.new(unpack(poolD.Size:split(','))), Center=CFrame.new(unpack(poolD.Position:split(','))), ItemType=poolD.Type }) end
-        for _, bsD  in next, houseData.Basements do fw.net:InvokeServer({ Type='PlaceBasement', ItemType='Basements', Size=Vector2.new(unpack(bsD.Size:split(','))), Center=CFrame.new(unpack(bsD.Position:split(','))) - Vector3.new(0,-12.49,0) }) end
+        for _, poolD in next, houseData.Pools do
+            fw.net:InvokeServer({ Type='PlacePool', Size=Vector2.new(unpack(poolD.Size:split(','))), Center=CFrame.new(unpack(poolD.Position:split(','))), ItemType=poolD.Type })
+        end
+        for _, bsD in next, houseData.Basements do
+            fw.net:InvokeServer({ Type='PlaceBasement', ItemType='Basements', Size=Vector2.new(unpack(bsD.Size:split(','))), Center=CFrame.new(unpack(bsD.Position:split(','))) - Vector3.new(0,-12.49,0) })
+        end
         for _, fcd in next, houseData.Fences do
             local fence = fw.net:InvokeServer({ Type='PlaceObject', Name=fcd.Name, StartPos=cvt3(fcd.From), Pos=cvt3(fcd.To), ItemType=fcd.Name })
             for _, id in next, fcd.Items do local item=fw.net:InvokeServer({Type='PlaceObject',Name=id.Name,TargetModel=fence,Rot=cvtRot(id.Rot),Pos=cvt3(id.Position)}); fw.net:InvokeServer({Type='ColorObject',Object=item,UseMaterials=true,Data=id.AppearanceData}) end
@@ -504,363 +786,17 @@ task.spawn(function()
         Library:Notify('House loaded!')
     end
 
-    -- ── Job Functions ─────────────────────────────────────────
-    _fnBensIceCream = function(toggle)
-        if not toggle then return end
-        repeat
-            local ws = _findWSBens(workspace.Environment.Locations.BensIceCream.CustomerTargets)
-            if _bxJobs:GetJob() == 'BensIceCreamSeller' and ws then
-                local customer = ws.Occupied.Value
-                local iceCup
-                repeat _bxFW.net:FireServer({ Type='TakeIceCreamCup' }); iceCup = _bxFW.Shared.EquipmentService:GetEquipped(LocalPlayer); task.wait()
-                until iceCup or not (Toggles.BX_BensIceCream and Toggles.BX_BensIceCream.Value)
-                if not (Toggles.BX_BensIceCream and Toggles.BX_BensIceCream.Value) then return end
-                for x = 1, 2 do
-                    _bxFW.net:FireServer({ Type='AddIceCreamScoop', Taste=customer.Order['Flavor'..tostring(x)].Value, Ball=iceCup:WaitForChild('Ball'..tostring(x)) }); task.wait(0.1)
-                end
-                if customer.Order.Topping.Value ~= '' then _bxFW.net:FireServer({ Type='AddIceCreamTopping', Taste=customer.Order.Topping.Value }) end
-                task.wait(0.1); _bxFW.net:FireServer({ Type='JobCompleted', Workstation=ws }); task.wait(1)
-            end
-            task.wait()
-        until not (Toggles.BX_BensIceCream and Toggles.BX_BensIceCream.Value)
-    end
-
-    _fnStylezHair = function(toggle)
-        if not toggle then return end
-        repeat
-            if _bxJobs:GetJob() == 'StylezHairdresser' then
-                local ws = _findWS(workspace.Environment.Locations.StylezHairStudio.HairdresserWorkstations)
-                if ws and ws.Mirror:FindFirstChild('HairdresserGUI') then
-                    ws.Mirror.HairdresserGUI.Overlay:FindFirstChild('false').ImageRectOffset = Vector2.new(0,0)
-                    ws.Mirror.HairdresserGUI.Overlay:FindFirstChild('false').ImageColor3    = Color3.new(0,255,0)
-                    for _, v in next, getconnections(ws.Mirror.HairdresserGUI.Frame.Done.Activated) do v.Function() end
-                    task.wait(1)
-                end
-            end
-            _Heartbt:Wait()
-        until not (Toggles.BX_StylezHairDresser and Toggles.BX_StylezHairDresser.Value)
-    end
-
-    _fnBloxyBurgers = function(toggle)
-        if not toggle then return end
-        local function getStations()
-            local res = {}
-            if not workspace.Environment.Locations:FindFirstChild('BloxyBurgers') then return res end
-            for _, v in next, workspace.Environment.Locations.BloxyBurgers.CashierWorkstations:GetChildren() do
-                if (v.InUse.Value == LocalPlayer or v.InUse.Value == nil) and v.Occupied.Value ~= nil then table.insert(res, v) end
-            end
-            return res
-        end
-        repeat
-            if _bxJobs:GetJob() == 'BloxyBurgersCashier' then
-                for _, ws in next, getStations() do
-                    if ws and ws.OrderDisplay.DisplayMain:FindFirstChild('CashierGUI') then
-                        ws.OrderDisplay.DisplayMain.CashierGUI.Overlay:FindFirstChild('false').ImageRectOffset = Vector2.new(0,0)
-                        ws.OrderDisplay.DisplayMain.CashierGUI.Overlay:FindFirstChild('false').ImageColor3    = Color3.new(0,255,0)
-                        for _, v in next, getconnections(ws.OrderDisplay.DisplayMain.CashierGUI.Frame.Done.Activated) do v.Function() end
-                        task.wait(1)
-                    end
-                end
-            end
-            _Heartbt:Wait()
-        until not (Toggles.BX_BloxyBurgers and Toggles.BX_BloxyBurgers.Value)
-    end
-
-    _fnPizzaBaker = function(toggle)
-        if not toggle then return end
-        repeat
-            if _bxJobs:GetJob() == 'PizzaPlanetBaker' then
-                local ws = _findWS(workspace.Environment.Locations.PizzaPlanet.BakerWorkstations)
-                if ws then
-                    local order = ws.Order; local oldPos = LocalPlayer.Character.PrimaryPart.Position
-                    if order.IngredientsLeft.Value == 0 then
-                        LocalPlayer.Character.PrimaryPart.CFrame = CFrame.new(1167.14685,13.6576815,255.879852); task.wait(0.5)
-                        _bxNet:FireServer({ Type='TakeIngredientCrate', Object=workspace.Environment.Locations.PizzaPlanet.IngredientCrates.Crate }); task.wait(0.5)
-                        _bxNet:FireServer({ Type='TakeIngredientCrate', Object=workspace.Environment.Locations.PizzaPlanet.IngredientCrates.Crate })
-                        LocalPlayer.Character.PrimaryPart.CFrame = CFrame.new(oldPos); task.wait(0.5)
-                        _bxNet:FireServer({ Type='RestockIngredients', Workstation=ws })
-                    elseif order.Value ~= 'true' then
-                        if ws:FindFirstChild('OrderDisplay') and ws.OrderDisplay:FindFirstChild('DisplayMain') and ws.OrderDisplay.DisplayMain:FindFirstChild('BakerGUI') then
-                            ws.OrderDisplay.DisplayMain.BakerGUI.Overlay:FindFirstChild('false').ImageRectOffset = Vector2.new(0,0)
-                            ws.OrderDisplay.DisplayMain.BakerGUI.Overlay:FindFirstChild('false').ImageColor3    = Color3.new(0,255,0)
-                            for _, v in next, getconnections(ws.OrderDisplay.DisplayMain.BakerGUI.Frame.Done.Activated) do v.Function() end
-                        end
-                    end
-                    task.wait(1)
-                end
-            end
-            _Heartbt:Wait()
-        until not (Toggles.BX_PizzaBaker and Toggles.BX_PizzaBaker.Value)
-    end
-
-    local function _bxFishLoop()
-        repeat task.wait() until LocalPlayer.Character:FindFirstChild('Fishing Rod') and _bxJobs:GetJob() == 'HutFisherman'
-        local t0 = tick()
-        _bxNet:FireServer({ Type='UseFishingRod', State=true, Pos=LocalPlayer.Character['Fishing Rod'].Line.Position }); task.wait(2)
-        if LocalPlayer.Character:FindFirstChild('Fishing Rod') then
-            local origY = LocalPlayer.Character['Fishing Rod'].Bobber.Position.Y; local con
-            con = LocalPlayer.Character['Fishing Rod'].Bobber:GetPropertyChangedSignal('Position'):Connect(function()
-                if not LocalPlayer.Character:FindFirstChild('Fishing Rod') then return end
-                if origY - LocalPlayer.Character['Fishing Rod'].Bobber.Position.Y < 3 then
-                    _bxNet:FireServer({ Type='UseFishingRod', State=false, Time=tick()-t0 }); con:Disconnect()
-                    if Toggles.BX_Fisherman and Toggles.BX_Fisherman.Value then _bxFishLoop() end
-                end
-            end)
-        end
-    end
-    _fnFisherman = function(toggle) if not toggle then return end; _bxFishLoop() end
-
-    local WheelPos = { Bloxster=Vector3.new(1155.36475,13.3524084,411.294983), Classic=Vector3.new(1156,13.3524084,396.650177), Moped=Vector3.new(1154,13,402) }
-    local function _getMotorWS()
-        if not workspace.Environment.Locations:FindFirstChild('MikesMotors') then return end
-        local s
-        for _, v in next, workspace.Environment.Locations.MikesMotors.MechanicWorkstations:GetChildren() do
-            if v:FindFirstChild('InUse') and v.InUse.Value == LocalPlayer then s = v end
-        end
-        for _, v in next, workspace.Environment.Locations.MikesMotors.MechanicWorkstations:GetChildren() do
-            if v:FindFirstChild('InUse') and v:FindFirstChild('Occupied') and v.InUse.Value == nil and v.Occupied.Value ~= nil then s = v end
-        end
-        if not s then task.wait(); return _getMotorWS() end
-        return s
-    end
-    _fnMechanic = function(toggle)
-        if not toggle then return end
-        repeat
-            if _bxJobs:GetJob() == 'MikesMechanic' then
-                local v = _getMotorWS()
-                if v and v.Occupied.Value then
-                    local Order = v.Occupied.Value:WaitForChild('Order')
-                    if Order:FindFirstChild('Oil') and Order.Oil.Value ~= nil then
-                        repeat _tweenTP(Vector3.new(1194,13,389)); _bxNet:FireServer({Type='TakeOil';Object=workspace.Environment.Locations.MikesMotors.OilCans:FindFirstChildWhichIsA('Model')}); task.wait() until LocalPlayer.Character:FindFirstChild('Oil Can') or not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-                        _tweenTP(v.Display.Screen.Position + Vector3.new(0,0,5)); _bxNet:FireServer({Type='FixBike';Workstation=v})
-                        repeat task.wait() until not LocalPlayer.Character:FindFirstChild('Oil Can') or not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-                        _bxNet:FireServer({Type='JobCompleted';Workstation=v}); task.wait(2)
-                    elseif Order:FindFirstChild('Wheels') then
-                        local wt = Order.Wheels.Value
-                        for i = 1, 2 do
-                            repeat _tweenTP(WheelPos[wt]); _bxNet:FireServer({Type='TakeWheel';Object=workspace.Environment.Locations.MikesMotors.TireRacks:FindFirstChild(wt)}); task.wait() until LocalPlayer.Character:FindFirstChild(wt..' Wheel') or not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-                            _tweenTP(v.Display.Screen.Position + Vector3.new(0,0,5)); _bxNet:FireServer({Type='FixBike';Workstation=v;Front=(i==1) or nil})
-                            repeat task.wait() until not LocalPlayer.Character:FindFirstChild(wt..' Wheel') or not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-                            if i==2 then _bxNet:FireServer({Type='JobCompleted';Workstation=v}) end; task.wait(2)
-                        end
-                    elseif Order:FindFirstChild('Color') and Order.Color.Value ~= nil then
-                        local col = Order.Color.Value
-                        repeat _tweenTP(Vector3.new(1173,13,388)); _bxNet:FireServer({Type='TakePainter';Object=workspace.Environment.Locations.MikesMotors.PaintingEquipment:FindFirstChild(col)}); task.wait() until LocalPlayer.Character:FindFirstChild('Spray Painter') or not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-                        _tweenTP(v.Display.Screen.Position + Vector3.new(0,0,5)); _bxNet:FireServer({Type='FixBike';Workstation=v})
-                        repeat task.wait() until not LocalPlayer.Character:FindFirstChild('Spray Painter') or not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-                        _bxNet:FireServer({Type='JobCompleted';Workstation=v}); task.wait(2)
-                    end
-                end
-            end
-            _Heartbt:Wait()
-        until not (Toggles.BX_Mechanic and Toggles.BX_Mechanic.Value)
-    end
-
-    local function _getTree()
-        local bd, bb = math.huge, nil
-        for _, v in next, workspace.Environment.Trees:GetChildren() do
-            local d = LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position)
-            if d < bd and v.PrimaryPart.Position.Y > 5 then bd, bb = d, v end
-        end
-        return bb
-    end
-    _fnLumber = function(toggle)
-        if not toggle then return end
-        task.spawn(function()
-            repeat
-                if Toggles.BX_Lumber and Toggles.BX_Lumber.Value and _bxJobs:GetJob() == 'LumberWoodcutter' then LocalPlayer.Character.Humanoid:ChangeState(11) end
-                _Heartbt:Wait()
-            until not (Toggles.BX_Lumber and Toggles.BX_Lumber.Value)
-        end)
-        repeat
-            if _bxJobs:GetJob() == 'LumberWoodcutter' then
-                local tree = _getTree()
-                if tree then
-                    local ti = TweenInfo.new((LocalPlayer.Character.HumanoidRootPart.Position - tree.PrimaryPart.Position).Magnitude/45, Enum.EasingStyle.Linear)
-                    local tw = TweenService:Create(LocalPlayer.Character.HumanoidRootPart, ti, { CFrame=tree.PrimaryPart.CFrame })
-                    tw:Play(); tw.Completed:Wait()
-                    repeat _bxNet:FireServer({Type='UseHatchet',Tree=tree}); task.wait() until tree.PrimaryPart.Position.Y < 0 or _bxJobs:GetJob() ~= 'LumberWoodcutter' or not (Toggles.BX_Lumber and Toggles.BX_Lumber.Value)
-                end
-            end
-            _Heartbt:Wait()
-        until not (Toggles.BX_Lumber and Toggles.BX_Lumber.Value)
-    end
-
-    local _oreColors = {'Dark stone grey','Dark orange','Deep orange','Lime green','Royal purple'}
-    local function _getOre()
-        local bd, bb, best = math.huge, nil, 'Dark stone grey'
-        for _, v in next, workspace.Environment.Locations.Static_MinerCave.Folder:GetChildren() do
-            if v:FindFirstChild('M') then
-                local vc = v:FindFirstChild('M').BrickColor.Name
-                if table.find(_oreColors, best) < table.find(_oreColors, vc) then bb=v; best=vc
-                elseif table.find(_oreColors, best) == table.find(_oreColors, vc) then
-                    local d = LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position)
-                    if d < bd then bd, bb = d, v end
-                end
-            end
-        end
-        if not bb then
-            for _, v in next, workspace.Environment.Locations.Static_MinerCave.Folder:GetChildren() do
-                local d = LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position)
-                if d < bd and (not v:FindFirstChild('B') or v:FindFirstChild('B').BrickColor.Name ~= 'Bright red') then bd, bb = d, v end
-            end
-        end
-        return bb
-    end
-    _fnMiner = function(toggle)
-        if not toggle then
-            local bv = LocalPlayer.Character and LocalPlayer.Character.HumanoidRootPart:FindFirstChildOfClass('BodyVelocity')
-            if bv then bv:Destroy() end; return
-        end
-        local bv = Instance.new('BodyVelocity', LocalPlayer.Character.HumanoidRootPart); bv.Velocity = Vector3.new(0,0,0)
-        task.spawn(function()
-            repeat
-                if Toggles.BX_Miner and Toggles.BX_Miner.Value then LocalPlayer.Character.Humanoid:ChangeState(11) end
-                _Heartbt:Wait()
-            until not (Toggles.BX_Miner and Toggles.BX_Miner.Value)
-        end)
-        repeat
-            if (Toggles.BX_Miner and Toggles.BX_Miner.Value) and _bxJobs:GetJob() == 'CaveMiner' and workspace.Environment.Locations:FindFirstChild('Static_MinerCave') then
-                local blk = _getOre()
-                if blk then
-                    blk.PrimaryPart.CanCollide = false; _tweenTP(blk.PrimaryPart.Position)
-                    local x,y,z = string.match(blk.Name, '(.+):(.+):(.+)')
-                    _bxNet:InvokeServer({ Type='MineBlock', P=Vector3.new(x,y,z) })
-                end
-            end
-        until not (Toggles.BX_Miner and Toggles.BX_Miner.Value)
-    end
-
-    local function _getTrash()
-        local bd, bb = math.huge, nil
-        for _, v in next, workspace.Environment.Locations.GreenClean.Spawns:GetChildren() do
-            local d = LocalPlayer:DistanceFromCharacter(v.Position)
-            if d < bd and v:FindFirstChildWhichIsA('Decal', true) then bd, bb = d, v end
-        end
-        if not bb then task.wait(); return _getTrash() end
-        return bb
-    end
-    _fnJanitor = function(toggle)
-        if not toggle then return end
-        task.spawn(function()
-            repeat
-                if Toggles.BX_Janitor and Toggles.BX_Janitor.Value then LocalPlayer.Character.Humanoid:ChangeState(11) end
-                _Heartbt:Wait()
-            until not (Toggles.BX_Janitor and Toggles.BX_Janitor.Value)
-        end)
-        repeat
-            if (Toggles.BX_Janitor and Toggles.BX_Janitor.Value) and _bxJobs:GetJob() == 'CleanJanitor' then
-                local trash = _getTrash()
-                if trash then
-                    if trash:FindFirstChild('Object') and trash.Object:IsA('Part') then _tweenTP(trash.Object.Position)
-                    else _tweenTP(trash.Position) end
-                    _bxNet:InvokeServer({ Type='CleanJanitorObject', Spawn=trash })
-                end
-            end
-            _Heartbt:Wait()
-        until not (Toggles.BX_Janitor and Toggles.BX_Janitor.Value)
-    end
-
-    local _grocFn = {
-        RestockBags = function(stn)
-            local crate = workspace.Environment.Locations.Supermarket.Crates:FindFirstChild('BagCrate')
-            _tweenTP(crate.Position + Vector3.new(5,0,-5)); _bxNet:FireServer({ Type='TakeNewBags', Object=crate })
-            repeat task.wait() until LocalPlayer.Character:FindFirstChild('BFF Bags')
-            _tweenTP(stn.Scanner.Position - Vector3.new(3,0,0)); _bxNet:FireServer({ Type='RestockBags', Workstation=stn })
-            repeat task.wait() until stn.BagsLeft.Value > 0
-        end,
-        GetFreeStation = function()
-            if not workspace.Environment.Locations:FindFirstChild('Supermarket') then return end
-            local stn
-            for _, v in next, workspace.Environment.Locations.Supermarket.CashierWorkstations:GetChildren() do
-                if v:FindFirstChild('InUse') and v.InUse.Value == LocalPlayer then stn = v end
-            end
-            if not stn then
-                local bd = math.huge
-                for _, v in next, workspace.Environment.Locations.Supermarket.CashierWorkstations:GetChildren() do
-                    if v:FindFirstChild('InUse') and v.InUse.Value == nil then
-                        local d = LocalPlayer:DistanceFromCharacter(v.Scanner.Position)
-                        if d < bd then bd, stn = d, v end
-                    end
-                end
-            end
-            if not stn then task.wait() end; return stn
-        end
-    }
-    local _bxCurBags, _bxCurCount = 1, 0
-    local function _bxNextCustomer()
-        if not (_bxJobs:GetJob()=='SupermarketCashier' and Toggles.BX_SupermarketCashier and Toggles.BX_SupermarketCashier.Value) then return end
-        local stn = _grocFn.GetFreeStation(); _bxCurCount, _bxCurBags = 0, 1
-        if stn.BagsLeft.Value == 0 then _grocFn.RestockBags(stn) end
-        repeat
-            for _, v in next, stn.DroppedFood:GetChildren() do
-                _bxCurCount = _bxCurCount + 1
-                if _bxCurCount / _bxCurBags == 3 then
-                    _bxNet:FireServer({Type='TakeNewBag',Workstation=stn}); _bxCurBags = _bxCurBags + 1
-                    if stn.BagsLeft.Value == 0 then _grocFn.RestockBags(stn); task.wait() end
-                end
-                _bxNet:FireServer({Type='ScanDroppedItem',Item=v}); task.wait(0.1)
-            end
-            task.wait()
-        until _bxJobs:GetJob() ~= 'SupermarketCashier' or (stn.Occupied.Value ~= nil and (stn.Occupied.Value.Head.Position - stn.CustomerTarget_2.Position).magnitude < 3)
-        _bxNet:FireServer({Type='JobCompleted',Workstation=stn}); _bxNextCustomer()
-    end
-    _fnSuperCashier = function(toggle)
-        if not toggle then return end
-        repeat task.wait() until _bxJobs:GetJob() == 'SupermarketCashier'
-        if Toggles.BX_SupermarketCashier and Toggles.BX_SupermarketCashier.Value then _bxNextCustomer() end
-    end
-
-    local function _getCrate()
-        local bd, bb = math.huge, nil
-        for _, v in next, workspace.Environment.Locations.Supermarket.Crates:GetChildren() do
-            local d = LocalPlayer:DistanceFromCharacter(v.Position)
-            if d < bd and v.Name == 'Crate' then bd, bb = d, v end
-        end
-        if not bb then task.wait(0.5) end; return bb
-    end
-    local function _getEmptyShelf()
-        local bd, bb = math.huge, nil
-        for _, v in next, workspace.Environment.Locations.Supermarket.Shelves:GetChildren() do
-            local d = LocalPlayer:DistanceFromCharacter(v.PrimaryPart.Position)
-            if d < bd and v.IsEmpty.Value == true then bd, bb = d, v end
-        end
-        if not bb then task.wait(0.5) end; return bb
-    end
-    local _goShelf, _takeCrate
-    _goShelf = function()
-        if _bxJobs:GetJob()=='SupermarketStocker' and Toggles.BX_SupermarketStocker and Toggles.BX_SupermarketStocker.Value then
-            local shelf = _getEmptyShelf(); _tweenTP(shelf:FindFirstChild('Part').Position)
-            _bxNet:FireServer({Type='RestockShelf',Shelf=shelf}); _takeCrate()
-        end
-    end
-    _takeCrate = function()
-        if _bxJobs:GetJob()=='SupermarketStocker' and Toggles.BX_SupermarketStocker and Toggles.BX_SupermarketStocker.Value then
-            local crate = _getCrate(); _tweenTP(crate.Position)
-            _bxNet:FireServer({Type='TakeFoodCrate',Object=crate}); _goShelf()
-        end
-    end
-    _fnStocker = function(toggle)
-        if not toggle then return end
-        task.spawn(function()
-            repeat
-                if (Toggles.BX_SupermarketStocker and Toggles.BX_SupermarketStocker.Value) and _bxJobs:GetJob()=='SupermarketStocker' then LocalPlayer.Character.Humanoid:ChangeState(11) end
-                _Heartbt:Wait()
-            until not (Toggles.BX_SupermarketStocker and Toggles.BX_SupermarketStocker.Value)
-        end)
-        if _bxJobs:GetJob() == 'SupermarketStocker' then _takeCrate() end
-    end
-
+    -- ── Teleport to plot ──────────────────────────────────────
     _fnTeleportPlot = function(name)
         local target = Players:FindFirstChild(name)
         if not target then Library:Notify('Player not found!'); return end
-        local pos = _bxFW.net:InvokeServer({ Type='ToPlot', Player=target })
+        local pos = _bxFW.net:InvokeServer({ Type = 'ToPlot', Player = target })
         LocalPlayer.Character:SetPrimaryPartCFrame(pos)
         Library:Notify('Teleported to ' .. name .. "'s plot")
     end
 
     _bxReady = true
-    Library:Notify('[BXBRG] Bloxburg framework loaded!')
+    Library:Notify('[BXBRG] Framework loaded!')
 end) -- end task.spawn
 
 end -- return function
