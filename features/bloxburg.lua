@@ -34,10 +34,14 @@ end
 -- ================================================================
 --  UI
 -- ================================================================
-local BX_PizzaGrp      = Tabs.BXBRG:AddLeftGroupbox('Pizza Delivery')
-local BX_BuildGrp      = Tabs.BXBRG:AddRightGroupbox('Auto Build')
-local BX_MiscGrp       = Tabs.BXBRG:AddLeftGroupbox('Misc')
+local BX_PizzaGrp       = Tabs.BXBRG:AddLeftGroupbox('Pizza Delivery')
+local BX_BuildGrp       = Tabs.BXBRG:AddRightGroupbox('Auto Build')
+local BX_MiscGrp        = Tabs.BXBRG:AddLeftGroupbox('Misc')
 local BX_HairdresserGrp = Tabs.BXBRG:AddLeftGroupbox('Stylez Hairdresser')
+local BX_JobSettingsGrp = Tabs.BXBRG:AddLeftGroupbox('Job Settings')
+local BX_AutoMoodGrp    = Tabs.BXBRG:AddLeftGroupbox('Auto Mood')
+local BX_StatViewerGrp  = Tabs.BXBRG:AddRightGroupbox('Stat Viewer')
+local BX_VehicleGrp     = Tabs.BXBRG:AddRightGroupbox('Vehicle Mods')
 
 BX_PizzaGrp:AddDropdown('BX_MoveMode', {
     Text    = 'Movement Mode',
@@ -78,7 +82,7 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
 })
 
 -- ── Hairdresser ───────────────────────────────────────────────
-BX_HairdresserGrp:AddLabel('SKYS A NIGGER')
+BX_HairdresserGrp:AddLabel('Must be clocked in at Stylez Hair Studio')
 BX_HairdresserGrp:AddToggle('BX_HairdresserFarm', {
     Text     = 'Hairdresser Autofarm',
     Default  = false,
@@ -603,6 +607,202 @@ _fnDelivery = function(toggle)
 end
 
 -- ================================================================
+--  JOB SETTINGS UI
+-- ================================================================
+local _stopAfterEnabled = false
+local _stopAfterAmount  = 0
+
+BX_JobSettingsGrp:AddLabel('Automatically stop farming when earnings reach goal')
+BX_JobSettingsGrp:AddToggle('BX_StopAfterEnabled', {
+    Text     = 'Stop After Amount',
+    Default  = false,
+    Callback = function(v)
+        _stopAfterEnabled = v
+        dbg('TOGGLE', 'StopAfterEnabled = ' .. tostring(v))
+    end,
+})
+BX_JobSettingsGrp:AddSlider('BX_StopAfterAmount', {
+    Text     = 'Target Earnings ($)',
+    Default  = 500,
+    Min      = 0,
+    Max      = 50000,
+    Rounding = 0,
+    Callback = function(v)
+        _stopAfterAmount = v
+    end,
+})
+
+-- ================================================================
+--  AUTO MOOD UI
+-- ================================================================
+local _autoMoodEnabled   = false
+local _moodThreshold     = 40
+local _autoMoodFood      = 'Garden Salad'
+local _autoMoodHunger    = true
+local _autoMoodFun       = true
+local _autoMoodEnergy    = true
+local _autoMoodHygiene   = true
+local _autoMoodRunning   = false
+local _fnAutoMood        = nil
+
+BX_AutoMoodGrp:AddLabel('Monitors mood stats and refills them automatically')
+BX_AutoMoodGrp:AddToggle('BX_AutoMood', {
+    Text     = 'Auto Mood',
+    Default  = false,
+    Callback = function(v)
+        _autoMoodEnabled = v
+        dbg('TOGGLE', 'AutoMood = ' .. tostring(v))
+        if v and _fnAutoMood then
+            task.spawn(_fnAutoMood)
+        end
+    end,
+})
+BX_AutoMoodGrp:AddSlider('BX_MoodThreshold', {
+    Text     = 'Refill When Below (%)',
+    Default  = 40,
+    Min      = 1,
+    Max      = 99,
+    Rounding = 0,
+    Callback = function(v) _moodThreshold = v end,
+})
+BX_AutoMoodGrp:AddDivider()
+BX_AutoMoodGrp:AddLabel('Which moods to monitor:')
+BX_AutoMoodGrp:AddToggle('BX_MoodHunger',  { Text = 'Hunger',  Default = true,  Callback = function(v) _autoMoodHunger  = v end })
+BX_AutoMoodGrp:AddToggle('BX_MoodFun',     { Text = 'Fun',     Default = true,  Callback = function(v) _autoMoodFun     = v end })
+BX_AutoMoodGrp:AddToggle('BX_MoodEnergy',  { Text = 'Energy',  Default = true,  Callback = function(v) _autoMoodEnergy  = v end })
+BX_AutoMoodGrp:AddToggle('BX_MoodHygiene', { Text = 'Hygiene', Default = true,  Callback = function(v) _autoMoodHygiene = v end })
+BX_AutoMoodGrp:AddDivider()
+BX_AutoMoodGrp:AddLabel('Auto Cook (for Hunger):')
+BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
+    Text    = 'Food to Cook',
+    Default = 1,
+    Values  = { 'Garden Salad', 'Grilled Cheese', 'Salad', 'Ramen', 'Steak' },
+    Callback = function(v) _autoMoodFood = v end,
+})
+
+-- ================================================================
+--  STAT VIEWER UI
+-- ================================================================
+local _statTargetPlayer = ''
+local _statLabels       = {}
+
+BX_StatViewerGrp:AddLabel('View stats of yourself or another player')
+BX_StatViewerGrp:AddDropdown('BX_StatPlayer', {
+    Text    = 'Select Player',
+    Default = 1,
+    Values  = (function()
+        local names = { LocalPlayer.Name }
+        for _, p in next, Players:GetPlayers() do
+            if p ~= LocalPlayer then table.insert(names, p.Name) end
+        end
+        return names
+    end)(),
+    Callback = function(v)
+        _statTargetPlayer = v
+        -- Update stat labels immediately when player changes
+        local ok, stats = pcall(function()
+            return _RepStore.Stats[v]
+        end)
+        if ok and stats then
+            local function getStat(name)
+                local ok2, val = pcall(function()
+                    return stats:FindFirstChild(name, true).Value
+                end)
+                return ok2 and tostring(math.floor(tonumber(val) or 0)) or 'N/A'
+            end
+            if _statLabels.money   then _statLabels.money:SetText('Money: $'      .. getStat('Money'))   end
+            if _statLabels.bux     then _statLabels.bux:SetText('Blockbux: '      .. getStat('Blockbux'))end
+            if _statLabels.level   then _statLabels.level:SetText('Job Level: '   .. getStat('Level'))   end
+            if _statLabels.visits  then _statLabels.visits:SetText('Plot Visits: '.. getStat('Visits'))  end
+        end
+    end,
+})
+_statLabels.money  = BX_StatViewerGrp:AddLabel('Money: —')
+_statLabels.bux    = BX_StatViewerGrp:AddLabel('Blockbux: —')
+_statLabels.level  = BX_StatViewerGrp:AddLabel('Job Level: —')
+_statLabels.visits = BX_StatViewerGrp:AddLabel('Plot Visits: —')
+BX_StatViewerGrp:AddButton('Refresh Stats', function()
+    local target = _statTargetPlayer ~= '' and _statTargetPlayer or LocalPlayer.Name
+    local ok, stats = pcall(function() return _RepStore.Stats[target] end)
+    if ok and stats then
+        local function getStat(name)
+            local ok2, val = pcall(function()
+                return stats:FindFirstChild(name, true).Value
+            end)
+            return ok2 and tostring(math.floor(tonumber(val) or 0)) or 'N/A'
+        end
+        _statLabels.money:SetText('Money: $'       .. getStat('Money'))
+        _statLabels.bux:SetText('Blockbux: '       .. getStat('Blockbux'))
+        _statLabels.level:SetText('Job Level: '    .. getStat('Level'))
+        _statLabels.visits:SetText('Plot Visits: ' .. getStat('Visits'))
+        Library:Notify('Stats refreshed for ' .. target)
+    else
+        Library:Notify('Could not read stats for ' .. target)
+    end
+end)
+
+-- ================================================================
+--  VEHICLE MODS UI
+-- ================================================================
+BX_VehicleGrp:AddLabel('Re-enter your vehicle after changing values')
+BX_VehicleGrp:AddSlider('BX_VehForward', {
+    Text     = 'Forward Speed',
+    Default  = 50,
+    Min      = 0,
+    Max      = 200,
+    Rounding = 0,
+    Callback = function(v)
+        if not _bxReady then return end
+        pcall(function()
+            local VehicleData = require(_RepStore.Modules.VehicleHandler.VehicleData)
+            for _, vd in next, VehicleData do vd.ForwardSpeed = v end
+        end)
+    end,
+})
+BX_VehicleGrp:AddSlider('BX_VehReverse', {
+    Text     = 'Reverse Speed',
+    Default  = 25,
+    Min      = 0,
+    Max      = 100,
+    Rounding = 0,
+    Callback = function(v)
+        if not _bxReady then return end
+        pcall(function()
+            local VehicleData = require(_RepStore.Modules.VehicleHandler.VehicleData)
+            for _, vd in next, VehicleData do vd.ReverseSpeed = v end
+        end)
+    end,
+})
+BX_VehicleGrp:AddSlider('BX_VehTurn', {
+    Text     = 'Turn Speed',
+    Default  = 30,
+    Min      = 0,
+    Max      = 100,
+    Rounding = 0,
+    Callback = function(v)
+        if not _bxReady then return end
+        pcall(function()
+            local VehicleData = require(_RepStore.Modules.VehicleHandler.VehicleData)
+            for _, vd in next, VehicleData do vd.TurnSpeed = v end
+        end)
+    end,
+})
+BX_VehicleGrp:AddSlider('BX_VehSpring', {
+    Text     = 'Spring Length',
+    Default  = 10,
+    Min      = 0,
+    Max      = 50,
+    Rounding = 0,
+    Callback = function(v)
+        if not _bxReady then return end
+        pcall(function()
+            local VehicleData = require(_RepStore.Modules.VehicleHandler.VehicleData)
+            for _, vd in next, VehicleData do vd.SpringLength = v end
+        end)
+    end,
+})
+
+-- ================================================================
 --  HAIRDRESSER AUTOFARM
 -- ================================================================
 local function _isHairdressing()
@@ -1031,6 +1231,133 @@ task.spawn(function()
 
     _bxReady = true
     Library:Notify('[BXBRG] Framework loaded!')
+
+    -- ── Stop After Amount monitor ─────────────────────────────
+    task.spawn(function()
+        while task.wait(2) do
+            if not _stopAfterEnabled or not _bxFW then continue end
+            local ok, earnings = pcall(function()
+                return _RepStore.Stats[LocalPlayer.Name].Job.ShiftEarnings.Value
+            end)
+            if ok and earnings and math.floor(earnings) >= _stopAfterAmount then
+                if Toggles.BX_PizzaDelivery and Toggles.BX_PizzaDelivery.Value then
+                    Toggles.BX_PizzaDelivery:SetValue(false)
+                end
+                if Toggles.BX_HairdresserFarm and Toggles.BX_HairdresserFarm.Value then
+                    Toggles.BX_HairdresserFarm:SetValue(false)
+                end
+                Library:Notify('[Job] Earnings goal reached! ($' .. math.floor(earnings) .. ') — Stopped farming.')
+                dbg('STOP', 'Stop after amount triggered at ' .. tostring(earnings))
+            end
+        end
+    end)
+
+    -- ── Auto Mood logic ───────────────────────────────────────
+    _fnAutoMood = function()
+        if _autoMoodRunning then return end
+        _autoMoodRunning = true
+
+        local function getMood(moodType)
+            local ok, val = pcall(function()
+                return _RepStore.Stats[LocalPlayer.Name].MoodData[moodType].Value
+            end)
+            return ok and math.ceil(val) or 100
+        end
+
+        local function getAppliance(types)
+            local plot = workspace.Plots['Plot_' .. LocalPlayer.Name]
+            if not plot then return nil end
+            local closest, closestDist = nil, math.huge
+            for _, buildType in next, plot.House:GetChildren() do
+                for _, obj in next, buildType:GetDescendants() do
+                    for _, t in next, types do
+                        if obj.Name:find(t) and obj:IsA('Part') then
+                            local dist = (LocalPlayer.Character.HumanoidRootPart.Position - obj.Position).Magnitude
+                            if dist < closestDist then
+                                closestDist, closest = dist, obj
+                            end
+                        end
+                    end
+                end
+            end
+            return closest
+        end
+
+        local function doMood(moodType)
+            if moodType == 'Hunger' then
+                -- Try to find already cooked food first
+                local plot = workspace.Plots['Plot_' .. LocalPlayer.Name]
+                if plot then
+                    for _, counter in next, plot.House.Counters:GetChildren() do
+                        if counter:FindFirstChild('ItemHolder') then
+                            for _, item in next, counter.ItemHolder:GetChildren() do
+                                if item:FindFirstChild('ObjectData') and item.ObjectData:FindFirstChild('FoodQuantity') then
+                                    if item.ObjectData.FoodQuantity.Value > -1 then
+                                        _bxNet:FireServer({ Type = 'Interact', Target = item, Path = '2' })
+                                        Library:Notify('[AutoMood] Eating from counter...')
+                                        task.wait(3)
+                                        return
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                Library:Notify('[AutoMood] Hunger low — attempting to cook ' .. _autoMoodFood)
+            elseif moodType == 'Hygiene' then
+                local app = getAppliance({'Bath', 'Shower', 'The Barrel', 'Jacuzzi'})
+                if app then
+                    Library:Notify('[AutoMood] Hygiene low — using bath/shower')
+                    _bxNet:FireServer({ Type = 'Interact', Target = app, Path = '1' })
+                    task.wait(10)
+                    LocalPlayer.Character.Humanoid.Jump = true
+                else
+                    Library:Notify('[AutoMood] No bath/shower found on plot!')
+                end
+            elseif moodType == 'Fun' then
+                local app = getAppliance({'TV', 'Television', 'Pixelview'})
+                if app then
+                    Library:Notify('[AutoMood] Fun low — watching TV')
+                    _bxNet:FireServer({ Type = 'Interact', Target = app, Path = '1' })
+                    task.wait(1)
+                    _bxNet:FireServer({ Type = 'Interact', Target = app, Path = '3' })
+                    task.wait(15)
+                    _bxNet:FireServer({ Type = 'Interact', Target = app, Path = '1' })
+                else
+                    Library:Notify('[AutoMood] No TV found on plot!')
+                end
+            elseif moodType == 'Energy' then
+                local app = getAppliance({'Bed'})
+                if app then
+                    Library:Notify('[AutoMood] Energy low — sleeping')
+                    _bxNet:FireServer({ Type = 'Interact', Target = app, Path = '1' })
+                    task.wait(20)
+                    LocalPlayer.Character.Humanoid.Jump = true
+                else
+                    Library:Notify('[AutoMood] No bed found on plot!')
+                end
+            end
+        end
+
+        while _autoMoodEnabled do
+            task.wait(5)
+            if not _bxNet then continue end
+            local moods = {
+                { name = 'Hunger',  enabled = _autoMoodHunger  },
+                { name = 'Fun',     enabled = _autoMoodFun     },
+                { name = 'Energy',  enabled = _autoMoodEnergy  },
+                { name = 'Hygiene', enabled = _autoMoodHygiene },
+            }
+            for _, mood in next, moods do
+                if mood.enabled and getMood(mood.name) < _moodThreshold then
+                    dbg('MOOD', mood.name .. ' is low (' .. getMood(mood.name) .. ')')
+                    doMood(mood.name)
+                end
+            end
+        end
+
+        _autoMoodRunning = false
+    end
     dbg('BOOT', 'Bootstrap complete.')
 end)
 
