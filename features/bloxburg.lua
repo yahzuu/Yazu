@@ -659,33 +659,44 @@ _fnHairdresser = function(toggle)
 
     local function doOrder()
         for _, v in next, doActionFuncs do
-            local workstation = getupvalue(v, 2)
-            if not workstation then continue end
+            local ok, err = pcall(function()
+                local workstation = getupvalue(v, 2)
+                if not workstation then return end
 
-            local npc = workstation.Occupied.Value
-            if workstation.InUse.Value == LocalPlayer and npc then
+                local inUse = workstation.InUse.Value
+                local npc   = workstation.Occupied.Value
+
+                -- Match game's CanUseWorkstation: InUse must be nil OR our player
+                local canUse = (not inUse) or (inUse == LocalPlayer)
+                if not canUse or not npc then return end
+
                 local head = npc:FindFirstChild('Head')
-                if not head then continue end
+                if not head then return end
 
-                -- Wait for ChatBubble (NPC is ready)
+                -- Wait for ChatBubble (NPC is ready with order)
                 head:WaitForChild('ChatBubble', 3)
                 task.wait(0.1)
 
-                if npc
-                    and npc:FindFirstChild('Order')
-                    and npc.Order.Style.Value ~= nil
-                    and npc.Order.Style.Value ~= '' then
+                local orderFolder = npc:FindFirstChild('Order')
+                if not orderFolder then return end
 
-                    local style = npc.Order.Style.Value
-                    local color = npc.Order.Color.Value
-                    dbg('HAIR', 'Customer wants: ' .. style .. ' | ' .. color)
-                    Library:Notify('[Hair] Order: ' .. style .. ' / ' .. color)
+                local styleVal = orderFolder:FindFirstChild('Style')
+                local colorVal = orderFolder:FindFirstChild('Color')
+                if not styleVal or not colorVal then return end
+                if styleVal.Value == '' or colorVal.Value == '' then return end
 
-                    setupvalue(v, 7, { getStyle(style), getColor(color) })
-                    task.wait(0.1)
-                    v('Done')
-                    dbg('HAIR', 'Done fired!')
-                end
+                local style = styleVal.Value
+                local color = colorVal.Value
+                dbg('HAIR', 'Customer wants: ' .. style .. ' | ' .. color)
+                Library:Notify('[Hair] Order: ' .. style .. ' / ' .. color)
+
+                setupvalue(v, 7, { getStyle(style), getColor(color) })
+                task.wait(0.1)
+                v('Done')
+                dbg('HAIR', 'Done fired!')
+            end)
+            if not ok then
+                dbg('HAIR', 'doOrder error: ' .. tostring(err))
             end
         end
     end
