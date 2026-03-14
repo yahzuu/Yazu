@@ -671,6 +671,7 @@ BX_AutoMoodGrp:AddToggle('BX_MoodHunger',  { Text = 'Hunger',  Default = true,  
 BX_AutoMoodGrp:AddToggle('BX_MoodFun',     { Text = 'Fun',     Default = true,  Callback = function(v) _autoMoodFun     = v end })
 BX_AutoMoodGrp:AddToggle('BX_MoodEnergy',  { Text = 'Energy',  Default = true,  Callback = function(v) _autoMoodEnergy  = v end })
 BX_AutoMoodGrp:AddToggle('BX_MoodHygiene', { Text = 'Hygiene', Default = true,  Callback = function(v) _autoMoodHygiene = v end })
+]]
 BX_AutoMoodGrp:AddDivider()
 BX_AutoMoodGrp:AddLabel('Auto Cook (for Hunger):')
 BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
@@ -679,7 +680,7 @@ BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
     Values  = { 'Garden Salad', 'Grilled Cheese', 'Salad', 'Ramen', 'Steak' },
     Callback = function(v) _autoMoodFood = v end,
 })
-]]
+
 -- ================================================================
 --  STAT VIEWER UI
 -- ================================================================
