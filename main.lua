@@ -39,10 +39,27 @@ local Tabs = {
 }
 
 -- ── 4. Features ───────────────────────────────────────────────
+local placeId = game.PlaceId
+
+-- Always loaded (global features)
 load('features/aimbot.lua')(State, Tabs, Services, Library)
 load('features/esp.lua')(State, Tabs, Services, Library)
 load('features/misc.lua')(State, Tabs, Services, Library)
-load('features/bloxburg.lua')(State, Tabs, Services, Library)
+
+-- Place-specific features
+local placeFeatures = {
+    [1537690962] = 'features/bloxburg.lua',   -- Bloxburg
+
+
+}
+
+if placeFeatures[placeId] then
+    load(placeFeatures[placeId])(State, Tabs, Services, Library)
+end
+
+if placeFeatures[1537690962] then
+    load(placeFeatures[1537690962])(State, Tabs, Services, Library)
+end
 
 -- ── 5. UI Settings tab ────────────────────────────────────────
 local UIGrp = Tabs['UI Settings']:AddRightGroupbox('Menu')
