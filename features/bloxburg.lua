@@ -612,7 +612,6 @@ end
 _fnHairdresser = function(toggle)
     if not toggle then return end
 
-    -- Find internal doAction functions from the StylezHairdresser script
     local doActionFuncs = {}
     for _, v in next, getgc() do
         if type(v) == 'function'
@@ -623,94 +622,47 @@ _fnHairdresser = function(toggle)
         end
     end
 
-    dbg('HAIR', 'Found ' .. #doActionFuncs .. ' doAction funcs')
-
     if #doActionFuncs == 0 then
-        Library:Notify('[Hair] No doAction found! Make sure you are clocked in first.')
+        Library:Notify('[Hair] Not found! Clock in first.')
         if Toggles.BX_HairdresserFarm then Toggles.BX_HairdresserFarm:SetValue(false) end
         return
     end
 
-    -- Get styles and colors from upvalues
     local styles = getupvalue(doActionFuncs[1], 6)
     local colors = getupvalue(doActionFuncs[1], 8)
 
-    if not styles or not colors then
-        Library:Notify('[Hair] Could not read styles/colors from upvalues!')
-        if Toggles.BX_HairdresserFarm then Toggles.BX_HairdresserFarm:SetValue(false) end
-        return
-    end
-
-    dbg('HAIR', 'Styles: ' .. #styles .. ' | Colors: ' .. #colors)
-
     local function getStyle(name)
-        for i, v in next, styles do
-            if v.Name == name then return i end
-        end
+        for i, v in next, styles do if v.Name == name then return i end end
         return 1
     end
-
     local function getColor(name)
-        for i, v in next, colors do
-            if v.Name == name then return i end
-        end
+        for i, v in next, colors do if v.Name == name then return i end end
         return 1
     end
 
     local function doOrder()
         for _, v in next, doActionFuncs do
-            local ok, err = pcall(function()
-                local workstation = getupvalue(v, 2)
-                if not workstation then return end
-
-                local inUse = workstation.InUse.Value
-                local npc   = workstation.Occupied.Value
-
-                -- Match game's CanUseWorkstation: InUse must be nil OR our player
-                local canUse = (not inUse) or (inUse == LocalPlayer)
-                if not canUse or not npc then return end
-
-                local head = npc:FindFirstChild('Head')
-                if not head then return end
-
-                -- Wait for ChatBubble (NPC is ready with order)
-                head:WaitForChild('ChatBubble', 3)
+            local workstation = getupvalue(v, 2)
+            local npc = workstation.Occupied.Value
+            if workstation.InUse.Value == LocalPlayer and npc then
+                local head = npc:WaitForChild('Head')
+                head:WaitForChild('ChatBubble')
                 task.wait(0.1)
-
-                local orderFolder = npc:FindFirstChild('Order')
-                if not orderFolder then return end
-
-                local styleVal = orderFolder:FindFirstChild('Style')
-                local colorVal = orderFolder:FindFirstChild('Color')
-                if not styleVal or not colorVal then return end
-                if styleVal.Value == '' or colorVal.Value == '' then return end
-
-                local style = styleVal.Value
-                local color = colorVal.Value
-                dbg('HAIR', 'Customer wants: ' .. style .. ' | ' .. color)
-                Library:Notify('[Hair] Order: ' .. style .. ' / ' .. color)
-
-                setupvalue(v, 7, { getStyle(style), getColor(color) })
-                task.wait(0.1)
-                v('Done')
-                dbg('HAIR', 'Done fired!')
-            end)
-            if not ok then
-                dbg('HAIR', 'doOrder error: ' .. tostring(err))
+                if npc and npc:FindFirstChild('Order') and npc.Order.Style.Value ~= nil then
+                    setupvalue(v, 7, { getStyle(npc.Order.Style.Value), getColor(npc.Order.Color.Value) })
+                    task.wait(0.1)
+                    v('Done')
+                end
             end
         end
     end
 
     Library:Notify('[Hair] Autofarm running!')
-    dbg('HAIR', '=== START ===')
-
     repeat
         doOrder()
         task.wait(0.1)
     until not _isHairdressing()
-
     Library:Notify('[Hair] Autofarm stopped.')
-    dbg('HAIR', '=== STOPPED ===')
 end
 
 -- ================================================================
