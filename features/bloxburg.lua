@@ -686,7 +686,7 @@ BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
 local _statTargetPlayer = ''
 local _statLabels       = {}
 
-BX_StatViewerGrp:AddLabel('View stats of yourself or another player')
+BX_StatViewerGrp:AddLabel('View stats of PPL')
 BX_StatViewerGrp:AddDropdown('BX_StatPlayer', {
     Text    = 'Select Player',
     Default = 1,
