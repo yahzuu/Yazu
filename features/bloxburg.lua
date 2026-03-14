@@ -78,7 +78,7 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
 })
 
 -- ── Hairdresser ───────────────────────────────────────────────
-BX_HairdresserGrp:AddLabel('Must be clocked in at Stylez Hair Studio')
+BX_HairdresserGrp:AddLabel('SKYS A NIGGER')
 BX_HairdresserGrp:AddToggle('BX_HairdresserFarm', {
     Text     = 'Hairdresser Autofarm',
     Default  = false,
