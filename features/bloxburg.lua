@@ -1359,7 +1359,8 @@ task.spawn(function()
         _autoMoodRunning = false
     end
     dbg('BOOT', 'Bootstrap complete.')
-end)
 ]]
+end)
+
 
 end -- return function
