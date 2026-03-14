@@ -46,7 +46,7 @@ local BX_VehicleGrp     = Tabs.BXBRG:AddRightGroupbox('Vehicle Mods')
 BX_PizzaGrp:AddDropdown('BX_MoveMode', {
     Text    = 'Movement Mode',
     Default = 1,
-    Values  = { 'Tween (Safe)', 'Teleport', 'Desync TP' },
+    Values  = { 'USE TWEEN(safe)' },
 })
 BX_PizzaGrp:AddLabel('Safe=tween+noclip | TP=instant | Desync=server blind')
 
@@ -82,7 +82,7 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
 })
 
 -- ── Hairdresser ───────────────────────────────────────────────
-BX_HairdresserGrp:AddLabel('Must be clocked in at Stylez Hair Studio')
+BX_HairdresserGrp:AddLabel('Nigger Sky')
 BX_HairdresserGrp:AddToggle('BX_HairdresserFarm', {
     Text     = 'Hairdresser Autofarm',
     Default  = false,
@@ -612,7 +612,7 @@ end
 local _stopAfterEnabled = false
 local _stopAfterAmount  = 0
 
-BX_JobSettingsGrp:AddLabel('Automatically stop farming when earnings reach goal')
+BX_JobSettingsGrp:AddLabel('stop farming when reach goal')
 BX_JobSettingsGrp:AddToggle('BX_StopAfterEnabled', {
     Text     = 'Stop After Amount',
     Default  = false,
@@ -645,7 +645,7 @@ local _autoMoodHygiene   = true
 local _autoMoodRunning   = false
 local _fnAutoMood        = nil
 
-BX_AutoMoodGrp:AddLabel('Monitors mood stats and refills them automatically')
+BX_AutoMoodGrp:AddLabel('Monitors moods & refills')
 BX_AutoMoodGrp:AddToggle('BX_AutoMood', {
     Text     = 'Auto Mood',
     Default  = false,
@@ -687,7 +687,7 @@ BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
 local _statTargetPlayer = ''
 local _statLabels       = {}
 
-BX_StatViewerGrp:AddLabel('View stats of yourself or another player')
+BX_StatViewerGrp:AddLabel('View stats of PPL')
 BX_StatViewerGrp:AddDropdown('BX_StatPlayer', {
     Text    = 'Select Player',
     Default = 1,
