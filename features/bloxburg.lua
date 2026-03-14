@@ -23,7 +23,7 @@ local VIM = game:GetService("VirtualInputManager")
 local _bxFW, _bxNet
 local _bxReady = false
 
-local _fnDelivery, _fnSaveHouse, _fnLoadHouse, _fnTeleportPlot
+local _fnDelivery, _fnSaveHouse, _fnLoadHouse, _fnTeleportPlot, _fnHairdresser
 
 local function _notReady() Library:Notify('Still loading Bloxburg framework…') end
 
@@ -34,9 +34,10 @@ end
 -- ================================================================
 --  UI
 -- ================================================================
-local BX_PizzaGrp = Tabs.BXBRG:AddLeftGroupbox('Pizza Delivery')
-local BX_BuildGrp = Tabs.BXBRG:AddRightGroupbox('Auto Build')
-local BX_MiscGrp  = Tabs.BXBRG:AddLeftGroupbox('Misc')
+local BX_PizzaGrp      = Tabs.BXBRG:AddLeftGroupbox('Pizza Delivery')
+local BX_BuildGrp      = Tabs.BXBRG:AddRightGroupbox('Auto Build')
+local BX_MiscGrp       = Tabs.BXBRG:AddLeftGroupbox('Misc')
+local BX_HairdresserGrp = Tabs.BXBRG:AddLeftGroupbox('Stylez Hairdresser')
 
 BX_PizzaGrp:AddDropdown('BX_MoveMode', {
     Text    = 'Movement Mode',
@@ -70,6 +71,21 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
         dbg('TOGGLE', 'BX_PizzaDelivery = ' .. tostring(v))
         if _fnDelivery then
             task.spawn(_fnDelivery, v)
+        else
+            Library:Notify('Still loading…')
+        end
+    end,
+})
+
+-- ── Hairdresser ───────────────────────────────────────────────
+BX_HairdresserGrp:AddLabel('Must be clocked in at Stylez Hair Studio')
+BX_HairdresserGrp:AddToggle('BX_HairdresserFarm', {
+    Text     = 'Hairdresser Autofarm',
+    Default  = false,
+    Callback = function(v)
+        dbg('TOGGLE', 'BX_HairdresserFarm = ' .. tostring(v))
+        if _fnHairdresser then
+            task.spawn(_fnHairdresser, v)
         else
             Library:Notify('Still loading…')
         end
@@ -584,6 +600,106 @@ _fnDelivery = function(toggle)
     _setCharNoclip(false)
     Library:Notify('[Pizza Delivery] Stopped.')
     dbg('LOOP', '=== STOPPED ===')
+end
+
+-- ================================================================
+--  HAIRDRESSER AUTOFARM
+-- ================================================================
+local function _isHairdressing()
+    return Toggles.BX_HairdresserFarm and Toggles.BX_HairdresserFarm.Value
+end
+
+_fnHairdresser = function(toggle)
+    if not toggle then return end
+
+    -- Find internal doAction functions from the StylezHairdresser script
+    local doActionFuncs = {}
+    for _, v in next, getgc() do
+        if type(v) == 'function'
+            and getinfo(v).name == 'doAction'
+            and getfenv(v).script
+            and getfenv(v).script.Name == 'StylezHairdresser' then
+            doActionFuncs[#doActionFuncs + 1] = v
+        end
+    end
+
+    dbg('HAIR', 'Found ' .. #doActionFuncs .. ' doAction funcs')
+
+    if #doActionFuncs == 0 then
+        Library:Notify('[Hair] No doAction found! Make sure you are clocked in first.')
+        if Toggles.BX_HairdresserFarm then Toggles.BX_HairdresserFarm:SetValue(false) end
+        return
+    end
+
+    -- Get styles and colors from upvalues
+    local styles = getupvalue(doActionFuncs[1], 6)
+    local colors = getupvalue(doActionFuncs[1], 8)
+
+    if not styles or not colors then
+        Library:Notify('[Hair] Could not read styles/colors from upvalues!')
+        if Toggles.BX_HairdresserFarm then Toggles.BX_HairdresserFarm:SetValue(false) end
+        return
+    end
+
+    dbg('HAIR', 'Styles: ' .. #styles .. ' | Colors: ' .. #colors)
+
+    local function getStyle(name)
+        for i, v in next, styles do
+            if v.Name == name then return i end
+        end
+        return 1
+    end
+
+    local function getColor(name)
+        for i, v in next, colors do
+            if v.Name == name then return i end
+        end
+        return 1
+    end
+
+    local function doOrder()
+        for _, v in next, doActionFuncs do
+            local workstation = getupvalue(v, 2)
+            if not workstation then continue end
+
+            local npc = workstation.Occupied.Value
+            if workstation.InUse.Value == LocalPlayer and npc then
+                local head = npc:FindFirstChild('Head')
+                if not head then continue end
+
+                -- Wait for ChatBubble (NPC is ready)
+                head:WaitForChild('ChatBubble', 3)
+                task.wait(0.1)
+
+                if npc
+                    and npc:FindFirstChild('Order')
+                    and npc.Order.Style.Value ~= nil
+                    and npc.Order.Style.Value ~= '' then
+
+                    local style = npc.Order.Style.Value
+                    local color = npc.Order.Color.Value
+                    dbg('HAIR', 'Customer wants: ' .. style .. ' | ' .. color)
+                    Library:Notify('[Hair] Order: ' .. style .. ' / ' .. color)
+
+                    setupvalue(v, 7, { getStyle(style), getColor(color) })
+                    task.wait(0.1)
+                    v('Done')
+                    dbg('HAIR', 'Done fired!')
+                end
+            end
+        end
+    end
+
+    Library:Notify('[Hair] Autofarm running!')
+    dbg('HAIR', '=== START ===')
+
+    repeat
+        doOrder()
+        task.wait(0.1)
+    until not _isHairdressing()
+
+    Library:Notify('[Hair] Autofarm stopped.')
+    dbg('HAIR', '=== STOPPED ===')
 end
 
 -- ================================================================
