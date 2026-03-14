@@ -130,7 +130,7 @@ local MiscGrp   = Tabs.Misc:AddRightGroupbox('Misc')
 
 -- Desync
 DesyncGrp:AddButton({ Text = 'Initialize Desync', Func = initDesync })
-DesyncGrp:AddLabel('Press Initialize first, then use the toggle.')
+DesyncGrp:AddLabel('Initialize first, then toggle.')
 DesyncGrp:AddToggle('DesyncEnabled', {
     Text = 'Enable Desync', Default = false,
     Callback = function(v)
