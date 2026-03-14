@@ -30,7 +30,7 @@ local Tabs = {
 }
 
 -- Only add the BXBRG tab if the player is in Bloxburg
-if placeId == 1537690962 then
+if placeId == 185655149 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
 end
 
@@ -41,7 +41,7 @@ load('features/misc.lua')(State, Tabs, Services, Library)
 
 -- Place-specific: only runs if PlaceId matches
 local placeFeatures = {
-    [1537690962] = 'features/bloxburg.lua',
+    [185655149] = 'features/bloxburg.lua',
 }
 
 if placeFeatures[placeId] then
