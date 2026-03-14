@@ -75,3 +75,5 @@ SaveManager:SetFolder('Yazu/configs')
 SaveManager:BuildConfigSection(Tabs['UI Settings'])
 ThemeManager:ApplyToTab(Tabs['UI Settings'])
 SaveManager:LoadAutoloadConfig()
+
+print("version0.01")
