@@ -19,8 +19,19 @@ local SaveManager  = loadstring(game:HttpGet(libRepo .. 'addons/SaveManager.lua'
 local Services = load('core/services.lua')
 local State    = load('core/state.lua')
 
--- ── 3. Tabs ───────────────────────────────────────────────────
-local placeId = game.PlaceId  -- move this up here
+-- ── 3. Window ─────────────────────────────────────────────────
+local RunService       = Services.RunService
+local UserInputService = Services.UserInputService
+
+local Window = Library:CreateWindow({ Title = 'Yazu', Center = true, AutoShow = true })
+
+UserInputService.MouseIcon = ''
+RunService.RenderStepped:Connect(function()
+    if UserInputService.MouseIcon ~= '' then UserInputService.MouseIcon = '' end
+end)
+
+-- ── 4. Tabs ───────────────────────────────────────────────────
+local placeId = game.PlaceId
 
 local Tabs = {
     Aimbot          = Window:AddTab('Aimbot'),
@@ -29,25 +40,24 @@ local Tabs = {
     ['UI Settings'] = Window:AddTab('UI Settings'),
 }
 
--- Only add the BXBRG tab if the player is in Bloxburg
 if placeId == 185655149 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
 end
 
--- ── 4. Features ───────────────────────────────────────────────
+-- ── 5. Features ───────────────────────────────────────────────
 load('features/aimbot.lua')(State, Tabs, Services, Library)
 load('features/esp.lua')(State, Tabs, Services, Library)
 load('features/misc.lua')(State, Tabs, Services, Library)
 
--- Place-specific: only runs if PlaceId matches
 local placeFeatures = {
-    [185655149] = 'features/bloxburg.lua',
+    [1537690962] = 'features/bloxburg.lua',
 }
 
 if placeFeatures[placeId] then
     load(placeFeatures[placeId])(State, Tabs, Services, Library)
 end
--- ── 5. UI Settings tab ────────────────────────────────────────
+
+-- ── 6. UI Settings tab ────────────────────────────────────────
 local UIGrp = Tabs['UI Settings']:AddRightGroupbox('Menu')
 UIGrp:AddButton({ Text = 'Unload', Func = function() Library:Unload() end })
 UIGrp:AddLabel('Toggle Key'):AddKeyPicker('MenuKeybind', { Default = 'End', NoUI = true, Text = 'Menu Keybind' })
