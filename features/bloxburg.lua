@@ -1252,7 +1252,7 @@ task.spawn(function()
         end
     end)
 
-    --[[ ── Auto Mood logic ───────────────────────────────────────
+--[[ ── Auto Mood logic ───────────────────────────────────────
     _fnAutoMood = function()
         if _autoMoodRunning then return end
         _autoMoodRunning = true
@@ -1285,7 +1285,6 @@ task.spawn(function()
 
         local function doMood(moodType)
             if moodType == 'Hunger' then
-                -- Try to find already cooked food first
                 local plot = workspace.Plots['Plot_' .. LocalPlayer.Name]
                 if plot then
                     for _, counter in next, plot.House.Counters:GetChildren() do
@@ -1358,9 +1357,9 @@ task.spawn(function()
 
         _autoMoodRunning = false
     end
+    ]]
+    
     dbg('BOOT', 'Bootstrap complete.')
-]]
 end)
-
 
 end -- return function
