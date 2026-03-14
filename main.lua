@@ -19,48 +19,34 @@ local SaveManager  = loadstring(game:HttpGet(libRepo .. 'addons/SaveManager.lua'
 local Services = load('core/services.lua')
 local State    = load('core/state.lua')
 
--- ── 3. Window & Tabs (must exist before any feature UI) ───────
-local RunService       = Services.RunService
-local UserInputService = Services.UserInputService
-
-local Window = Library:CreateWindow({ Title = 'Yazu', Center = true, AutoShow = true })
-
-UserInputService.MouseIcon = ''
-RunService.RenderStepped:Connect(function()
-    if UserInputService.MouseIcon ~= '' then UserInputService.MouseIcon = '' end
-end)
+-- ── 3. Tabs ───────────────────────────────────────────────────
+local placeId = game.PlaceId  -- move this up here
 
 local Tabs = {
     Aimbot          = Window:AddTab('Aimbot'),
     ESP             = Window:AddTab('ESP'),
     Misc            = Window:AddTab('Misc'),
-    BXBRG           = Window:AddTab('BXBRG'),
     ['UI Settings'] = Window:AddTab('UI Settings'),
 }
 
--- ── 4. Features ───────────────────────────────────────────────
-local placeId = game.PlaceId
+-- Only add the BXBRG tab if the player is in Bloxburg
+if placeId == 1537690962 then
+    Tabs.BXBRG = Window:AddTab('BXBRG')
+end
 
--- Always loaded (global features)
+-- ── 4. Features ───────────────────────────────────────────────
 load('features/aimbot.lua')(State, Tabs, Services, Library)
 load('features/esp.lua')(State, Tabs, Services, Library)
 load('features/misc.lua')(State, Tabs, Services, Library)
 
--- Place-specific features
+-- Place-specific: only runs if PlaceId matches
 local placeFeatures = {
-    [1537690962] = 'features/bloxburg.lua',   -- Bloxburg
-
-
+    [1537690962] = 'features/bloxburg.lua',
 }
 
 if placeFeatures[placeId] then
     load(placeFeatures[placeId])(State, Tabs, Services, Library)
 end
-
-if placeFeatures[1537690962] then
-    load(placeFeatures[1537690962])(State, Tabs, Services, Library)
-end
-
 -- ── 5. UI Settings tab ────────────────────────────────────────
 local UIGrp = Tabs['UI Settings']:AddRightGroupbox('Menu')
 UIGrp:AddButton({ Text = 'Unload', Func = function() Library:Unload() end })
