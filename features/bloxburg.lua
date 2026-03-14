@@ -46,9 +46,9 @@ local BX_VehicleGrp     = Tabs.BXBRG:AddRightGroupbox('Vehicle Mods')
 BX_PizzaGrp:AddDropdown('BX_MoveMode', {
     Text    = 'Movement Mode',
     Default = 1,
-    Values  = { 'USE TWEEN(safe)' },
+    Values  = { 'Tween (Safe)', 'Teleport', 'Desync TP' },
 })
-BX_PizzaGrp:AddLabel('Safe=tween+noclip | TP=instant | Desync=server blind')
+BX_PizzaGrp:AddLabel('use tween(safe)')
 
 BX_PizzaGrp:AddSlider('BX_YOffset', {
     Text     = 'Vertical Offset (Y)',
