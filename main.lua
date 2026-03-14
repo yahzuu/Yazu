@@ -34,15 +34,18 @@ end)
 local placeId = game.PlaceId
 
 local Tabs = {
-    Aimbot          = Window:AddTab('Aimbot'),
-    ESP             = Window:AddTab('ESP'),
-    Misc            = Window:AddTab('Misc'),
-    ['UI Settings'] = Window:AddTab('UI Settings'),
+    Aimbot = Window:AddTab('Aimbot'),
+    ESP    = Window:AddTab('ESP'),
+    Misc   = Window:AddTab('Misc'),
 }
 
-if placeId == 185655149 then
+-- Place-specific tabs added BEFORE UI Settings
+if placeId == 1537690962 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
 end
+
+-- UI Settings must always be last
+Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
 -- ── 5. Features ───────────────────────────────────────────────
 load('features/aimbot.lua')(State, Tabs, Services, Library)
