@@ -40,7 +40,7 @@ local Tabs = {
 }
 
 -- Place-specific tabs added BEFORE UI Settings
-if placeId == 1537690962 then
+if placeId == 185655149 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
 end
 
@@ -53,7 +53,7 @@ load('features/esp.lua')(State, Tabs, Services, Library)
 load('features/misc.lua')(State, Tabs, Services, Library)
 
 local placeFeatures = {
-    [1537690962] = 'features/bloxburg.lua',
+    [185655149] = 'features/bloxburg.lua',
 }
 
 if placeFeatures[placeId] then
