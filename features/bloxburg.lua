@@ -82,7 +82,7 @@ BX_PizzaGrp:AddToggle('BX_PizzaDelivery', {
 })
 
 -- ── Hairdresser ───────────────────────────────────────────────
-BX_HairdresserGrp:AddLabel('Skys a Nigger')
+BX_HairdresserGrp:AddLabel('Must be clocked in at Stylez Hair Studio')
 BX_HairdresserGrp:AddToggle('BX_HairdresserFarm', {
     Text     = 'Hairdresser Autofarm',
     Default  = false,
@@ -686,7 +686,7 @@ BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
 local _statTargetPlayer = ''
 local _statLabels       = {}
 
-BX_StatViewerGrp:AddLabel('View stats of PPL')
+BX_StatViewerGrp:AddLabel('View stats of yourself or another player')
 BX_StatViewerGrp:AddDropdown('BX_StatPlayer', {
     Text    = 'Select Player',
     Default = 1,
@@ -742,7 +742,7 @@ BX_StatViewerGrp:AddButton('Refresh Stats', function()
 end)
 
 -- ================================================================
---  VEHICLE MODS UI
+--[[  VEHICLE MODS UI
 -- ================================================================
 BX_VehicleGrp:AddLabel('Re-enter your vehicle after changing values')
 BX_VehicleGrp:AddSlider('BX_VehForward', {
@@ -801,7 +801,7 @@ BX_VehicleGrp:AddSlider('BX_VehSpring', {
         end)
     end,
 })
-
+]]
 -- ================================================================
 --  HAIRDRESSER AUTOFARM
 -- ================================================================
@@ -1252,7 +1252,7 @@ task.spawn(function()
         end
     end)
 
-    -- ── Auto Mood logic ───────────────────────────────────────
+    --[[ ── Auto Mood logic ───────────────────────────────────────
     _fnAutoMood = function()
         if _autoMoodRunning then return end
         _autoMoodRunning = true
@@ -1360,5 +1360,6 @@ task.spawn(function()
     end
     dbg('BOOT', 'Bootstrap complete.')
 end)
+]]
 
 end -- return function
