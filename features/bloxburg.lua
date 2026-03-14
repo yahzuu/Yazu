@@ -633,7 +633,7 @@ BX_JobSettingsGrp:AddSlider('BX_StopAfterAmount', {
 })
 
 -- ================================================================
---  AUTO MOOD UI
+--[[  AUTO MOOD UI
 -- ================================================================
 local _autoMoodEnabled   = false
 local _moodThreshold     = 40
@@ -679,7 +679,7 @@ BX_AutoMoodGrp:AddDropdown('BX_AutoMoodFood', {
     Values  = { 'Garden Salad', 'Grilled Cheese', 'Salad', 'Ramen', 'Steak' },
     Callback = function(v) _autoMoodFood = v end,
 })
-
+]]
 -- ================================================================
 --  STAT VIEWER UI
 -- ================================================================
