@@ -1,6 +1,6 @@
 -- ================================================================
 --  features/misc.lua
---  Contains: Desync (Instant + Delayed), SpinBot UI,
+--  Contains: Desync (Instant + Delayed lag-mimic), SpinBot UI,
 --            Movement (noclip/walkspeed/jump), random part timers.
 -- ================================================================
 
@@ -16,19 +16,16 @@ local function getLocalHRP()
     return c and c:FindFirstChild('HumanoidRootPart')
 end
 
-local function getLocalHumanoid()
-    local c = LocalPlayer.Character
-    return c and c:FindFirstChildWhichIsA('Humanoid')
-end
-
 -- ================================================================
 --  DESYNC LOGIC
 -- ================================================================
 local desyncInitialized = false
 
--- Delayed desync state
-State.desyncMode           = State.desyncMode or 'instant'   -- 'instant' | 'delayed'
-State.delayedDesyncTimer   = 0
+State.desyncMode        = State.desyncMode or 'instant'   -- 'instant' | 'delayed'
+State.lastDelayedUpdate = 0   -- os.clock() stamp of last lag-window open
+
+-- How long the replication window stays open each cycle (~1 packet worth)
+local DELAYED_WINDOW_SEC = 0.12
 
 local function makePart(col, label)
     local p = Instance.new('Part')
@@ -46,23 +43,48 @@ end
 
 local clientPart, clientLbl = makePart(Color3.fromRGB(60, 255, 100), 'CLIENT')
 local serverPart, serverLbl = makePart(Color3.fromRGB(255, 50,  50), 'SERVER')
-local vizConn    = nil
-local charStateConn = nil  -- tracks humanoid state changes for server part fix
+local vizConn = nil
 
 -- ================================================================
---  SERVER ROOT PART — SEAT / STATE FIX
---  Reconnects humanoid state listener so server part stays pinned
---  even when the character sits, jumps, swims, etc.
+--  SERVER ROOT PART — SYNCHRONIZATION
+--
+--  The root cause of the tracking bug:
+--  Certain humanoid state transitions (Seated, Ragdoll, GettingUp,
+--  Swimming, Climbing, FallingDown) force Roblox to push a real
+--  position replication packet to the server regardless of our
+--  fflag. When that happens, frozenServerPos no longer matches
+--  what the server actually knows — so we must re-snapshot it.
 -- ================================================================
+local charStateConn = nil
+
+local FORCED_REPLICATION_STATES = {
+    [Enum.HumanoidStateType.Seated]      = true,
+    [Enum.HumanoidStateType.GettingUp]   = true,
+    [Enum.HumanoidStateType.Ragdoll]     = true,
+    [Enum.HumanoidStateType.FallingDown] = true,
+    [Enum.HumanoidStateType.Climbing]    = true,
+    [Enum.HumanoidStateType.Swimming]    = true,
+}
+
+local function syncServerPos()
+    -- Defer one frame so the engine finishes moving the HRP first,
+    -- then snapshot wherever the server just saw us land.
+    task.defer(function()
+        local hrp = getLocalHRP()
+        if hrp then State.frozenServerPos = hrp.Position end
+    end)
+end
+
 local function connectCharacterStateTracking(char)
     if charStateConn then charStateConn:Disconnect(); charStateConn = nil end
     if not char then return end
 
     local hum = char:FindFirstChildWhichIsA('Humanoid')
     if not hum then
-        -- Humanoid might not exist yet if char just added; wait for it
-        char.ChildAdded:Connect(function(child)
+        -- Humanoid not yet present; wait for it
+        local waitConn; waitConn = char.ChildAdded:Connect(function(child)
             if child:IsA('Humanoid') then
+                waitConn:Disconnect()
                 connectCharacterStateTracking(char)
             end
         end)
@@ -70,20 +92,10 @@ local function connectCharacterStateTracking(char)
     end
 
     charStateConn = hum.StateChanged:Connect(function(_, newState)
-        -- On any state change (Seated, Jumping, etc.) force server part to stay pinned
-        if State.desyncActive and State.frozenServerPos then
-            serverPart.CFrame = CFrame.new(State.frozenServerPos)
-        end
-    end)
-
-    -- Also watch for HRP being re-parented (happens when SeatWeld is applied/removed)
-    char.ChildAdded:Connect(function(child)
-        if child.Name == 'HumanoidRootPart' and State.desyncActive then
-            task.wait(0.1)   -- let the weld settle
-            -- frozenServerPos stays the same; just re-anchor the visual
-            if State.frozenServerPos then
-                serverPart.CFrame = CFrame.new(State.frozenServerPos)
-            end
+        if not State.desyncActive then return end
+        if FORCED_REPLICATION_STATES[newState] then
+            -- Roblox forced a position packet — re-sync our view of the server pos
+            syncServerPos()
         end
     end)
 end
@@ -94,21 +106,24 @@ end
 local function startViz()
     if vizConn then vizConn:Disconnect(); vizConn = nil end
     clientPart.Parent = workspace; serverPart.Parent = workspace
+
     vizConn = RunService.Heartbeat:Connect(function()
         local hrp = getLocalHRP(); if not hrp then return end
         clientPart.CFrame = hrp.CFrame
+
         if State.desyncActive and State.frozenServerPos then
             serverPart.CFrame = CFrame.new(State.frozenServerPos)
             local dist = math.floor((hrp.Position - State.frozenServerPos).Magnitude)
-            local modeTag = State.desyncMode == 'delayed' and '[DELAY]' or ''
-            serverLbl.Text = 'SERVER ' .. modeTag .. '  ' .. dist .. 'm'
+            local tag  = State.desyncMode == 'delayed' and '[LAG] ' or ''
+            serverLbl.Text = 'SERVER ' .. tag .. dist .. 'm'
             clientLbl.Text = 'CLIENT'
         else
             serverPart.CFrame = hrp.CFrame
-            serverLbl.Text = 'SERVER (synced)'; clientLbl.Text = 'CLIENT'
+            serverLbl.Text = 'SERVER (synced)'
+            clientLbl.Text = 'CLIENT'
         end
     end)
-    -- Re-hook state tracking so visualizer stays correct through sits etc.
+
     connectCharacterStateTracking(LocalPlayer.Character)
 end
 
@@ -121,8 +136,9 @@ end
 --  DESYNC ENABLE / DISABLE
 -- ================================================================
 local function pauseDesync()
-    State.desyncActive = false; State.frozenServerPos = nil
-    State.delayedDesyncTimer = 0
+    State.desyncActive      = false
+    State.frozenServerPos   = nil
+    State.lastDelayedUpdate = 0
     pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'True') end)
     Library:Notify('Desync OFF')
 end
@@ -133,14 +149,14 @@ local function resumeDesync()
         Library:Notify('No character!')
         task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
     end
-    State.frozenServerPos    = hrp.Position
-    State.desyncActive       = true
-    State.delayedDesyncTimer = 0
+    State.frozenServerPos   = hrp.Position
+    State.desyncActive      = true
+    State.lastDelayedUpdate = os.clock()  -- start delayed timer from now
     pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
 
     if State.desyncMode == 'delayed' then
-        local interval = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-        Library:Notify(('Delayed Desync ON — server updates every %.1fs'):format(interval))
+        local iv = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
+        Library:Notify(('Lag Desync ON — server updates every %.0fs'):format(iv))
     else
         Library:Notify('Instant Desync ON — server frozen at current position')
     end
@@ -171,14 +187,14 @@ local function connectTouchDetection()
 end
 
 -- ================================================================
---  CHARACTER ADDED — reset everything cleanly
+--  CHARACTER ADDED — full reset
 -- ================================================================
 LocalPlayer.CharacterAdded:Connect(function(char)
     if State.desyncHbConn then State.desyncHbConn:Disconnect(); State.desyncHbConn = nil end
-    desyncInitialized        = false
-    State.desyncActive       = false
-    State.frozenServerPos    = nil
-    State.delayedDesyncTimer = 0
+    desyncInitialized       = false
+    State.desyncActive      = false
+    State.frozenServerPos   = nil
+    State.lastDelayedUpdate = 0
     pcall(function() if setfflag then setfflag('NextGenReplicatorEnabledWrite4', 'True') end end)
     stopViz()
     task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
@@ -193,7 +209,24 @@ if LocalPlayer.Character then
 end
 
 -- ================================================================
---  INIT DESYNC — sets up the heartbeat that drives both modes
+--  INIT DESYNC
+--
+--  Master heartbeat driving both modes:
+--
+--  INSTANT MODE — original behaviour unchanged.
+--    Every heartbeat: setfflag False. Server position permanently frozen.
+--
+--  DELAYED MODE — mimics genuine packet-loss / high-ping lag.
+--    Keep replication OFF the whole time (same as instant).
+--    Every N seconds, open replication for ~120ms so the server
+--    receives exactly ONE position snapshot, then lock off again.
+--    From the server's perspective: your position teleports every
+--    N seconds then freezes — identical to real lag rubber-banding.
+--
+--    Timeline looks like:
+--      t=0s   [OFF OFF OFF OFF OFF OFF OFF OFF OFF OFF]
+--      t=5s   [ON  ON  ON][OFF OFF OFF OFF OFF OFF OFF]   ← lag spike
+--      t=10s  [ON  ON  ON][OFF OFF OFF OFF OFF OFF OFF]   ← lag spike
 -- ================================================================
 local function initDesync()
     if not setfflag then Library:Notify('setfflag not available in this executor'); return end
@@ -201,40 +234,34 @@ local function initDesync()
     if not getLocalHRP()   then Library:Notify('No character — spawn in first'); return end
     desyncInitialized = true
 
-    State.desyncHbConn = RunService.Heartbeat:Connect(function(dt)
+    State.desyncHbConn = RunService.Heartbeat:Connect(function()
         if not State.desyncActive then return end
 
+        -- ── INSTANT ────────────────────────────────────────────────────
         if State.desyncMode == 'instant' then
-            -- ── INSTANT MODE ─────────────────────────────────────────────
-            -- Original behaviour: keep replication disabled every frame.
             pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
 
+        -- ── DELAYED (lag mimic) ─────────────────────────────────────────
         elseif State.desyncMode == 'delayed' then
-            -- ── DELAYED MODE ─────────────────────────────────────────────
-            -- Passively accumulate time. Every N seconds, open a tiny
-            -- replication window so the server gets ONE position snapshot,
-            -- then lock again. Looks exactly like rubber-band / high-ping lag.
-            State.delayedDesyncTimer = State.delayedDesyncTimer + dt
+            local now      = os.clock()
             local interval = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
+            local elapsed  = now - State.lastDelayedUpdate
 
-            if State.delayedDesyncTimer >= interval then
-                State.delayedDesyncTimer = 0
+            if elapsed < interval then
+                -- ❶ Frozen phase — replication OFF (server can't see us move)
+                pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
 
-                -- Step 1: re-enable replication (server sees your real pos)
+            elseif elapsed < interval + DELAYED_WINDOW_SEC then
+                -- ❷ Lag-spike window — replication ON for ~120ms
+                --    Server receives our real current position right now.
                 pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'True') end)
-
-                -- Step 2: grab the new "lag snapshot" position for the visualizer
+                -- Keep frozenServerPos up-to-date so visualiser matches reality
                 local hrp = getLocalHRP()
                 if hrp then State.frozenServerPos = hrp.Position end
 
-                -- Step 3: lock again after one physics frame (~100 ms is safe)
-                task.delay(0.1, function()
-                    if State.desyncActive and State.desyncMode == 'delayed' then
-                        pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
-                    end
-                end)
             else
-                -- Between updates, keep replication off
+                -- ❸ Window closed — lock off and reset timer for next cycle
+                State.lastDelayedUpdate = now
                 pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
             end
         end
@@ -257,28 +284,28 @@ DesyncGrp:AddLabel('Initialize first, then toggle.')
 DesyncGrp:AddDropdown('DesyncMode', {
     Text    = 'Desync Mode',
     Default = 'Instant',
-    Values  = { 'Instant', 'Delayed' },
+    Values  = { 'Instant', 'Delayed (Lag Mimic)' },
     Callback = function(v)
-        State.desyncMode         = (v == 'Delayed') and 'delayed' or 'instant'
-        State.delayedDesyncTimer = 0
+        State.desyncMode        = (v == 'Instant') and 'instant' or 'delayed'
+        State.lastDelayedUpdate = os.clock()   -- reset timer on switch
         if State.desyncActive then
             if State.desyncMode == 'instant' then
                 Library:Notify('Switched → Instant Desync')
             else
                 local iv = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-                Library:Notify(('Switched → Delayed Desync (%.1fs)'):format(iv))
+                Library:Notify(('Switched → Lag Mimic (%.0fs)'):format(iv))
             end
         end
     end,
 })
 
 DesyncGrp:AddSlider('DelayedDesyncInterval', {
-    Text     = 'Delayed Interval (seconds)',
+    Text     = 'Lag Interval (seconds)',
     Default  = 5,
     Min      = 1,
     Max      = 30,
-    Rounding = 1,
-    -- Live-updates during active delayed desync via the main hb loop automatically.
+    Rounding = 0,
+    -- Heartbeat reads this live — no restart needed when you adjust it.
 })
 
 DesyncGrp:AddToggle('DesyncEnabled', {
