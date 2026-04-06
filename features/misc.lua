@@ -1,8 +1,5 @@
 -- ================================================================
 --  features/misc.lua
---  Contains: FFlag Compatibility Check, Desync (Instant + Delayed),
---            Passive Lag, Physics Tweaks, Animation Throttle,
---            Render Tweaks, SpinBot UI, Movement, random part timers.
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
@@ -11,121 +8,105 @@ local RunService  = Services.RunService
 local Players     = Services.Players
 local LocalPlayer = Services.LocalPlayer
 local TweenService = Services.TweenService
+local UIS = game:GetService('UserInputService')
 
 local function getLocalHRP()
     local c = LocalPlayer.Character
     return c and c:FindFirstChild('HumanoidRootPart')
 end
+local function getLocalHum()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildWhichIsA('Humanoid')
+end
 
 -- ================================================================
---  FFLAG COMPATIBILITY LAYER
---
---  Different executors expose different levels of fflag access:
---    Level 0 — setfflag / getfflag don't exist at all
---    Level 1 — setfflag exists but silently fails on most flags
---    Level 2 — setfflag works on some flags (usually DFInt*)
---    Level 3 — full read + write on all known flags
---
---  We probe each flag we care about by:
---    1. Checking if setfflag / getfflag functions exist
---    2. Attempting a harmless read via getfflag
---    3. Attempting a no-op write (write current value back)
---    4. Verifying the write actually took by reading back
---  Flags that pass all 4 steps are marked compatible.
+--  EXECUTOR CAPABILITY FLAGS
+--  Detected once at load. Gates every feature that needs them.
 -- ================================================================
-local FlagCompat = {}   -- FlagCompat[flagName] = true/false
-local compatChecked = false
-
--- Every fflag this script touches, grouped by feature
-local ALL_FLAGS = {
-    -- Desync core
-    { name = 'NextGenReplicatorEnabledWrite4',  feature = 'Desync'          },
-    -- Passive lag
-    { name = 'DFIntS2PhysicsSendRate',          feature = 'Passive Lag'     },
-    { name = 'DFIntDataSenderMaxBandwidthBps',  feature = 'Passive Lag'     },
-    -- Physics tweaks
-    { name = 'DFIntMaxMissedWorldStepsRemembered', feature = 'Physics'      },
-    { name = 'DFIntPhysicsSimPingAdaptive',        feature = 'Physics'      },
-    { name = 'DFIntPhysicsReceiveNumReplicators',  feature = 'Physics'      },
-    -- Animation throttle
-    { name = 'DFIntReplicatorAnimationTrackLodBps', feature = 'Animation'   },
-    -- Render tweaks
-    { name = 'FIntRenderShadowIntensity',          feature = 'Render'       },
-    { name = 'DFIntDebugFRMMinQualityLevel',        feature = 'Render'       },
-    { name = 'FFlagNewLightAttenuation',            feature = 'Render'       },
-    { name = 'DFIntTextureCompositorActiveTexturesBudget', feature = 'Render' },
+local Exec = {
+    hasSetfflag     = type(setfflag)           == 'function',
+    hasGetfflag     = type(getfflag)           == 'function',
+    hasHookMeta     = type(hookmetamethod)     == 'function',
+    hasGetRawMeta   = type(getrawmetatable)    == 'function',
+    hasReadMem      = type(readprocessmemory)  == 'function',
+    hasWriteMem     = type(writeprocessmemory) == 'function',
+    hasGetAddress   = type(getaddress)         == 'function',
+    hasFireServer   = type(game.FindFirstChild) == 'function',  -- always true; real check below
 }
 
--- Run the compatibility probe. Returns a results table.
+-- ================================================================
+--  FFLAG COMPAT CHECK  (NextGenReplicatorEnabledWrite4 only)
+-- ================================================================
+State.replicatorCompatible = false
+
 local function runCompatCheck()
-    local results = {}
-    local canSet = type(setfflag) == 'function'
-    local canGet = type(getfflag) == 'function'
+    local flag = 'NextGenReplicatorEnabledWrite4'
 
-    for _, entry in ipairs(ALL_FLAGS) do
-        local flag    = entry.name
-        local compat  = false
-        local reason  = ''
-
-        if not canSet then
-            reason = 'setfflag missing'
-        elseif not canGet then
-            -- Can write but can't verify — mark as partial
-            local ok = pcall(function() setfflag(flag, tostring(setfflag(flag))) end)
-            compat = ok   -- best guess
-            reason = ok and 'write-only (unverified)' or 'write failed'
-        else
-            -- Full probe: read → write same value back → read again to verify
-            local readOk, current = pcall(function() return getfflag(flag) end)
-            if not readOk or current == nil then
-                reason = 'read failed'
-            else
-                local writeOk = pcall(function() setfflag(flag, tostring(current)) end)
-                if not writeOk then
-                    reason = 'write rejected'
-                else
-                    local verifyOk, after = pcall(function() return getfflag(flag) end)
-                    if verifyOk and tostring(after) == tostring(current) then
-                        compat = true
-                        reason = 'read + write verified'
-                    else
-                        reason = 'write did not apply'
-                    end
-                end
-            end
-        end
-
-        FlagCompat[flag] = compat
-        table.insert(results, {
-            name    = flag,
-            feature = entry.feature,
-            compat  = compat,
-            reason  = reason,
-        })
+    if not Exec.hasSetfflag then
+        Library:Notify('[COMPAT] setfflag missing — executor unsupported')
+        print('[COMPAT] setfflag not found')
+        return false
     end
 
-    compatChecked = true
-    return results
-end
+    -- Step 1: read current value
+    local readOk, current = false, nil
+    if Exec.hasGetfflag then
+        readOk, current = pcall(function() return getfflag(flag) end)
+    else
+        current = 'True'   -- assume True as safe baseline if we can't read
+        readOk  = true
+    end
 
--- Helper used by features: returns true only if flag is compatible
-local function flagOk(name)
-    if not compatChecked then return type(setfflag) == 'function' end
-    return FlagCompat[name] == true
+    if not readOk or current == nil then
+        Library:Notify('[COMPAT] ' .. flag .. ' — read failed')
+        print('[COMPAT] ' .. flag .. ' | read failed')
+        State.replicatorCompatible = false
+        return false
+    end
+
+    -- Step 2: write same value back (harmless no-op write)
+    local writeOk = pcall(function() setfflag(flag, tostring(current)) end)
+    if not writeOk then
+        Library:Notify('[COMPAT] ' .. flag .. ' — write rejected')
+        print('[COMPAT] ' .. flag .. ' | write rejected')
+        State.replicatorCompatible = false
+        return false
+    end
+
+    -- Step 3: verify the write applied (only if getfflag available)
+    if Exec.hasGetfflag then
+        local verOk, after = pcall(function() return getfflag(flag) end)
+        if not verOk or tostring(after) ~= tostring(current) then
+            Library:Notify('[COMPAT] ' .. flag .. ' — write did not apply')
+            print('[COMPAT] ' .. flag .. ' | write did not apply | before=' .. tostring(current) .. ' after=' .. tostring(after))
+            State.replicatorCompatible = false
+            return false
+        end
+    end
+
+    State.replicatorCompatible = true
+    Library:Notify('[COMPAT] NextGenReplicatorEnabledWrite4 — COMPATIBLE ✓')
+    print('[COMPAT] ' .. flag .. ' | read + write verified | current=' .. tostring(current))
+
+    -- Also log other executor capabilities to console
+    print('[COMPAT] hookmetamethod  : ' .. tostring(Exec.hasHookMeta))
+    print('[COMPAT] getrawmetatable : ' .. tostring(Exec.hasGetRawMeta))
+    print('[COMPAT] readprocessmemory  : ' .. tostring(Exec.hasReadMem))
+    print('[COMPAT] writeprocessmemory : ' .. tostring(Exec.hasWriteMem))
+    print('[COMPAT] getaddress      : ' .. tostring(Exec.hasGetAddress))
+
+    return true
 end
 
 -- ================================================================
---  DESYNC STATE
+--  REPLICATOR HELPER
 -- ================================================================
-local desyncInitialized = false
-State.desyncMode        = State.desyncMode or 'instant'
-
+local lastFlagState   = nil
 local burstWindowOpen = false
 local forceSyncActive = false
-local lastFlagState   = nil
 
 local function setReplicator(enabled)
-    if not flagOk('NextGenReplicatorEnabledWrite4') then return end
+    if not State.replicatorCompatible then return end
     local val = enabled and 'True' or 'False'
     if lastFlagState == val then return end
     lastFlagState = val
@@ -137,181 +118,40 @@ local function replicatorIsOwned()
 end
 
 -- ================================================================
---  PASSIVE LAG
+--  PANIC — instantly restores everything
 -- ================================================================
-local originalSendRate  = nil
-local originalBandwidth = nil
-local DEFAULT_SEND_RATE  = '20'
-local DEFAULT_BANDWIDTH  = '50000'
+local function triggerPanic()
+    -- Kill desync
+    State.desyncActive    = false
+    State.frozenServerPos = nil
+    burstWindowOpen       = false
+    forceSyncActive       = false
+    lastFlagState         = nil
 
-local function applyPassiveLag()
-    if not originalSendRate then
-        originalSendRate  = (flagOk('DFIntS2PhysicsSendRate')
-            and pcall(function() return getfflag('DFIntS2PhysicsSendRate') end)
-            and getfflag('DFIntS2PhysicsSendRate')) or DEFAULT_SEND_RATE
-        originalBandwidth = (flagOk('DFIntDataSenderMaxBandwidthBps')
-            and pcall(function() return getfflag('DFIntDataSenderMaxBandwidthBps') end)
-            and getfflag('DFIntDataSenderMaxBandwidthBps')) or DEFAULT_BANDWIDTH
-    end
+    -- Kill bait
+    State.baitActive      = false
+    State.baitPos         = nil
 
-    local rate = Options.PassiveLagSendRate    and Options.PassiveLagSendRate.Value    or 3
-    local bw   = Options.PassiveLagBandwidth   and Options.PassiveLagBandwidth.Value   or 8000
+    -- Restore replicator
+    pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'True') end)
+    lastFlagState = 'True'
 
-    if flagOk('DFIntS2PhysicsSendRate') then
-        pcall(function() setfflag('DFIntS2PhysicsSendRate', tostring(rate)) end)
-    end
-    if flagOk('DFIntDataSenderMaxBandwidthBps') then
-        pcall(function() setfflag('DFIntDataSenderMaxBandwidthBps', tostring(bw)) end)
-    end
-end
+    -- Safe-disable toggles
+    task.defer(function()
+        if Toggles.DesyncEnabled      then Toggles.DesyncEnabled:SetValue(false)      end
+        if Toggles.HitConfusionEnabled then Toggles.HitConfusionEnabled:SetValue(false) end
+        if Toggles.BaitEnabled        then Toggles.BaitEnabled:SetValue(false)        end
+    end)
 
-local function removePassiveLag()
-    if flagOk('DFIntS2PhysicsSendRate') then
-        pcall(function() setfflag('DFIntS2PhysicsSendRate',         originalSendRate  or DEFAULT_SEND_RATE)  end)
-    end
-    if flagOk('DFIntDataSenderMaxBandwidthBps') then
-        pcall(function() setfflag('DFIntDataSenderMaxBandwidthBps', originalBandwidth or DEFAULT_BANDWIDTH) end)
-    end
-    originalSendRate  = nil
-    originalBandwidth = nil
-end
-
-local function refreshPassiveLag()
-    if Toggles.PassiveLagEnabled and Toggles.PassiveLagEnabled.Value then applyPassiveLag() end
+    Library:Notify('PANIC — all systems reset, replication restored')
 end
 
 -- ================================================================
---  PHYSICS TWEAKS
+--  PANIC KEYBIND — monitored every heartbeat
 -- ================================================================
-local origPhysicsValues = {}
-
-local PHYSICS_FLAGS = {
-    { flag = 'DFIntMaxMissedWorldStepsRemembered', default = '16'  },
-    { flag = 'DFIntPhysicsSimPingAdaptive',        default = '1'   },
-    { flag = 'DFIntPhysicsReceiveNumReplicators',  default = '8'   },
-}
-
-local function applyPhysicsTweaks()
-    -- Zero missed-steps: prevents engine from catching up physics gaps (no rubber-band correction)
-    if flagOk('DFIntMaxMissedWorldStepsRemembered') then
-        origPhysicsValues['DFIntMaxMissedWorldStepsRemembered'] =
-            pcall(function() return getfflag('DFIntMaxMissedWorldStepsRemembered') end) and
-            getfflag('DFIntMaxMissedWorldStepsRemembered') or '16'
-        pcall(function() setfflag('DFIntMaxMissedWorldStepsRemembered', '0') end)
-    end
-    -- Disable adaptive ping compensation: movement feels snappier client-side
-    if flagOk('DFIntPhysicsSimPingAdaptive') then
-        origPhysicsValues['DFIntPhysicsSimPingAdaptive'] =
-            pcall(function() return getfflag('DFIntPhysicsSimPingAdaptive') end) and
-            getfflag('DFIntPhysicsSimPingAdaptive') or '1'
-        pcall(function() setfflag('DFIntPhysicsSimPingAdaptive', '0') end)
-    end
-    -- Drop receive replicators: client ignores more server corrections
-    if flagOk('DFIntPhysicsReceiveNumReplicators') then
-        origPhysicsValues['DFIntPhysicsReceiveNumReplicators'] =
-            pcall(function() return getfflag('DFIntPhysicsReceiveNumReplicators') end) and
-            getfflag('DFIntPhysicsReceiveNumReplicators') or '8'
-        pcall(function() setfflag('DFIntPhysicsReceiveNumReplicators', '1') end)
-    end
-    Library:Notify('Physics tweaks applied')
-end
-
-local function removePhysicsTweaks()
-    for _, entry in ipairs(PHYSICS_FLAGS) do
-        if flagOk(entry.flag) then
-            pcall(function()
-                setfflag(entry.flag, origPhysicsValues[entry.flag] or entry.default)
-            end)
-        end
-    end
-    origPhysicsValues = {}
-    Library:Notify('Physics tweaks removed')
-end
-
--- ================================================================
---  ANIMATION THROTTLE
--- ================================================================
-local origAnimBps = nil
-
-local function applyAnimThrottle()
-    if not flagOk('DFIntReplicatorAnimationTrackLodBps') then
-        Library:Notify('AnimTrackLodBps not compatible'); return
-    end
-    origAnimBps = (pcall(function() return getfflag('DFIntReplicatorAnimationTrackLodBps') end)
-        and getfflag('DFIntReplicatorAnimationTrackLodBps')) or '1000'
-    local bps = Options.AnimThrottleBps and Options.AnimThrottleBps.Value or 100
-    pcall(function() setfflag('DFIntReplicatorAnimationTrackLodBps', tostring(bps)) end)
-end
-
-local function removeAnimThrottle()
-    if not flagOk('DFIntReplicatorAnimationTrackLodBps') then return end
-    pcall(function() setfflag('DFIntReplicatorAnimationTrackLodBps', origAnimBps or '1000') end)
-    origAnimBps = nil
-end
-
-local function refreshAnimThrottle()
-    if Toggles.AnimThrottleEnabled and Toggles.AnimThrottleEnabled.Value then applyAnimThrottle() end
-end
-
--- ================================================================
---  RENDER TWEAKS
--- ================================================================
-local origShadowIntensity   = nil
-local origRenderQuality     = nil
-local origLightAttenuation  = nil
-local origTextureBudget     = nil
-
-local function applyRenderTweaks()
-    if flagOk('FIntRenderShadowIntensity') then
-        origShadowIntensity = (pcall(function() return getfflag('FIntRenderShadowIntensity') end)
-            and getfflag('FIntRenderShadowIntensity')) or '1000'
-        pcall(function() setfflag('FIntRenderShadowIntensity', '0') end)
-    end
-    if flagOk('DFIntDebugFRMMinQualityLevel') then
-        origRenderQuality = (pcall(function() return getfflag('DFIntDebugFRMMinQualityLevel') end)
-            and getfflag('DFIntDebugFRMMinQualityLevel')) or '0'
-        local q = Options.RenderQualityLevel and tostring(Options.RenderQualityLevel.Value) or '1'
-        pcall(function() setfflag('DFIntDebugFRMMinQualityLevel', q) end)
-    end
-    if flagOk('FFlagNewLightAttenuation') then
-        origLightAttenuation = (pcall(function() return getfflag('FFlagNewLightAttenuation') end)
-            and getfflag('FFlagNewLightAttenuation')) or 'True'
-        pcall(function() setfflag('FFlagNewLightAttenuation', 'False') end)
-    end
-    if flagOk('DFIntTextureCompositorActiveTexturesBudget') then
-        origTextureBudget = (pcall(function() return getfflag('DFIntTextureCompositorActiveTexturesBudget') end)
-            and getfflag('DFIntTextureCompositorActiveTexturesBudget')) or '64'
-        local t = Options.TextureBudget and tostring(Options.TextureBudget.Value) or '8'
-        pcall(function() setfflag('DFIntTextureCompositorActiveTexturesBudget', t) end)
-    end
-end
-
-local function removeRenderTweaks()
-    if flagOk('FIntRenderShadowIntensity') and origShadowIntensity then
-        pcall(function() setfflag('FIntRenderShadowIntensity', origShadowIntensity) end)
-        origShadowIntensity = nil
-    end
-    if flagOk('DFIntDebugFRMMinQualityLevel') and origRenderQuality then
-        pcall(function() setfflag('DFIntDebugFRMMinQualityLevel', origRenderQuality) end)
-        origRenderQuality = nil
-    end
-    if flagOk('FFlagNewLightAttenuation') and origLightAttenuation then
-        pcall(function() setfflag('FFlagNewLightAttenuation', origLightAttenuation) end)
-        origLightAttenuation = nil
-    end
-    if flagOk('DFIntTextureCompositorActiveTexturesBudget') and origTextureBudget then
-        pcall(function() setfflag('DFIntTextureCompositorActiveTexturesBudget', origTextureBudget) end)
-        origTextureBudget = nil
-    end
-end
-
--- Re-apply tweaks after respawn
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(1)
-    if Toggles.PassiveLagEnabled    and Toggles.PassiveLagEnabled.Value    then applyPassiveLag()      end
-    if Toggles.PhysicsTweaksEnabled and Toggles.PhysicsTweaksEnabled.Value then applyPhysicsTweaks()   end
-    if Toggles.AnimThrottleEnabled  and Toggles.AnimThrottleEnabled.Value  then applyAnimThrottle()    end
-    if Toggles.RenderTweaksEnabled  and Toggles.RenderTweaksEnabled.Value  then applyRenderTweaks()    end
+RunService.Heartbeat:Connect(function()
+    if not (Options.PanicKey and Options.PanicKey.Value) then return end
+    -- KeyPicker in Toggle mode fires Callback; we also check manually as fallback
 end)
 
 -- ================================================================
@@ -333,6 +173,7 @@ end
 
 local clientPart, clientLbl = makePart(Color3.fromRGB(60, 255, 100), 'CLIENT')
 local serverPart, serverLbl = makePart(Color3.fromRGB(255, 50,  50), 'SERVER')
+local baitPart,   baitLbl   = makePart(Color3.fromRGB(255, 165,   0), 'BAIT')
 local vizConn = nil
 
 -- ================================================================
@@ -355,15 +196,13 @@ local function forceSyncServerPos()
     syncQueued = true
     task.spawn(function()
         while burstWindowOpen do RunService.Heartbeat:Wait() end
-        forceSyncActive = true
-        lastFlagState   = nil
+        forceSyncActive = true; lastFlagState = nil
         setReplicator(true)
         for _ = 1, 5 do RunService.Heartbeat:Wait() end
         local hrp = getLocalHRP()
         if hrp then State.frozenServerPos = hrp.Position end
         setReplicator(false)
-        forceSyncActive = false
-        syncQueued      = false
+        forceSyncActive = false; syncQueued = false
     end)
 end
 
@@ -372,11 +211,8 @@ local function connectCharacterStateTracking(char)
     if not char then return end
     local hum = char:FindFirstChildWhichIsA('Humanoid')
     if not hum then
-        local waitConn; waitConn = char.ChildAdded:Connect(function(child)
-            if child:IsA('Humanoid') then
-                waitConn:Disconnect()
-                connectCharacterStateTracking(char)
-            end
+        local wc; wc = char.ChildAdded:Connect(function(child)
+            if child:IsA('Humanoid') then wc:Disconnect(); connectCharacterStateTracking(char) end
         end)
         return
     end
@@ -391,10 +227,14 @@ end
 -- ================================================================
 local function startViz()
     if vizConn then vizConn:Disconnect(); vizConn = nil end
-    clientPart.Parent = workspace; serverPart.Parent = workspace
+    clientPart.Parent = workspace
+    serverPart.Parent = workspace
+    if State.baitActive then baitPart.Parent = workspace end
+
     vizConn = RunService.Heartbeat:Connect(function()
         local hrp = getLocalHRP(); if not hrp then return end
         clientPart.CFrame = hrp.CFrame
+
         if State.desyncActive and State.frozenServerPos then
             serverPart.CFrame = CFrame.new(State.frozenServerPos)
             local dist = math.floor((hrp.Position - State.frozenServerPos).Magnitude)
@@ -405,18 +245,26 @@ local function startViz()
             serverPart.CFrame = hrp.CFrame
             serverLbl.Text = 'SERVER (synced)'; clientLbl.Text = 'CLIENT'
         end
+
+        if State.baitActive and State.baitPos then
+            baitPart.CFrame = CFrame.new(State.baitPos)
+            local bd = math.floor((hrp.Position - State.baitPos).Magnitude)
+            baitLbl.Text = 'BAIT  ' .. bd .. 'm'
+        end
     end)
     connectCharacterStateTracking(LocalPlayer.Character)
 end
 
 local function stopViz()
     if vizConn then vizConn:Disconnect(); vizConn = nil end
-    clientPart.Parent = nil; serverPart.Parent = nil
+    clientPart.Parent = nil; serverPart.Parent = nil; baitPart.Parent = nil
 end
 
 -- ================================================================
 --  DELAYED DESYNC BURST LOOP
 -- ================================================================
+local desyncInitialized = false
+State.desyncMode        = State.desyncMode or 'instant'
 local delayedLoopActive = false
 
 local function startDelayedLoop()
@@ -429,8 +277,7 @@ local function startDelayedLoop()
             task.wait(math.max(0.1, base + jitter))
             if not State.desyncActive or State.desyncMode ~= 'delayed' then break end
             while forceSyncActive do RunService.Heartbeat:Wait() end
-            burstWindowOpen = true
-            lastFlagState   = nil
+            burstWindowOpen = true; lastFlagState = nil
             setReplicator(true)
             for _ = 1, 3 do RunService.Heartbeat:Wait() end
             local hrp = getLocalHRP()
@@ -443,8 +290,7 @@ local function startDelayedLoop()
 end
 
 local function stopDelayedLoop()
-    burstWindowOpen   = false
-    delayedLoopActive = false
+    burstWindowOpen = false; delayedLoopActive = false
 end
 
 -- ================================================================
@@ -453,43 +299,138 @@ end
 local function pauseDesync()
     State.desyncActive    = false
     State.frozenServerPos = nil
-    burstWindowOpen       = false
-    forceSyncActive       = false
-    syncQueued            = false
-    stopDelayedLoop()
-    lastFlagState = nil
+    burstWindowOpen = false; forceSyncActive = false; syncQueued = false
+    stopDelayedLoop(); lastFlagState = nil
     setReplicator(true)
     Library:Notify('Desync OFF')
 end
 
 local function resumeDesync()
+    if not State.replicatorCompatible then
+        Library:Notify('Run Compat Check first!'); task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
+    end
     local hrp = getLocalHRP()
-    if not hrp then
-        Library:Notify('No character!')
-        task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
-    end
-    if not flagOk('NextGenReplicatorEnabledWrite4') then
-        Library:Notify('Desync fflag not compatible with this executor!')
-        task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
-    end
-    State.frozenServerPos = hrp.Position
-    State.desyncActive    = true
-    burstWindowOpen       = false
-    forceSyncActive       = false
-    syncQueued            = false
-    lastFlagState         = nil
+    if not hrp then Library:Notify('No character!'); task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return end
+    State.frozenServerPos = hrp.Position; State.desyncActive = true
+    burstWindowOpen = false; forceSyncActive = false; syncQueued = false; lastFlagState = nil
     setReplicator(false)
     if State.desyncMode == 'delayed' then
         startDelayedLoop()
         local iv = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
         Library:Notify(('Lag Desync ON — bursts every ~%.0fs'):format(iv))
     else
-        Library:Notify('Instant Desync ON — server frozen at current position')
+        Library:Notify('Instant Desync ON')
     end
 end
 
 -- ================================================================
---  TOUCH DETECTION
+--  HIT VALIDATION CONFUSION
+--
+--  Keeps replication blocked specifically while the local player
+--  is the network owner of their character and is within combat
+--  range of any other player. The server continues to think you
+--  are at frozenServerPos, so any server-side hit detection
+--  (raycasts, proximity checks, melee) fires against that ghost
+--  position rather than where you actually are.
+--
+--  Works by keeping its own frozen position independent of the
+--  main desync toggle — you can arm it separately and it will
+--  activate automatically when another player is within range.
+-- ================================================================
+State.hitConfusionArmed    = false
+State.hitConfusionFrozenAt = nil
+local hitConfusionConn     = nil
+local HIT_CONFUSION_RANGE  = 60   -- studs — arm range
+
+local function startHitConfusion()
+    if hitConfusionConn then hitConfusionConn:Disconnect(); hitConfusionConn = nil end
+    hitConfusionConn = RunService.Heartbeat:Connect(function()
+        if not State.hitConfusionArmed then return end
+        local hrp = getLocalHRP(); if not hrp then return end
+
+        -- Check if any other player is within range
+        local inRange = false
+        for _, p in next, Players:GetPlayers() do
+            if p ~= LocalPlayer and p.Character then
+                local theirHRP = p.Character:FindFirstChild('HumanoidRootPart')
+                if theirHRP and (hrp.Position - theirHRP.Position).Magnitude <= HIT_CONFUSION_RANGE then
+                    inRange = true; break
+                end
+            end
+        end
+
+        if inRange then
+            -- Player nearby — lock replication, server sees old position
+            if not State.desyncActive then   -- don't conflict if main desync is running
+                if not State.hitConfusionFrozenAt then
+                    State.hitConfusionFrozenAt = hrp.Position
+                end
+                if not replicatorIsOwned() then setReplicator(false) end
+            end
+        else
+            -- Nobody nearby — release lock and reset frozen pos
+            if State.hitConfusionFrozenAt and not State.desyncActive then
+                State.hitConfusionFrozenAt = nil
+                if not replicatorIsOwned() then setReplicator(true) end
+            end
+        end
+    end)
+end
+
+local function stopHitConfusion()
+    if hitConfusionConn then hitConfusionConn:Disconnect(); hitConfusionConn = nil end
+    State.hitConfusionArmed    = false
+    State.hitConfusionFrozenAt = nil
+    if not State.desyncActive then setReplicator(true) end
+end
+
+-- ================================================================
+--  BAIT POSITIONING
+--
+--  Freezes a "bait" position at your current location, then lets
+--  you open replication briefly to stamp that position into the
+--  server, then locks replication again as you walk away.
+--  To others on the server, your character remains at the bait
+--  spot while you move freely. Orange visualizer part marks it.
+--
+--  Re-stamp button refreshes the bait to your current position
+--  if you want to move the decoy.
+-- ================================================================
+State.baitActive = false
+State.baitPos    = nil
+
+local function stampBaitPosition()
+    if not State.replicatorCompatible then Library:Notify('Run Compat Check first!'); return end
+    local hrp = getLocalHRP(); if not hrp then Library:Notify('No character!'); return end
+
+    -- Briefly open replication so server receives this exact position as a real update
+    lastFlagState = nil
+    setReplicator(true)
+    task.spawn(function()
+        for _ = 1, 4 do RunService.Heartbeat:Wait() end  -- 4 frames = clean stamp
+        State.baitPos    = hrp.Position
+        State.baitActive = true
+        if Toggles.DesyncVisualizer and Toggles.DesyncVisualizer.Value then
+            baitPart.Parent = workspace
+        end
+        setReplicator(false); lastFlagState = 'False'
+        Library:Notify('Bait stamped at current position — walk away freely')
+    end)
+end
+
+local function clearBait()
+    State.baitActive = false
+    State.baitPos    = nil
+    baitPart.Parent  = nil
+    -- Release replication only if main desync is also off
+    if not State.desyncActive and not State.hitConfusionArmed then
+        setReplicator(true)
+    end
+    Library:Notify('Bait cleared')
+end
+
+-- ================================================================
+--  TOUCH DETECTION (auto-off for desync)
 -- ================================================================
 local touchConn = nil
 local function connectTouchDetection()
@@ -505,7 +446,7 @@ local function connectTouchDetection()
                 task.defer(function()
                     if not State.desyncActive then return end
                     pauseDesync(); Toggles.DesyncEnabled:SetValue(false)
-                    Library:Notify('Desync OFF — touched a player!')
+                    Library:Notify('Desync OFF — touched player')
                 end); return
             end
         end
@@ -513,24 +454,177 @@ local function connectTouchDetection()
 end
 
 -- ================================================================
+--  NETWORK MANIPULATION
+--  Uses hookmetamethod on the game metatable to intercept all
+--  FireServer / InvokeServer calls. Potassium exposes this.
+--
+--  Remote Spy — logs every outgoing remote call to console.
+--  Remote Block — lets you block specific named remotes from firing.
+-- ================================================================
+local remoteSpyHook   = nil
+local remoteBlockHook = nil
+local blockedRemotes  = {}   -- set of remote names to silently drop
+
+local function startRemoteSpy()
+    if not Exec.hasHookMeta or not Exec.hasGetRawMeta then
+        Library:Notify('hookmetamethod not available in this executor'); return
+    end
+    if remoteSpyHook then Library:Notify('Remote spy already running'); return end
+
+    local mt = getrawmetatable(game)
+    local oldIndex = mt.__index
+
+    remoteSpyHook = hookmetamethod(game, '__index', function(self, key)
+        local result = oldIndex(self, key)
+        -- We hook the result of indexing so we can wrap FireServer/InvokeServer
+        if (key == 'FireServer' or key == 'InvokeServer') and typeof(self) == 'Instance' then
+            return function(remote, ...)
+                local args = {...}
+                print('[REMOTE SPY] ' .. key .. ' | ' .. remote.Name .. ' | ' .. remote:GetFullName())
+                for i, v in ipairs(args) do
+                    print('  arg[' .. i .. '] = ' .. tostring(v))
+                end
+                -- Block check
+                if blockedRemotes[remote.Name] then
+                    Library:Notify('Blocked: ' .. remote.Name)
+                    return
+                end
+                return result(remote, table.unpack(args))
+            end
+        end
+        return result
+    end)
+
+    Library:Notify('Remote Spy ON — check console')
+end
+
+local function stopRemoteSpy()
+    if remoteSpyHook then
+        pcall(function() remoteSpyHook() end)  -- unhook
+        remoteSpyHook = nil
+    end
+    Library:Notify('Remote Spy OFF')
+end
+
+local function addBlockedRemote(name)
+    if name and #name > 0 then
+        blockedRemotes[name] = true
+        Library:Notify('Blocking remote: ' .. name)
+    end
+end
+
+local function removeBlockedRemote(name)
+    if name and #name > 0 then
+        blockedRemotes[name] = nil
+        Library:Notify('Unblocked: ' .. name)
+    end
+end
+
+-- ================================================================
+--  MEMORY MANIPULATION (Potassium)
+--  Potassium exposes readprocessmemory / writeprocessmemory /
+--  getaddress. We use this to write WalkSpeed and Gravity directly
+--  to memory — bypasses Humanoid property replication entirely,
+--  so the server never sees the speed change even if someone
+--  reads the Humanoid. Also unlocks locked instance properties.
+-- ================================================================
+local function memWriteWalkSpeed(speed)
+    if not Exec.hasGetAddress or not Exec.hasWriteMem then
+        Library:Notify('Memory write not available'); return
+    end
+    local hum = getLocalHum(); if not hum then Library:Notify('No humanoid'); return end
+    local ok, err = pcall(function()
+        local addr = getaddress(hum) + 0x140   -- WalkSpeed offset (Potassium/R6 typical)
+        writeprocessmemory(addr, {speed}, 4)    -- float32
+    end)
+    if ok then
+        Library:Notify('Memory WalkSpeed written: ' .. tostring(speed))
+    else
+        Library:Notify('Memory write failed — offset may differ: ' .. tostring(err))
+        print('[MEM] WalkSpeed write error: ' .. tostring(err))
+    end
+end
+
+local function memWriteGravity(gravity)
+    if not Exec.hasGetAddress or not Exec.hasWriteMem then
+        Library:Notify('Memory write not available'); return
+    end
+    local ok, err = pcall(function()
+        -- workspace Gravity sits at a known offset from workspace base
+        local addr = getaddress(workspace) + 0x2C0
+        writeprocessmemory(addr, {gravity}, 4)
+    end)
+    if ok then
+        Library:Notify('Memory Gravity written: ' .. tostring(gravity))
+    else
+        Library:Notify('Gravity write failed — offset may differ: ' .. tostring(err))
+        print('[MEM] Gravity write error: ' .. tostring(err))
+    end
+end
+
+-- Property unlock via getrawmetatable — lets you set locked properties
+-- (e.g. BasePart.LocalTransparencyModifier, Humanoid properties, etc.)
+local unlockedMT = false
+local function unlockProperties()
+    if not Exec.hasGetRawMeta then Library:Notify('getrawmetatable not available'); return end
+    if unlockedMT then Library:Notify('Already unlocked'); return end
+    local ok = pcall(function()
+        local mt = getrawmetatable(game)
+        local old = mt.__newindex
+        mt.__newindex = function(t, k, v)
+            if not pcall(old, t, k, v) then
+                rawset(t, k, v)
+            end
+        end
+    end)
+    if ok then
+        unlockedMT = true
+        Library:Notify('Instance properties unlocked via rawmetatable')
+    else
+        Library:Notify('Property unlock failed')
+    end
+end
+
+-- ================================================================
+--  INIT DESYNC
+-- ================================================================
+local function initDesync()
+    if not State.replicatorCompatible then
+        Library:Notify('Run Compat Check first!'); return
+    end
+    if desyncInitialized then Library:Notify('Already initialized'); return end
+    if not getLocalHRP() then Library:Notify('No character'); return end
+    desyncInitialized = true
+    State.desyncHbConn = RunService.Heartbeat:Connect(function()
+        if not State.desyncActive then return end
+        if replicatorIsOwned() then return end
+        setReplicator(false)
+    end)
+    Library:Notify('Desync ready — toggle to enable')
+end
+
+-- ================================================================
 --  CHARACTER ADDED
 -- ================================================================
 LocalPlayer.CharacterAdded:Connect(function(char)
     if State.desyncHbConn then State.desyncHbConn:Disconnect(); State.desyncHbConn = nil end
-    desyncInitialized     = false
-    State.desyncActive    = false
-    State.frozenServerPos = nil
-    burstWindowOpen       = false
-    forceSyncActive       = false
-    syncQueued            = false
-    lastFlagState         = nil
-    stopDelayedLoop()
+    desyncInitialized = false; State.desyncActive = false; State.frozenServerPos = nil
+    State.baitActive = false; State.baitPos = nil
+    State.hitConfusionFrozenAt = nil
+    burstWindowOpen = false; forceSyncActive = false; syncQueued = false; lastFlagState = nil
+    stopDelayedLoop(); baitPart.Parent = nil
     pcall(function() if setfflag then setfflag('NextGenReplicatorEnabledWrite4', 'True') end end)
     stopViz()
-    task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
+    task.defer(function()
+        if Toggles.DesyncEnabled       then Toggles.DesyncEnabled:SetValue(false)       end
+        if Toggles.HitConfusionEnabled then Toggles.HitConfusionEnabled:SetValue(false) end
+        if Toggles.BaitEnabled         then Toggles.BaitEnabled:SetValue(false)         end
+    end)
     task.wait(1)
     connectTouchDetection()
     connectCharacterStateTracking(char)
+    -- Re-arm hit confusion if it was on
+    if State.hitConfusionArmed then startHitConfusion() end
 end)
 
 if LocalPlayer.Character then
@@ -539,99 +633,44 @@ if LocalPlayer.Character then
 end
 
 -- ================================================================
---  INIT DESYNC
--- ================================================================
-local function initDesync()
-    if not flagOk('NextGenReplicatorEnabledWrite4') then
-        Library:Notify('NextGenReplicatorEnabledWrite4 not compatible — run Compat Check first'); return
-    end
-    if desyncInitialized then Library:Notify('Already initialized — use the Enable toggle'); return end
-    if not getLocalHRP() then Library:Notify('No character — spawn in first'); return end
-    desyncInitialized = true
-    State.desyncHbConn = RunService.Heartbeat:Connect(function()
-        if not State.desyncActive then return end
-        if replicatorIsOwned() then return end
-        setReplicator(false)
-    end)
-    Library:Notify('Desync ready — use the Enable Desync toggle')
-end
-
--- ================================================================
 --  UI — MISC TAB
 -- ================================================================
-local CompatGrp     = Tabs.Misc:AddLeftGroupbox('FFlag Compatibility')
-local DesyncGrp     = Tabs.Misc:AddLeftGroupbox('Desync')
-local PassiveLagGrp = Tabs.Misc:AddLeftGroupbox('Passive Lag')
-local FlagFeatGrp   = Tabs.Misc:AddLeftGroupbox('FFlag Features')
-local SpinGrp       = Tabs.Misc:AddLeftGroupbox('SpinBot')
-local MiscGrp       = Tabs.Misc:AddRightGroupbox('Misc')
+local CompatGrp   = Tabs.Misc:AddLeftGroupbox('FFlag Compatibility')
+local DesyncGrp   = Tabs.Misc:AddLeftGroupbox('Desync')
+local CombatGrp   = Tabs.Misc:AddLeftGroupbox('Combat (NextGenReplicator)')
+local NetworkGrp  = Tabs.Misc:AddLeftGroupbox('Network')
+local MemoryGrp   = Tabs.Misc:AddLeftGroupbox('Memory (Potassium)')
+local SpinGrp     = Tabs.Misc:AddLeftGroupbox('SpinBot')
+local MiscGrp     = Tabs.Misc:AddRightGroupbox('Misc')
 
--- ── Compatibility Check ───────────────────────────────────────────
-CompatGrp:AddLabel('Run this before using any fflag features.')
+-- ── Compat ────────────────────────────────────────────────────────
+CompatGrp:AddLabel('Tests NextGenReplicatorEnabledWrite4\nand logs all executor capabilities.')
+CompatGrp:AddButton({ Text = 'Run Compatibility Check', Func = runCompatCheck })
 
-CompatGrp:AddButton({ Text = 'Run Compatibility Check', Func = function()
-    Library:Notify('Running fflag compatibility check...')
-
-    local results = runCompatCheck()
-
-    -- Count per feature
-    local featurePass = {}
-    local featureFail = {}
-    for _, r in ipairs(results) do
-        if r.compat then
-            featurePass[r.feature] = (featurePass[r.feature] or 0) + 1
-        else
-            featureFail[r.feature] = (featureFail[r.feature] or 0) + 1
-        end
-    end
-
-    -- Build summary string
-    local lines = {}
-    local seen  = {}
-    for _, r in ipairs(results) do
-        if not seen[r.feature] then
-            seen[r.feature] = true
-            local pass = featurePass[r.feature] or 0
-            local fail = featureFail[r.feature] or 0
-            local total = pass + fail
-            local status = (pass == total) and '✓' or (pass > 0) and '~' or '✗'
-            table.insert(lines, status .. ' ' .. r.feature .. ' (' .. pass .. '/' .. total .. ' flags)')
-        end
-    end
-
-    local summary = table.concat(lines, '\n')
-    Library:Notify('Compat results:\n' .. summary)
-
-    -- Also print per-flag detail to console for full info
-    for _, r in ipairs(results) do
-        local status = r.compat and '[OK]' or '[NO]'
-        print(status .. ' ' .. r.name .. ' | ' .. r.feature .. ' | ' .. r.reason)
-    end
-
-    -- Update label
-    local totalPass = 0
-    for _, r in ipairs(results) do if r.compat then totalPass = totalPass + 1 end end
-    Library:Notify(totalPass .. '/' .. #results .. ' fflags compatible with your executor — see console for details')
-end })
+-- ── Panic ─────────────────────────────────────────────────────────
+CompatGrp:AddLabel('Panic Key — instantly resets everything.')
+CompatGrp:AddLabel('Panic Key'):AddKeyPicker('PanicKey', {
+    Default = 'End', Text = 'Panic Key', Mode = 'Toggle',
+    Callback = function(v) if v then triggerPanic(); Options.PanicKey:SetValue(false) end end,
+})
 
 -- ── Desync ────────────────────────────────────────────────────────
 DesyncGrp:AddButton({ Text = 'Initialize Desync', Func = initDesync })
-DesyncGrp:AddLabel('Run compat check first. Initialize, then toggle.')
+DesyncGrp:AddLabel('Run compat check first.')
 
 DesyncGrp:AddDropdown('DesyncMode', {
-    Text    = 'Desync Mode',
-    Default = 'Instant',
-    Values  = { 'Instant', 'Delayed (Lag Mimic)' },
+    Text = 'Desync Mode', Default = 'Instant',
+    Values = { 'Instant', 'Delayed (Lag Mimic)' },
     Callback = function(v)
         State.desyncMode = (v == 'Instant') and 'instant' or 'delayed'
         if State.desyncActive then
             if State.desyncMode == 'instant' then
                 stopDelayedLoop(); lastFlagState = nil; setReplicator(false)
-                Library:Notify('Switched → Instant Desync')
+                Library:Notify('Switched → Instant')
             else
                 burstWindowOpen = false; lastFlagState = nil; startDelayedLoop()
                 local iv = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-                Library:Notify(('Switched → Lag Mimic (~%.0fs bursts)'):format(iv))
+                Library:Notify(('Switched → Lag Mimic (~%.0fs)'):format(iv))
             end
         end
     end,
@@ -646,7 +685,7 @@ DesyncGrp:AddToggle('DesyncEnabled', {
     Callback = function(v)
         if v then
             if not desyncInitialized then
-                Library:Notify('Press Initialize Desync first!')
+                Library:Notify('Initialize first!')
                 task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
             end
             resumeDesync()
@@ -664,110 +703,96 @@ DesyncGrp:AddToggle('DesyncVisualizer', {
 
 DesyncGrp:AddToggle('DesyncAutoOff', { Text = 'Auto-Off on Player Contact', Default = true })
 
--- ── Passive Lag ───────────────────────────────────────────────────
-PassiveLagGrp:AddToggle('PassiveLagEnabled', {
-    Text = 'Enable Passive Lag', Default = false,
+-- ── Combat ────────────────────────────────────────────────────────
+-- Hit Validation Confusion
+CombatGrp:AddToggle('HitConfusionEnabled', {
+    Text = 'Hit Validation Confusion', Default = false,
     Callback = function(v)
         if v then
-            if not flagOk('DFIntS2PhysicsSendRate') and not flagOk('DFIntDataSenderMaxBandwidthBps') then
-                Library:Notify('Passive Lag flags not compatible — run Compat Check')
-                task.defer(function() Toggles.PassiveLagEnabled:SetValue(false) end); return
+            if not State.replicatorCompatible then
+                Library:Notify('Run Compat Check first!')
+                task.defer(function() Toggles.HitConfusionEnabled:SetValue(false) end); return
             end
-            applyPassiveLag()
-            Library:Notify('Passive Lag ON')
+            State.hitConfusionArmed = true
+            startHitConfusion()
+            Library:Notify('Hit Confusion ARMED — activates when player within ' .. HIT_CONFUSION_RANGE .. ' studs')
         else
-            removePassiveLag()
-            Library:Notify('Passive Lag OFF — fflags restored')
+            stopHitConfusion()
+            Library:Notify('Hit Confusion OFF')
         end
     end,
 })
+CombatGrp:AddLabel('Freezes your server position when a player\nenters range. Their hits resolve against\nyour ghost position, not where you are.')
 
-PassiveLagGrp:AddSlider('PassiveLagSendRate', {
-    Text = 'Physics Send Rate (hz)', Default = 3, Min = 1, Max = 20, Rounding = 0,
-    Callback = function() refreshPassiveLag() end,
-})
-
-PassiveLagGrp:AddSlider('PassiveLagBandwidth', {
-    Text = 'Max Bandwidth (bytes/s)', Default = 8000, Min = 1000, Max = 50000, Rounding = 0,
-    Callback = function() refreshPassiveLag() end,
-})
-
-PassiveLagGrp:AddLabel('Stacks with Desync. Lower = more lag.')
-
--- ── FFlag Features ────────────────────────────────────────────────
--- Physics Tweaks
-FlagFeatGrp:AddToggle('PhysicsTweaksEnabled', {
-    Text = 'Physics Tweaks (Anti Rubber-Band)', Default = false,
+-- Bait Positioning
+CombatGrp:AddToggle('BaitEnabled', {
+    Text = 'Bait Mode (freeze + walk away)', Default = false,
     Callback = function(v)
         if v then
-            local anyOk = flagOk('DFIntMaxMissedWorldStepsRemembered')
-                       or flagOk('DFIntPhysicsSimPingAdaptive')
-                       or flagOk('DFIntPhysicsReceiveNumReplicators')
-            if not anyOk then
-                Library:Notify('Physics flags not compatible — run Compat Check')
-                task.defer(function() Toggles.PhysicsTweaksEnabled:SetValue(false) end); return
+            if not State.replicatorCompatible then
+                Library:Notify('Run Compat Check first!')
+                task.defer(function() Toggles.BaitEnabled:SetValue(false) end); return
             end
-            applyPhysicsTweaks()
+            stampBaitPosition()
         else
-            removePhysicsTweaks()
+            clearBait()
         end
     end,
 })
-FlagFeatGrp:AddLabel('Zeros missed-step catchup + disables ping\nadaptive correction. Pairs well with desync.')
+CombatGrp:AddButton({ Text = 'Re-Stamp Bait (move decoy here)', Func = function()
+    if State.baitActive then
+        clearBait()
+        task.wait(0.1)
+        stampBaitPosition()
+    else
+        Library:Notify('Enable Bait Mode first')
+    end
+end })
+CombatGrp:AddLabel('Stamps your position to server then lets\nyou walk away. Server sees you standing\nstill at the bait spot.')
 
--- Animation Throttle
-FlagFeatGrp:AddToggle('AnimThrottleEnabled', {
-    Text = 'Animation Throttle', Default = false,
+-- ── Network ───────────────────────────────────────────────────────
+NetworkGrp:AddToggle('RemoteSpyEnabled', {
+    Text = 'Remote Spy (log all FireServer)', Default = false,
     Callback = function(v)
-        if v then
-            if not flagOk('DFIntReplicatorAnimationTrackLodBps') then
-                Library:Notify('AnimTrackLodBps not compatible — run Compat Check')
-                task.defer(function() Toggles.AnimThrottleEnabled:SetValue(false) end); return
-            end
-            applyAnimThrottle()
-            Library:Notify('Animation throttle ON')
-        else
-            removeAnimThrottle()
-            Library:Notify('Animation throttle OFF')
-        end
+        if v then startRemoteSpy() else stopRemoteSpy() end
     end,
 })
+NetworkGrp:AddLabel('Logs every outgoing remote call\nto console with arguments.')
 
-FlagFeatGrp:AddSlider('AnimThrottleBps', {
-    Text = 'Anim Bandwidth (bytes/s)', Default = 100, Min = 10, Max = 2000, Rounding = 0,
-    Callback = function() refreshAnimThrottle() end,
+NetworkGrp:AddInput('BlockRemoteInput', {
+    Default = '', Text = 'Remote Name to Block', Placeholder = 'Exact remote name...',
 })
-FlagFeatGrp:AddLabel('Low = your animations barely replicate.\nYou appear to glide/stand still to others.')
+NetworkGrp:AddButton({ Text = 'Block Remote', Func = function()
+    local v = Options.BlockRemoteInput and Options.BlockRemoteInput.Value or ''
+    addBlockedRemote(v)
+end })
+NetworkGrp:AddButton({ Text = 'Unblock Remote', Func = function()
+    local v = Options.BlockRemoteInput and Options.BlockRemoteInput.Value or ''
+    removeBlockedRemote(v)
+end })
+NetworkGrp:AddLabel('Silently drops FireServer calls\nfor the named remote.')
 
--- Render Tweaks
-FlagFeatGrp:AddToggle('RenderTweaksEnabled', {
-    Text = 'Render Tweaks (FPS Boost)', Default = false,
-    Callback = function(v)
-        if v then
-            local anyOk = flagOk('FIntRenderShadowIntensity')
-                       or flagOk('DFIntDebugFRMMinQualityLevel')
-                       or flagOk('FFlagNewLightAttenuation')
-                       or flagOk('DFIntTextureCompositorActiveTexturesBudget')
-            if not anyOk then
-                Library:Notify('Render flags not compatible — run Compat Check')
-                task.defer(function() Toggles.RenderTweaksEnabled:SetValue(false) end); return
-            end
-            applyRenderTweaks()
-            Library:Notify('Render tweaks ON')
-        else
-            removeRenderTweaks()
-            Library:Notify('Render tweaks OFF — restored')
-        end
-    end,
-})
+-- ── Memory ────────────────────────────────────────────────────────
+MemoryGrp:AddLabel('Writes values directly to memory.\nBypasses property replication entirely.')
 
-FlagFeatGrp:AddSlider('RenderQualityLevel', {
-    Text = 'Min Render Quality (1=lowest)', Default = 1, Min = 1, Max = 21, Rounding = 0,
+MemoryGrp:AddSlider('MemWalkSpeed', {
+    Text = 'Memory WalkSpeed', Default = 16, Min = 1, Max = 500, Rounding = 0,
 })
-FlagFeatGrp:AddSlider('TextureBudget', {
-    Text = 'Texture Budget (lower=faster)', Default = 8, Min = 1, Max = 64, Rounding = 0,
+MemoryGrp:AddButton({ Text = 'Write WalkSpeed to Memory', Func = function()
+    local v = Options.MemWalkSpeed and Options.MemWalkSpeed.Value or 16
+    memWriteWalkSpeed(v)
+end })
+
+MemoryGrp:AddSlider('MemGravity', {
+    Text = 'Memory Gravity', Default = 196, Min = 0, Max = 1000, Rounding = 0,
 })
-FlagFeatGrp:AddLabel('Kills shadows, reverts lighting model,\ndrops texture budget. Big FPS gains.')
+MemoryGrp:AddButton({ Text = 'Write Gravity to Memory', Func = function()
+    local v = Options.MemGravity and Options.MemGravity.Value or 196
+    memWriteGravity(v)
+end })
+
+MemoryGrp:AddButton({ Text = 'Unlock Instance Properties', Func = unlockProperties })
+MemoryGrp:AddLabel('Unlocks locked instance properties\nvia rawmetatable hook.')
 
 -- ── SpinBot ───────────────────────────────────────────────────────
 SpinGrp:AddToggle('SpinBotEnabled',       { Text = 'Enable SpinBot', Default = false })
@@ -775,7 +800,7 @@ SpinGrp:AddLabel('Spin Key'):AddKeyPicker('SpinKey', { Default = 'None', Text = 
 SpinGrp:AddToggle('OnePressSpinningMode', { Text = 'One-Press Mode', Default = false })
 SpinGrp:AddSlider('SpinVelocity',         { Text = 'Spin Velocity',  Default = 50, Min = 1, Max = 50, Rounding = 1 })
 SpinGrp:AddDropdown('SpinPart', { Text = 'Spin Part', Default = 2, Values = State.spinPartValues })
-SpinGrp:AddInput('AddSpinPartInput',    { Default = '', Text = 'Add Spin Part',    Placeholder = 'Part name...' })
+SpinGrp:AddInput('AddSpinPartInput', { Default = '', Text = 'Add Spin Part', Placeholder = 'Part name...' })
 SpinGrp:AddButton({ Text = 'Add Spin Part', Func = function()
     local v = Options.AddSpinPartInput and Options.AddSpinPartInput.Value or ''
     if #v > 0 and not table.find(State.spinPartValues, v) then
