@@ -17,12 +17,25 @@ local function getLocalHRP()
 end
 
 -- ================================================================
---  DESYNC LOGIC
+--  DESYNC STATE
 -- ================================================================
-local desyncInitialized  = false
-State.desyncMode         = State.desyncMode or 'instant'  -- 'instant' | 'delayed'
-State.delayedWindowOpen  = false  -- true during the ~200ms replication window
+local desyncInitialized   = false
+State.desyncMode          = State.desyncMode or 'instant'
+State.delayedWindowOpen   = false   -- true while lag loop owns the fflag
+local lastFlagState       = nil     -- tracks actual fflag value to avoid redundant calls
 
+-- Only call setfflag when the value actually needs to change.
+-- Calling pcall every heartbeat (~60x/sec) is expensive.
+local function setReplicator(enabled)
+    local val = enabled and 'True' or 'False'
+    if lastFlagState == val then return end
+    lastFlagState = val
+    pcall(function() setfflag('NextGenReplicatorEnabledWrite4', val) end)
+end
+
+-- ================================================================
+--  PART HELPERS
+-- ================================================================
 local function makePart(col, label)
     local p = Instance.new('Part')
     p.Anchored = true; p.CanCollide = false; p.CastShadow = false
@@ -42,19 +55,19 @@ local serverPart, serverLbl = makePart(Color3.fromRGB(255, 50,  50), 'SERVER')
 local vizConn = nil
 
 -- ================================================================
---  SERVER ROOT PART TRACKING
+--  SERVER ROOT PART — FORCED REPLICATION SYNC
 --
---  Root cause of the bug:
---  State transitions like Seated / Ragdoll / GettingUp force Roblox
---  to push a real position packet to the server regardless of fflag.
---  So frozenServerPos falls out of sync with what the server sees.
+--  Problem: Seated / Ragdoll / GettingUp / Swimming / Climbing /
+--  FallingDown all bypass the fflag and force a position packet.
+--  When that happens frozenServerPos is stale and the server part
+--  looks frozen at the wrong spot.
 --
---  Fix:
---  Listen to StateChanged. When a forced-replication state fires,
---  wait 0.2s (enough time for the engine to move the HRP AND for
---  the replication packet to actually flush), then re-snapshot.
---  task.defer was too short (1 frame ~16ms) — physics + replication
---  needs more time to settle, especially for seat welds.
+--  Fix: On those states, immediately take ownership of the fflag
+--  (bypass delayedWindowOpen), open replication, wait exactly 5
+--  heartbeat frames so the engine physically moves the HRP and
+--  flushes the packet, THEN snapshot and re-lock.
+--  5 frames (~83ms at 60fps) is the sweet spot: enough for the
+--  seat weld + replication flush, not so long it's visible.
 -- ================================================================
 local charStateConn = nil
 
@@ -67,15 +80,29 @@ local FORCED_REPLICATION_STATES = {
     [Enum.HumanoidStateType.Swimming]    = true,
 }
 
-local function syncServerPos()
-    -- Wait long enough for the engine to finish moving the HRP
-    -- and for the replication packet to flush to the server.
-    task.delay(0.2, function()
-        if not State.desyncActive then return end
+local syncInProgress = false
+
+local function forceSyncServerPos()
+    if syncInProgress then return end
+    syncInProgress = true
+
+    task.spawn(function()
+        -- Take ownership of the fflag regardless of delayed loop state
+        local prevWindow = State.delayedWindowOpen
+        State.delayedWindowOpen = true   -- pause the heartbeat guard
+        lastFlagState = nil              -- force setReplicator to actually fire
+
+        setReplicator(true)
+
+        -- Wait exactly 5 physics frames — engine moves HRP, replication flushes
+        for _ = 1, 5 do RunService.Heartbeat:Wait() end
+
         local hrp = getLocalHRP()
-        if hrp then
-            State.frozenServerPos = hrp.Position
-        end
+        if hrp then State.frozenServerPos = hrp.Position end
+
+        setReplicator(false)
+        State.delayedWindowOpen = prevWindow
+        syncInProgress = false
     end)
 end
 
@@ -97,9 +124,7 @@ local function connectCharacterStateTracking(char)
     charStateConn = hum.StateChanged:Connect(function(_, newState)
         if not State.desyncActive then return end
         if FORCED_REPLICATION_STATES[newState] then
-            -- Roblox just force-pushed our position to the server.
-            -- Re-snapshot after physics settle so our marker stays accurate.
-            syncServerPos()
+            forceSyncServerPos()
         end
     end)
 end
@@ -137,28 +162,34 @@ local function stopViz()
 end
 
 -- ================================================================
---  DELAYED DESYNC — LAG MIMIC LOOP
+--  DELAYED DESYNC — BURST LAG LOOP
 --
---  Previous approach was broken because the heartbeat loop and the
---  timed window were fighting each other:
---    heartbeat fires every ~16ms → sets fflag False
---    window phase sets fflag True → heartbeat immediately overrides it
---    net result: window never actually stays open long enough
+--  Key insight from previous broken version:
+--  The heartbeat (~60x/sec) and the time-window were fighting over
+--  the same fflag. The heartbeat was setting it False before a
+--  single packet could get through.
 --
---  Correct approach:
---    1. Heartbeat does setfflag False ONLY when delayedWindowOpen == false.
---    2. A separate task.spawn loop owns the window timing:
---         - wait N seconds
---         - set delayedWindowOpen = true  (heartbeat backs off)
---         - set fflag True                (replication opens)
---         - wait 0.2s                     (server gets the packet)
---         - snapshot frozenServerPos      (visualizer updates)
---         - set fflag False               (lock it again)
---         - set delayedWindowOpen = false (heartbeat resumes guarding)
---         - repeat
+--  Architecture now:
+--    • Heartbeat ONLY touches the fflag when delayedWindowOpen=false
+--    • The lag loop sets delayedWindowOpen=true, does its burst,
+--      then releases. They never overlap.
 --
---  The heartbeat and the loop never conflict. The window stays open
---  for the full 0.2s every time, giving the server a clean snapshot.
+--  Burst pattern (mimics natural high-ping lag):
+--    ├─ wait N±jitter seconds (fflag=False the whole time)
+--    ├─ open fflag=True
+--    ├─ wait exactly 3 heartbeat frames  ← reliable engine flush
+--    ├─ snapshot frozenServerPos
+--    ├─ close fflag=False
+--    └─ repeat
+--
+--  Why Heartbeat:Wait() instead of task.wait(0.2)?
+--  task.wait is time-based and doesn't align with the physics step.
+--  3 heartbeat frames guarantees the engine has run 3 physics steps
+--  and the replicator has had exactly 3 chances to send a packet.
+--  This is consistent regardless of frame rate.
+--
+--  Jitter: real lag is never perfectly periodic. ±0.5s randomness
+--  makes the pattern feel genuine and harder to predict/exploit.
 -- ================================================================
 local delayedLoopActive = false
 
@@ -168,24 +199,26 @@ local function startDelayedLoop()
 
     task.spawn(function()
         while State.desyncActive and State.desyncMode == 'delayed' do
-            local interval = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-            task.wait(interval)
+            local base    = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
+            local jitter  = math.random(-500, 500) / 1000   -- ±0.5s
+            task.wait(math.max(0.1, base + jitter))
 
             if not State.desyncActive or State.desyncMode ~= 'delayed' then break end
 
-            -- Open window: tell heartbeat to back off, then enable replication
+            -- Take ownership — heartbeat will not touch fflag during this block
             State.delayedWindowOpen = true
-            pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'True') end)
+            lastFlagState = nil   -- force the call to actually fire
 
-            -- Let the engine send the position packet (~3-4 physics frames)
-            task.wait(0.2)
+            setReplicator(true)
+
+            -- Wait exactly 3 physics frames — guaranteed engine flush
+            for _ = 1, 3 do RunService.Heartbeat:Wait() end
 
             -- Snapshot what the server just received
             local hrp = getLocalHRP()
             if hrp then State.frozenServerPos = hrp.Position end
 
-            -- Close window: lock replication off, resume heartbeat guard
-            pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
+            setReplicator(false)
             State.delayedWindowOpen = false
         end
 
@@ -194,10 +227,9 @@ local function startDelayedLoop()
 end
 
 local function stopDelayedLoop()
-    -- Setting desyncMode away from 'delayed' or desyncActive = false
-    -- causes the loop's while-condition to exit naturally next iteration.
     State.delayedWindowOpen = false
     delayedLoopActive = false
+    -- Loop exits naturally on next iteration via while condition
 end
 
 -- ================================================================
@@ -208,7 +240,8 @@ local function pauseDesync()
     State.frozenServerPos   = nil
     State.delayedWindowOpen = false
     stopDelayedLoop()
-    pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'True') end)
+    lastFlagState = nil
+    setReplicator(true)
     Library:Notify('Desync OFF')
 end
 
@@ -221,12 +254,13 @@ local function resumeDesync()
     State.frozenServerPos   = hrp.Position
     State.desyncActive      = true
     State.delayedWindowOpen = false
-    pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
+    lastFlagState = nil
+    setReplicator(false)
 
     if State.desyncMode == 'delayed' then
         local iv = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
         startDelayedLoop()
-        Library:Notify(('Lag Desync ON — server updates every %.0fs'):format(iv))
+        Library:Notify(('Lag Desync ON — bursts every ~%.0fs'):format(iv))
     else
         Library:Notify('Instant Desync ON — server frozen at current position')
     end
@@ -265,6 +299,8 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     State.desyncActive      = false
     State.frozenServerPos   = nil
     State.delayedWindowOpen = false
+    syncInProgress          = false
+    lastFlagState           = nil
     stopDelayedLoop()
     pcall(function() if setfflag then setfflag('NextGenReplicatorEnabledWrite4', 'True') end end)
     stopViz()
@@ -281,37 +317,27 @@ end
 
 -- ================================================================
 --  INIT DESYNC
---
---  Sets up the master heartbeat that drives replication locking.
---
---  INSTANT MODE:
---    setfflag False every single heartbeat. Server permanently frozen.
---    (Unchanged from original.)
---
---  DELAYED MODE:
---    Heartbeat sets fflag False every frame UNLESS delayedWindowOpen
---    is true (meaning the lag-loop owns the fflag right now).
---    The actual timed window is handled by startDelayedLoop() above.
+--  Heartbeat guard: only keeps fflag locked while NOT in a window.
+--  State-change optimized: only calls setReplicator when value
+--  actually differs from lastFlagState (no wasted pcall spam).
 -- ================================================================
 local function initDesync()
     if not setfflag then Library:Notify('setfflag not available in this executor'); return end
-    if desyncInitialized   then Library:Notify('Already initialized — use the Enable toggle'); return end
-    if not getLocalHRP()   then Library:Notify('No character — spawn in first'); return end
+    if desyncInitialized then Library:Notify('Already initialized — use the Enable toggle'); return end
+    if not getLocalHRP() then Library:Notify('No character — spawn in first'); return end
     desyncInitialized = true
 
     State.desyncHbConn = RunService.Heartbeat:Connect(function()
         if not State.desyncActive then return end
 
         if State.desyncMode == 'instant' then
-            -- Original behaviour: lock every frame
-            pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
+            setReplicator(false)
 
         elseif State.desyncMode == 'delayed' then
-            -- Only lock when the lag-loop isn't mid-window
+            -- Only guard when the lag loop isn't mid-burst
             if not State.delayedWindowOpen then
-                pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
+                setReplicator(false)
             end
-            -- (When delayedWindowOpen == true the lag-loop owns the fflag)
         end
     end)
 
@@ -334,21 +360,19 @@ DesyncGrp:AddDropdown('DesyncMode', {
     Default = 'Instant',
     Values  = { 'Instant', 'Delayed (Lag Mimic)' },
     Callback = function(v)
-        local wasDelayed = State.desyncMode == 'delayed'
         State.desyncMode = (v == 'Instant') and 'instant' or 'delayed'
-
         if State.desyncActive then
             if State.desyncMode == 'instant' then
-                -- Kill the delayed loop, resume instant locking
                 stopDelayedLoop()
-                pcall(function() setfflag('NextGenReplicatorEnabledWrite4', 'False') end)
+                lastFlagState = nil
+                setReplicator(false)
                 Library:Notify('Switched → Instant Desync')
             else
-                -- Start the delayed loop from scratch
                 State.delayedWindowOpen = false
+                lastFlagState = nil
                 startDelayedLoop()
                 local iv = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-                Library:Notify(('Switched → Lag Mimic (%.0fs interval)'):format(iv))
+                Library:Notify(('Switched → Lag Mimic (~%.0fs bursts)'):format(iv))
             end
         end
     end,
@@ -360,8 +384,8 @@ DesyncGrp:AddSlider('DelayedDesyncInterval', {
     Min      = 1,
     Max      = 30,
     Rounding = 0,
-    -- The delayed loop reads this live on each task.wait() call.
-    -- Changing the slider takes effect on the very next cycle.
+    -- Loop reads this live on every cycle. Changing the slider
+    -- takes effect on the very next burst without restarting.
 })
 
 DesyncGrp:AddToggle('DesyncEnabled', {
