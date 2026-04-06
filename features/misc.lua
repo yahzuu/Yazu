@@ -1,7 +1,8 @@
 -- ================================================================
 --  features/misc.lua
---  Contains: Desync (Instant + Delayed lag-mimic), SpinBot UI,
---            Movement (noclip/walkspeed/jump), random part timers.
+--  Contains: Desync (Instant + Delayed lag-mimic), Passive Lag,
+--            SpinBot UI, Movement (noclip/walkspeed/jump),
+--            and random part timers.
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
@@ -22,16 +23,10 @@ end
 local desyncInitialized = false
 State.desyncMode        = State.desyncMode or 'instant'
 
--- Two SEPARATE ownership flags — this was the conflict root cause.
--- The heartbeat backs off when EITHER is true.
---   burstWindowOpen  → delayed loop owns the fflag right now
---   forceSyncActive  → a state-change sync (seat/ragdoll) owns it
--- Previously both shared one flag so they would race and corrupt
--- each other's timing.
 local burstWindowOpen = false
 local forceSyncActive = false
 
-local lastFlagState   = nil   -- avoids redundant setfflag pcalls
+local lastFlagState   = nil
 
 local function setReplicator(enabled)
     local val = enabled and 'True' or 'False'
@@ -40,10 +35,55 @@ local function setReplicator(enabled)
     pcall(function() setfflag('NextGenReplicatorEnabledWrite4', val) end)
 end
 
--- Heartbeat should back off when either system owns the fflag
 local function replicatorIsOwned()
     return burstWindowOpen or forceSyncActive
 end
+
+-- ================================================================
+--  PASSIVE LAG — stored originals for restore on disable
+-- ================================================================
+local originalSendRate  = nil
+local originalBandwidth = nil
+
+-- Sensible defaults Roblox ships with
+local DEFAULT_SEND_RATE  = '20'
+local DEFAULT_BANDWIDTH  = '50000'
+
+local function applyPassiveLag()
+    -- Snapshot originals only once so we can restore cleanly
+    if not originalSendRate then
+        originalSendRate  = pcall(function() return getfflag('DFIntS2PhysicsSendRate')       end) and getfflag('DFIntS2PhysicsSendRate')       or DEFAULT_SEND_RATE
+        originalBandwidth = pcall(function() return getfflag('DFIntDataSenderMaxBandwidthBps') end) and getfflag('DFIntDataSenderMaxBandwidthBps') or DEFAULT_BANDWIDTH
+    end
+
+    local rate = Options.PassiveLagSendRate     and Options.PassiveLagSendRate.Value     or 3
+    local bw   = Options.PassiveLagBandwidth    and Options.PassiveLagBandwidth.Value    or 8000
+
+    pcall(function() setfflag('DFIntS2PhysicsSendRate',          tostring(rate)) end)
+    pcall(function() setfflag('DFIntDataSenderMaxBandwidthBps',  tostring(bw))   end)
+end
+
+local function removePassiveLag()
+    pcall(function() setfflag('DFIntS2PhysicsSendRate',          originalSendRate  or DEFAULT_SEND_RATE)  end)
+    pcall(function() setfflag('DFIntDataSenderMaxBandwidthBps',  originalBandwidth or DEFAULT_BANDWIDTH) end)
+    originalSendRate  = nil
+    originalBandwidth = nil
+end
+
+-- Reapply live whenever sliders change while active
+local function refreshPassiveLag()
+    if Toggles.PassiveLagEnabled and Toggles.PassiveLagEnabled.Value then
+        applyPassiveLag()
+    end
+end
+
+-- Clean up on respawn
+LocalPlayer.CharacterAdded:Connect(function()
+    if Toggles.PassiveLagEnabled and Toggles.PassiveLagEnabled.Value then
+        task.wait(1)
+        applyPassiveLag()   -- re-apply after respawn since fflags may reset
+    end
+end)
 
 -- ================================================================
 --  PART HELPERS
@@ -68,16 +108,9 @@ local vizConn = nil
 
 -- ================================================================
 --  SERVER ROOT PART — FORCED STATE SYNC
---
---  Certain humanoid states (Seated, Ragdoll, etc.) bypass the
---  fflag and force Roblox to push a real position packet.
---  We catch those, open replication intentionally, wait 5 frames
---  for the engine + weld to settle, snapshot what the server sees,
---  then lock again. Uses its own flag (forceSyncActive) completely
---  separate from the delayed burst system.
 -- ================================================================
-local charStateConn  = nil
-local syncQueued     = false   -- prevent stacking multiple syncs
+local charStateConn = nil
+local syncQueued    = false
 
 local FORCED_REPLICATION_STATES = {
     [Enum.HumanoidStateType.Seated]      = true,
@@ -93,7 +126,6 @@ local function forceSyncServerPos()
     syncQueued = true
 
     task.spawn(function()
-        -- If the burst loop is mid-window, wait for it to finish first
         while burstWindowOpen do RunService.Heartbeat:Wait() end
 
         forceSyncActive = true
@@ -168,15 +200,6 @@ end
 
 -- ================================================================
 --  DELAYED DESYNC — BURST LAG LOOP
---
---  Uses burstWindowOpen (not shared with forceSyncServerPos).
---  Pattern every N±jitter seconds:
---    1. Raise burstWindowOpen  → heartbeat backs off
---    2. Open replicator
---    3. Wait exactly 3 heartbeat frames  (physics-aligned flush)
---    4. Snapshot frozenServerPos
---    5. Close replicator
---    6. Lower burstWindowOpen  → heartbeat resumes guard
 -- ================================================================
 local delayedLoopActive = false
 
@@ -192,7 +215,6 @@ local function startDelayedLoop()
 
             if not State.desyncActive or State.desyncMode ~= 'delayed' then break end
 
-            -- Wait for any active force-sync to finish before our burst
             while forceSyncActive do RunService.Heartbeat:Wait() end
 
             burstWindowOpen = true
@@ -213,8 +235,8 @@ local function startDelayedLoop()
 end
 
 local function stopDelayedLoop()
-    burstWindowOpen     = false
-    delayedLoopActive   = false
+    burstWindowOpen   = false
+    delayedLoopActive = false
 end
 
 -- ================================================================
@@ -316,13 +338,8 @@ local function initDesync()
 
     State.desyncHbConn = RunService.Heartbeat:Connect(function()
         if not State.desyncActive then return end
-        if replicatorIsOwned() then return end  -- burst or forceSync owns it
-
-        if State.desyncMode == 'instant' then
-            setReplicator(false)
-        elseif State.desyncMode == 'delayed' then
-            setReplicator(false)
-        end
+        if replicatorIsOwned() then return end
+        setReplicator(false)
     end)
 
     Library:Notify('Desync ready — use the Enable Desync toggle')
@@ -331,10 +348,12 @@ end
 -- ================================================================
 --  UI — MISC TAB
 -- ================================================================
-local DesyncGrp = Tabs.Misc:AddLeftGroupbox('Desync')
-local SpinGrp   = Tabs.Misc:AddLeftGroupbox('SpinBot')
-local MiscGrp   = Tabs.Misc:AddRightGroupbox('Misc')
+local DesyncGrp    = Tabs.Misc:AddLeftGroupbox('Desync')
+local PassiveLagGrp = Tabs.Misc:AddLeftGroupbox('Passive Lag')
+local SpinGrp      = Tabs.Misc:AddLeftGroupbox('SpinBot')
+local MiscGrp      = Tabs.Misc:AddRightGroupbox('Misc')
 
+-- ── Desync ────────────────────────────────────────────────────────
 DesyncGrp:AddButton({ Text = 'Initialize Desync', Func = initDesync })
 DesyncGrp:AddLabel('Initialize first, then toggle.')
 
@@ -362,11 +381,7 @@ DesyncGrp:AddDropdown('DesyncMode', {
 })
 
 DesyncGrp:AddSlider('DelayedDesyncInterval', {
-    Text     = 'Lag Interval (seconds)',
-    Default  = 5,
-    Min      = 1,
-    Max      = 30,
-    Rounding = 0,
+    Text = 'Lag Interval (seconds)', Default = 5, Min = 1, Max = 30, Rounding = 0,
 })
 
 DesyncGrp:AddToggle('DesyncEnabled', {
@@ -391,6 +406,57 @@ DesyncGrp:AddToggle('DesyncVisualizer', {
 })
 
 DesyncGrp:AddToggle('DesyncAutoOff', { Text = 'Auto-Off on Player Contact', Default = true })
+
+-- ── Passive Lag ───────────────────────────────────────────────────
+-- Passive Lag works completely differently to desync.
+-- Instead of cutting replication entirely, it throttles HOW OFTEN
+-- and HOW MUCH data your client sends to the server.
+-- Result: your character still updates server-side, just slowly —
+-- identical to genuine high-ping lag. No hard cuts, no rubber band.
+--
+-- SendRate  — physics updates per second sent to server (default ~20)
+--             Set low (2-4) = server sees you move in slow choppy steps
+--             Set high (20) = normal, undo passive lag
+--
+-- Bandwidth — max bytes/sec your client sends to the server (default ~50000)
+--             Set low (6000-10000) = all replication slows down (pos,
+--             animations, tool state) not just physics
+--             Combine both low for the most convincing passive lag look
+--
+-- Can stack with Desync: Passive Lag runs all the time passively,
+-- Desync can still be toggled on top of it for full position freeze.
+PassiveLagGrp:AddToggle('PassiveLagEnabled', {
+    Text = 'Enable Passive Lag', Default = false,
+    Callback = function(v)
+        if v then
+            applyPassiveLag()
+            Library:Notify('Passive Lag ON')
+        else
+            removePassiveLag()
+            Library:Notify('Passive Lag OFF — fflags restored')
+        end
+    end,
+})
+
+PassiveLagGrp:AddSlider('PassiveLagSendRate', {
+    Text     = 'Physics Send Rate (hz)',
+    Default  = 3,
+    Min      = 1,
+    Max      = 20,
+    Rounding = 0,
+    Callback = function() refreshPassiveLag() end,
+})
+
+PassiveLagGrp:AddSlider('PassiveLagBandwidth', {
+    Text     = 'Max Bandwidth (bytes/s)',
+    Default  = 8000,
+    Min      = 1000,
+    Max      = 50000,
+    Rounding = 0,
+    Callback = function() refreshPassiveLag() end,
+})
+
+PassiveLagGrp:AddLabel('Stacks with Desync. Lower = more lag.')
 
 -- ── SpinBot ───────────────────────────────────────────────────────
 SpinGrp:AddToggle('SpinBotEnabled',       { Text = 'Enable SpinBot', Default = false })
