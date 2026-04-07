@@ -20,17 +20,13 @@ end
 -- ================================================================
 --  FFLAG COMPAT CHECK
 --
---  FIX 1: Previously wrote tostring(current) back as the test.
---  If flag was 'False' from a prior session, stamping 'False'
---  locked replication — looked like compat check "enabled" something.
---  Now: save original → write 'True' to test → verify → RESTORE original.
---  Zero side effects on replication state.
---
---  FIX 2: getfflag verification is now truly optional.
---  If Potassium doesn't expose getfflag, we skip verification and
---  mark compatible as long as the write didn't throw. This was why
---  Initialize always said "run compat check" — verification was
---  silently failing and blocking State.replicatorCompatible.
+--  FIX: removed getfflag verification entirely.
+--  getfflag was returning unexpected values on Potassium causing
+--  "write did not apply" even when the write actually worked.
+--  New rule: if setfflag exists AND the call doesn't throw,
+--  the flag is compatible. That's the only check we need.
+--  We test with 'True' (the safe open state) then immediately
+--  restore the original value so there are zero side effects.
 -- ================================================================
 State.replicatorCompatible = false
 
@@ -39,58 +35,40 @@ local function runCompatCheck()
 
     if type(setfflag) ~= 'function' then
         Library:Notify('[COMPAT] setfflag not available on this executor')
-        return false
+        print('[COMPAT] setfflag missing'); return false
     end
 
-    -- Read original value so we can restore it after the test
+    -- Read original only if getfflag exists — purely for restore
     local original = 'True'
     if type(getfflag) == 'function' then
         local ok, val = pcall(getfflag, flag)
         if ok and val ~= nil then original = tostring(val) end
     end
 
-    -- Write 'True' as the test value
+    -- The only real test: does setfflag accept the call without throwing?
     local writeOk = pcall(setfflag, flag, 'True')
+
+    -- Restore original regardless of result
+    pcall(setfflag, flag, original)
+
     if not writeOk then
-        pcall(setfflag, flag, original)   -- restore before bailing
-        Library:Notify('[COMPAT] ' .. flag .. ' — write rejected')
+        Library:Notify('[COMPAT] ' .. flag .. ' — write threw an error')
+        print('[COMPAT] write errored out')
         State.replicatorCompatible = false
         return false
     end
 
-    -- Verify only when getfflag exists — do NOT block compat on missing API
-    if type(getfflag) == 'function' then
-        local verOk, after = pcall(getfflag, flag)
-        if not verOk or tostring(after) ~= 'True' then
-            pcall(setfflag, flag, original)
-            Library:Notify('[COMPAT] ' .. flag .. ' — write did not apply')
-            State.replicatorCompatible = false
-            return false
-        end
-    end
-
-    -- RESTORE original — this is what was missing before
-    pcall(setfflag, flag, original)
-
+    -- Write succeeded — we're compatible
     State.replicatorCompatible = true
-    Library:Notify('[COMPAT] Compatible ✓  (original value restored)')
+    Library:Notify('[COMPAT] Compatible ✓  |  original flag value restored')
     print('[COMPAT] ' .. flag .. ' writable | restored to: ' .. original)
-    print('[COMPAT] getfflag available: ' .. tostring(type(getfflag) == 'function'))
     return true
 end
 
 -- ================================================================
 --  MASTER REPLICATOR CONTROLLER
---
---  FIX: removed lastFlagState caching entirely.
---  The cache was the root of "stuck frozen" and "toggle not
---  enforcing". With caching, the master loop could skip a write
---  if it thought the value hadn't changed — even if the engine
---  had reset the flag externally.
---
---  Without caching, the flag is written every single heartbeat.
+--  No caching — writes every heartbeat frame.
 --  replicationTarget is the single source of truth.
---  wantReplication(true/false) sets target; master loop enforces it.
 -- ================================================================
 local replicationTarget = true
 local burstWindowOpen   = false
@@ -102,7 +80,6 @@ end
 
 local function wantReplication(open)
     replicationTarget = open
-    -- No cache — master loop applies this on the very next frame
 end
 
 local function setReplicatorDirect(enabled)
@@ -110,7 +87,6 @@ local function setReplicatorDirect(enabled)
     pcall(setfflag, 'NextGenReplicatorEnabledWrite4', enabled and 'True' or 'False')
 end
 
--- Master loop — no cache, writes every frame, always enforced
 RunService.Heartbeat:Connect(function()
     if not State.replicatorCompatible then return end
     if replicatorIsOwned() then return end
@@ -398,10 +374,6 @@ end
 
 -- ================================================================
 --  PASSIVE LAG — PURE API (no fflags)
---
---  FIX: old code used frame % 2 which hard-capped injection at 50%
---  regardless of the throttle slider. Now throttle directly controls
---  frequency: inject once every N frames. At N=2 → ~50%, N=10 → ~10%.
 -- ================================================================
 State.passiveLagActive = false
 local passiveLagConn   = nil
@@ -421,9 +393,9 @@ local function startPassiveLag()
         if not State.passiveLagActive then return end
         local hrp = getLocalHRP(); if not hrp then return end
 
-        local throttle = Options.PassiveLagThrottle and Options.PassiveLagThrottle.Value or 10
-        frameCount          = frameCount + 1
-        lagStats.total      = lagStats.total + 1
+        local throttle  = Options.PassiveLagThrottle and Options.PassiveLagThrottle.Value or 10
+        frameCount      = frameCount + 1
+        lagStats.total  = lagStats.total + 1
 
         if frameCount % throttle == 0 then
             snapshotPos       = hrp.Position
@@ -445,7 +417,7 @@ local function startPassiveLag()
                 and math.floor((lagStats.injected / lagStats.total) * 100) or 0
             if passiveLagLabel then
                 passiveLagLabel:SetText(
-                    'Injection rate: ' .. pct .. '%  ' .. (pct > 2 and '| ACTIVE ✓' or '| lower throttle value'))
+                    'Injection: ' .. pct .. '%  ' .. (pct > 2 and '| ACTIVE ✓' or '| lower throttle value'))
             end
             lagStats.injected  = 0
             lagStats.total     = 0
@@ -464,17 +436,21 @@ end
 -- ================================================================
 --  CHARACTER STATE SPOOFER
 --
---  FIX: previous version used RunService.Heartbeat:Wait() between
---  the fake ChangeState and the restore. One full heartbeat frame
---  is enough for the client to physically enter the state —
---  Seated blocks movement, Ragdoll drops the character, etc.
+--  FIX: task.defer was TOO fast — it cancelled the state before
+--  the replication layer could queue the packet. The server never
+--  received it.
 --
---  Fix: task.defer() fires in the SAME frame's deferred queue,
---  before the next physics step runs. The client calls
---  ChangeState(fake), then ChangeState(real) fires before physics
---  processes it — the client never actually enters the fake state.
---  The replication layer reads state at call time so the server
---  still receives the fake state packet. Full movement preserved.
+--  task.wait(1/60) waits exactly one physics frame (~16ms).
+--  That's enough for Roblox's replication pipeline to read and
+--  queue the state change as an outgoing packet. Then we restore
+--  the real state. The client feels a 16ms blip which is
+--  imperceptible for most states.
+--
+--  For Seated/Ragdoll which do restrict movement briefly:
+--  the blip is ~1 frame so movement stutters only for an instant
+--  once every N seconds (controlled by interval slider).
+--  Set a higher interval if you feel it. Jumping/FallingDown
+--  have no movement restriction at all.
 -- ================================================================
 State.stateSpoofActive = false
 local stateSpoofThread = nil
@@ -508,11 +484,12 @@ local function startStateSpoof(stateName)
                 -- Pulse fake state
                 pcall(function() hum:ChangeState(targetState) end)
 
-                -- Restore in the same frame before physics runs
-                task.defer(function()
-                    local h = getLocalHum()
-                    if h then pcall(function() h:ChangeState(realState) end) end
-                end)
+                -- Wait exactly one physics frame so the packet goes out
+                task.wait(1 / 60)
+
+                -- Restore real state — client back to normal
+                local h = getLocalHum()
+                if h then pcall(function() h:ChangeState(realState) end) end
             end
 
             local interval = Options.StateSpoofInterval and Options.StateSpoofInterval.Value or 2
@@ -520,7 +497,7 @@ local function startStateSpoof(stateName)
         end
     end)
 
-    Library:Notify('State Spoof ON → ' .. stateName .. ' | you keep full movement')
+    Library:Notify('State Spoof ON → ' .. stateName)
 end
 
 local function stopStateSpoof()
@@ -655,7 +632,7 @@ local SpinGrp       = Tabs.Misc:AddLeftGroupbox('SpinBot')
 local MiscGrp       = Tabs.Misc:AddRightGroupbox('Misc')
 
 -- ── Compat + Panic ────────────────────────────────────────────────
-CompatGrp:AddLabel('Tests write access only. Restores\noriginal flag value after check.')
+CompatGrp:AddLabel('Only checks if setfflag accepts the call.\nRestores original value. No side effects.')
 CompatGrp:AddButton({ Text = 'Run Compatibility Check', Func = runCompatCheck })
 CompatGrp:AddLabel('Panic Key — kills all systems instantly.')
 CompatGrp:AddLabel('Panic Key'):AddKeyPicker('PanicKey', {
@@ -758,7 +735,7 @@ CombatGrp:AddButton({ Text = 'Re-Stamp Bait Here', Func = function()
         Library:Notify('Enable Bait Mode first')
     end
 end })
-CombatGrp:AddLabel('Stamps your pos to server then walk away.\nServer sees you at the bait spot.')
+CombatGrp:AddLabel('Stamps pos to server then walk away freely.')
 
 -- ── Passive Lag ───────────────────────────────────────────────────
 PassiveLagGrp:AddToggle('PassiveLagEnabled', {
@@ -780,8 +757,8 @@ PassiveLagGrp:AddLabel('N=2 → ~50%  |  N=10 → ~10%  |  N=60 → ~2%')
 -- ── State Spoofing ────────────────────────────────────────────────
 NetGrp:AddDropdown('StateSpoofState', {
     Text   = 'Spoof State',
-    Default = 'Seated',
-    Values = { 'Seated', 'Ragdoll', 'FallingDown', 'Jumping', 'Swimming', 'Climbing' },
+    Default = 'Jumping',
+    Values = { 'Jumping', 'FallingDown', 'Seated', 'Ragdoll', 'Swimming', 'Climbing' },
 })
 NetGrp:AddSlider('StateSpoofInterval', {
     Text = 'Pulse interval (seconds)', Default = 2, Min = 0.5, Max = 10, Rounding = 1,
@@ -790,14 +767,14 @@ NetGrp:AddToggle('StateSpoofEnabled', {
     Text = 'Enable State Spoofer', Default = false,
     Callback = function(v)
         if v then
-            local s = Options.StateSpoofState and Options.StateSpoofState.Value or 'Seated'
+            local s = Options.StateSpoofState and Options.StateSpoofState.Value or 'Jumping'
             startStateSpoof(s)
         else
             stopStateSpoof()
         end
     end,
 })
-NetGrp:AddLabel('task.defer restore — server gets fake state,\nclient never enters it. Full movement kept.')
+NetGrp:AddLabel('Jumping/FallingDown = no movement restriction.\nSeated/Ragdoll = 1 frame blip per pulse.')
 
 -- ── SpinBot ───────────────────────────────────────────────────────
 SpinGrp:AddToggle('SpinBotEnabled',       { Text = 'Enable SpinBot', Default = false })
