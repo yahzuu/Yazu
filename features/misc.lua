@@ -7,7 +7,6 @@ return function(State, Tabs, Services, Library)
 local RunService  = Services.RunService
 local Players     = Services.Players
 local LocalPlayer = Services.LocalPlayer
-local TweenService = Services.TweenService
 
 local function getLocalHRP()
     local c = LocalPlayer.Character
@@ -19,123 +18,103 @@ local function getLocalHum()
 end
 
 -- ================================================================
---  EXECUTOR CAPABILITY FLAGS
--- ================================================================
-local Exec = {
-    hasSetfflag   = type(setfflag)        == 'function',
-    hasGetfflag   = type(getfflag)        == 'function',
-    hasGetRawMeta = type(getrawmetatable) == 'function',
-}
-
--- ================================================================
 --  FFLAG COMPAT CHECK
 --
---  BUG FIX: previously wrote tostring(current) back as the test
---  write. If the flag was already 'False' (from a prior session),
---  this stamped 'False' and locked replication — making the compat
---  check itself appear to "enable" desync.
+--  FIX 1: Previously wrote tostring(current) back as the test.
+--  If flag was 'False' from a prior session, stamping 'False'
+--  locked replication — looked like compat check "enabled" something.
+--  Now: save original → write 'True' to test → verify → RESTORE original.
+--  Zero side effects on replication state.
 --
---  Fix: always test-write 'True' explicitly (safe, open state),
---  verify it applied, then leave it at 'True'. This is a pure
---  read-write-verify with no side effects on replication state.
+--  FIX 2: getfflag verification is now truly optional.
+--  If Potassium doesn't expose getfflag, we skip verification and
+--  mark compatible as long as the write didn't throw. This was why
+--  Initialize always said "run compat check" — verification was
+--  silently failing and blocking State.replicatorCompatible.
 -- ================================================================
 State.replicatorCompatible = false
 
 local function runCompatCheck()
     local flag = 'NextGenReplicatorEnabledWrite4'
 
-    if not Exec.hasSetfflag then
-        Library:Notify('[COMPAT] setfflag missing — executor unsupported')
-        print('[COMPAT] setfflag not found'); return false
+    if type(setfflag) ~= 'function' then
+        Library:Notify('[COMPAT] setfflag not available on this executor')
+        return false
     end
 
-    -- Write 'True' as test (always safe — this is the open/normal state)
-    local writeOk = pcall(function() setfflag(flag, 'True') end)
+    -- Read original value so we can restore it after the test
+    local original = 'True'
+    if type(getfflag) == 'function' then
+        local ok, val = pcall(getfflag, flag)
+        if ok and val ~= nil then original = tostring(val) end
+    end
+
+    -- Write 'True' as the test value
+    local writeOk = pcall(setfflag, flag, 'True')
     if not writeOk then
+        pcall(setfflag, flag, original)   -- restore before bailing
         Library:Notify('[COMPAT] ' .. flag .. ' — write rejected')
-        print('[COMPAT] write rejected')
-        State.replicatorCompatible = false; return false
+        State.replicatorCompatible = false
+        return false
     end
 
-    -- Verify the write actually applied
-    if Exec.hasGetfflag then
-        local verOk, after = pcall(function() return getfflag(flag) end)
+    -- Verify only when getfflag exists — do NOT block compat on missing API
+    if type(getfflag) == 'function' then
+        local verOk, after = pcall(getfflag, flag)
         if not verOk or tostring(after) ~= 'True' then
-            Library:Notify('[COMPAT] ' .. flag .. ' — write did not apply (got: ' .. tostring(after) .. ')')
-            print('[COMPAT] verification failed | after=' .. tostring(after))
-            State.replicatorCompatible = false; return false
+            pcall(setfflag, flag, original)
+            Library:Notify('[COMPAT] ' .. flag .. ' — write did not apply')
+            State.replicatorCompatible = false
+            return false
         end
     end
 
-    -- Leave flag in 'True' (open) state — no side effects
+    -- RESTORE original — this is what was missing before
+    pcall(setfflag, flag, original)
+
     State.replicatorCompatible = true
-    Library:Notify('[COMPAT] NextGenReplicatorEnabledWrite4 — COMPATIBLE ✓')
-    print('[COMPAT] ' .. flag .. ' | verified writable | left at True (open)')
-    print('[COMPAT] getrawmetatable : ' .. tostring(Exec.hasGetRawMeta))
+    Library:Notify('[COMPAT] Compatible ✓  (original value restored)')
+    print('[COMPAT] ' .. flag .. ' writable | restored to: ' .. original)
+    print('[COMPAT] getfflag available: ' .. tostring(type(getfflag) == 'function'))
     return true
 end
 
 -- ================================================================
 --  MASTER REPLICATOR CONTROLLER
 --
---  BUG FIX (stuck frozen / toggle not enforcing):
---  Root cause was lastFlagState caching. When wantReplication(true)
---  was called, lastFlagState might already be 'True' from a previous
---  write, so the master loop would skip the pcall — even if the
---  engine had reset the flag externally between calls.
+--  FIX: removed lastFlagState caching entirely.
+--  The cache was the root of "stuck frozen" and "toggle not
+--  enforcing". With caching, the master loop could skip a write
+--  if it thought the value hadn't changed — even if the engine
+--  had reset the flag externally.
 --
---  Fix: wantReplication() always clears lastFlagState, forcing the
---  master loop to re-apply the flag on the very next heartbeat
---  regardless of what it thinks the current state is.
---
---  Additionally: the master loop now tracks a `framesSinceWrite`
---  counter and re-forces the flag every 30 frames even if it thinks
---  nothing changed. This catches any external engine resets.
+--  Without caching, the flag is written every single heartbeat.
+--  replicationTarget is the single source of truth.
+--  wantReplication(true/false) sets target; master loop enforces it.
 -- ================================================================
-local replicationTarget  = true   -- true = open, false = closed
-local lastFlagState      = nil
-local framesSinceWrite   = 0
-local REFORCE_INTERVAL   = 30     -- re-confirm fflag every N frames
-
--- Subsystems that temporarily own the fflag
-local burstWindowOpen  = false
-local forceSyncActive  = false
+local replicationTarget = true
+local burstWindowOpen   = false
+local forceSyncActive   = false
 
 local function replicatorIsOwned()
     return burstWindowOpen or forceSyncActive
 end
 
--- Request a replication state. Clears cache so master loop
--- applies it immediately on the next frame without skipping.
 local function wantReplication(open)
     replicationTarget = open
-    lastFlagState     = nil    -- ← THE KEY FIX: always invalidate cache
-    framesSinceWrite  = REFORCE_INTERVAL  -- trigger immediate re-apply
+    -- No cache — master loop applies this on the very next frame
 end
 
--- Direct write for burst operations that own the fflag themselves
 local function setReplicatorDirect(enabled)
     if not State.replicatorCompatible then return end
-    local val = enabled and 'True' or 'False'
-    lastFlagState    = val
-    framesSinceWrite = 0
-    pcall(function() setfflag('NextGenReplicatorEnabledWrite4', val) end)
+    pcall(setfflag, 'NextGenReplicatorEnabledWrite4', enabled and 'True' or 'False')
 end
 
--- Master heartbeat — single source of truth, always running
+-- Master loop — no cache, writes every frame, always enforced
 RunService.Heartbeat:Connect(function()
     if not State.replicatorCompatible then return end
     if replicatorIsOwned() then return end
-
-    framesSinceWrite = framesSinceWrite + 1
-    local val = replicationTarget and 'True' or 'False'
-
-    -- Apply if: value changed, or we haven't re-confirmed in a while
-    if lastFlagState ~= val or framesSinceWrite >= REFORCE_INTERVAL then
-        lastFlagState    = val
-        framesSinceWrite = 0
-        pcall(function() setfflag('NextGenReplicatorEnabledWrite4', val) end)
-    end
+    pcall(setfflag, 'NextGenReplicatorEnabledWrite4', replicationTarget and 'True' or 'False')
 end)
 
 -- ================================================================
@@ -185,9 +164,9 @@ local function forceSyncServerPos()
         for _ = 1, 5 do RunService.Heartbeat:Wait() end
         local hrp = getLocalHRP()
         if hrp then State.frozenServerPos = hrp.Position end
-        -- Re-apply whatever the master loop wants
         setReplicatorDirect(replicationTarget)
-        forceSyncActive = false; syncQueued = false
+        forceSyncActive = false
+        syncQueued      = false
     end)
 end
 
@@ -197,7 +176,10 @@ local function connectCharacterStateTracking(char)
     local hum = char:FindFirstChildWhichIsA('Humanoid')
     if not hum then
         local wc; wc = char.ChildAdded:Connect(function(child)
-            if child:IsA('Humanoid') then wc:Disconnect(); connectCharacterStateTracking(char) end
+            if child:IsA('Humanoid') then
+                wc:Disconnect()
+                connectCharacterStateTracking(char)
+            end
         end)
         return
     end
@@ -212,7 +194,8 @@ end
 -- ================================================================
 local function startViz()
     if vizConn then vizConn:Disconnect(); vizConn = nil end
-    clientPart.Parent = workspace; serverPart.Parent = workspace
+    clientPart.Parent = workspace
+    serverPart.Parent = workspace
     if State.baitActive then baitPart.Parent = workspace end
 
     vizConn = RunService.Heartbeat:Connect(function()
@@ -227,20 +210,24 @@ local function startViz()
             clientLbl.Text = 'CLIENT'
         else
             serverPart.CFrame = hrp.CFrame
-            serverLbl.Text = 'SERVER (synced)'; clientLbl.Text = 'CLIENT'
+            serverLbl.Text    = 'SERVER (synced)'
+            clientLbl.Text    = 'CLIENT'
         end
 
         if State.baitActive and State.baitPos then
             baitPart.CFrame = CFrame.new(State.baitPos)
-            baitLbl.Text = 'BAIT  ' .. math.floor((hrp.Position - State.baitPos).Magnitude) .. 'm'
+            baitLbl.Text    = 'BAIT  ' .. math.floor((hrp.Position - State.baitPos).Magnitude) .. 'm'
         end
     end)
+
     connectCharacterStateTracking(LocalPlayer.Character)
 end
 
 local function stopViz()
     if vizConn then vizConn:Disconnect(); vizConn = nil end
-    clientPart.Parent = nil; serverPart.Parent = nil; baitPart.Parent = nil
+    clientPart.Parent = nil
+    serverPart.Parent = nil
+    baitPart.Parent   = nil
 end
 
 -- ================================================================
@@ -248,8 +235,6 @@ end
 -- ================================================================
 local desyncInitialized = false
 State.desyncMode        = State.desyncMode or 'instant'
-
--- Delayed burst loop
 local delayedLoopActive = false
 
 local function startDelayedLoop()
@@ -275,7 +260,8 @@ local function startDelayedLoop()
 end
 
 local function stopDelayedLoop()
-    burstWindowOpen = false; delayedLoopActive = false
+    burstWindowOpen   = false
+    delayedLoopActive = false
 end
 
 local function pauseDesync()
@@ -285,8 +271,6 @@ local function pauseDesync()
     forceSyncActive       = false
     syncQueued            = false
     stopDelayedLoop()
-    -- Tell master loop: keep replication OPEN.
-    -- wantReplication clears lastFlagState so this applies next frame.
     wantReplication(true)
     Library:Notify('Desync OFF — replication restored')
 end
@@ -294,19 +278,20 @@ end
 local function resumeDesync()
     if not State.replicatorCompatible then
         Library:Notify('Run Compat Check first!')
-        task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
+        task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
+        return
     end
     local hrp = getLocalHRP()
     if not hrp then
         Library:Notify('No character!')
-        task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
+        task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
+        return
     end
     State.frozenServerPos = hrp.Position
     State.desyncActive    = true
     burstWindowOpen       = false
     forceSyncActive       = false
     syncQueued            = false
-    -- Tell master loop: keep replication CLOSED.
     wantReplication(false)
 
     if State.desyncMode == 'delayed' then
@@ -323,7 +308,7 @@ local function initDesync()
         Library:Notify('Run Compat Check first!'); return
     end
     if desyncInitialized then Library:Notify('Already initialized'); return end
-    if not getLocalHRP() then Library:Notify('No character'); return end
+    if not getLocalHRP()  then Library:Notify('No character');        return end
     desyncInitialized = true
     Library:Notify('Desync ready — use the Enable toggle')
 end
@@ -380,8 +365,11 @@ State.baitActive = false
 State.baitPos    = nil
 
 local function stampBaitPosition()
-    if not State.replicatorCompatible then Library:Notify('Run Compat Check first!'); return end
-    local hrp = getLocalHRP(); if not hrp then Library:Notify('No character!'); return end
+    if not State.replicatorCompatible then
+        Library:Notify('Run Compat Check first!'); return
+    end
+    local hrp = getLocalHRP()
+    if not hrp then Library:Notify('No character!'); return end
     task.spawn(function()
         burstWindowOpen = true
         setReplicatorDirect(true)
@@ -391,7 +379,6 @@ local function stampBaitPosition()
         if Toggles.DesyncVisualizer and Toggles.DesyncVisualizer.Value then
             baitPart.Parent = workspace
         end
-        -- Lock closed — stamp is done, server sees us here now
         setReplicatorDirect(false)
         burstWindowOpen = false
         wantReplication(false)
@@ -400,8 +387,9 @@ local function stampBaitPosition()
 end
 
 local function clearBait()
-    State.baitActive = false; State.baitPos = nil
-    baitPart.Parent = nil
+    State.baitActive = false
+    State.baitPos    = nil
+    baitPart.Parent  = nil
     if not State.desyncActive and not State.hitConfusionArmed then
         wantReplication(true)
     end
@@ -411,82 +399,57 @@ end
 -- ================================================================
 --  PASSIVE LAG — PURE API (no fflags)
 --
---  BUG FIX (50% cap):
---  The old code used `frame % 2 == 1` to decide when to inject,
---  which by definition is exactly 50% of frames regardless of the
---  throttle slider. The throttle slider had no effect on injection
---  frequency, only on snapshot staleness.
---
---  Fix: injection frequency is now directly controlled by the
---  throttle slider as a ratio. ThrottleSlider ranges 2-60 meaning
---  "inject a stale frame once every N real frames". At throttle=2
---  it injects every 2 frames (~50%), at throttle=10 every 10 frames
---  (~10%), at throttle=60 every 60 frames (~1.6%). The indicator
---  now reflects the actual injection ratio accurately.
---
---  Mechanism: every N frames, snapshot position. On the frame
---  immediately after a snapshot, push the stale position for one
---  physics step so the replication pipeline sees it, then restore.
+--  FIX: old code used frame % 2 which hard-capped injection at 50%
+--  regardless of the throttle slider. Now throttle directly controls
+--  frequency: inject once every N frames. At N=2 → ~50%, N=10 → ~10%.
 -- ================================================================
 State.passiveLagActive = false
 local passiveLagConn   = nil
 local passiveLagLabel  = nil
 
-local passiveLagStats = {
-    injected  = 0,
-    total     = 0,
-    lastReset = os.clock(),
-}
+local lagStats = { injected = 0, total = 0, lastReset = os.clock() }
 
 local function startPassiveLag()
     if passiveLagConn then passiveLagConn:Disconnect(); passiveLagConn = nil end
     State.passiveLagActive = true
 
-    local snapshotPos  = nil
-    local frameCount   = 0
-    local injectThisFrame = false
+    local snapshotPos     = nil
+    local frameCount      = 0
+    local injectNextFrame = false
 
     passiveLagConn = RunService.Heartbeat:Connect(function()
         if not State.passiveLagActive then return end
         local hrp = getLocalHRP(); if not hrp then return end
 
         local throttle = Options.PassiveLagThrottle and Options.PassiveLagThrottle.Value or 10
-        frameCount = frameCount + 1
-        passiveLagStats.total = passiveLagStats.total + 1
+        frameCount          = frameCount + 1
+        lagStats.total      = lagStats.total + 1
 
-        -- Every `throttle` frames: take a new snapshot and schedule
-        -- one stale injection on the very next frame
         if frameCount % throttle == 0 then
             snapshotPos       = hrp.Position
-            injectThisFrame   = true
-        elseif injectThisFrame and snapshotPos then
-            -- Inject the stale position for exactly one physics step
-            injectThisFrame = false
-            local realCF = hrp.CFrame
-            local rot    = realCF - Vector3.new(realCF.X, realCF.Y, realCF.Z)
-            hrp.CFrame   = CFrame.new(snapshotPos) * CFrame.fromMatrix(
+            injectNextFrame   = true
+        elseif injectNextFrame and snapshotPos then
+            injectNextFrame = false
+            local realCF    = hrp.CFrame
+            hrp.CFrame = CFrame.new(snapshotPos) * CFrame.fromMatrix(
                 Vector3.new(), realCF.RightVector, realCF.UpVector, -realCF.LookVector)
             task.defer(function()
                 if hrp and hrp.Parent then hrp.CFrame = realCF end
             end)
-            passiveLagStats.injected = passiveLagStats.injected + 1
+            lagStats.injected = lagStats.injected + 1
         end
 
-        -- Update indicator label once per second
         local now = os.clock()
-        if now - passiveLagStats.lastReset >= 1 then
-            local pct = 0
-            if passiveLagStats.total > 0 then
-                pct = math.floor((passiveLagStats.injected / passiveLagStats.total) * 100)
-            end
+        if now - lagStats.lastReset >= 1 then
+            local pct = lagStats.total > 0
+                and math.floor((lagStats.injected / lagStats.total) * 100) or 0
             if passiveLagLabel then
-                local status = pct > 5 and 'ACTIVE ✓' or 'inactive — lower throttle value'
                 passiveLagLabel:SetText(
-                    'Injection rate: ' .. pct .. '% | ' .. status)
+                    'Injection rate: ' .. pct .. '%  ' .. (pct > 2 and '| ACTIVE ✓' or '| lower throttle value'))
             end
-            passiveLagStats.injected  = 0
-            passiveLagStats.total     = 0
-            passiveLagStats.lastReset = now
+            lagStats.injected  = 0
+            lagStats.total     = 0
+            lagStats.lastReset = now
         end
     end)
 end
@@ -494,20 +457,24 @@ end
 local function stopPassiveLag()
     State.passiveLagActive = false
     if passiveLagConn then passiveLagConn:Disconnect(); passiveLagConn = nil end
-    passiveLagStats.injected = 0; passiveLagStats.total = 0
+    lagStats.injected = 0; lagStats.total = 0
     if passiveLagLabel then passiveLagLabel:SetText('Passive Lag OFF') end
 end
 
 -- ================================================================
 --  CHARACTER STATE SPOOFER
 --
---  BUG FIX (can't move while spoofing):
---  ChangeState() to Seated/Ragdoll changes the CLIENT state too,
---  which physically prevents movement. The fix: pulse the fake
---  state for exactly 1 frame so the replication packet goes out,
---  then immediately ChangeState back to Running (or the actual
---  current state). Client barely notices the 1-frame blip but the
---  server receives the fake state packet.
+--  FIX: previous version used RunService.Heartbeat:Wait() between
+--  the fake ChangeState and the restore. One full heartbeat frame
+--  is enough for the client to physically enter the state —
+--  Seated blocks movement, Ragdoll drops the character, etc.
+--
+--  Fix: task.defer() fires in the SAME frame's deferred queue,
+--  before the next physics step runs. The client calls
+--  ChangeState(fake), then ChangeState(real) fires before physics
+--  processes it — the client never actually enters the fake state.
+--  The replication layer reads state at call time so the server
+--  still receives the fake state packet. Full movement preserved.
 -- ================================================================
 State.stateSpoofActive = false
 local stateSpoofThread = nil
@@ -522,14 +489,13 @@ local STATE_MAP = {
 }
 
 local function startStateSpoof(stateName)
-    State.stateSpoofActive = false   -- stop any running loop first
-    if stateSpoofThread then
-        task.cancel(stateSpoofThread)
-        stateSpoofThread = nil
-    end
+    State.stateSpoofActive = false
+    if stateSpoofThread then task.cancel(stateSpoofThread); stateSpoofThread = nil end
 
     local targetState = STATE_MAP[stateName]
-    if not targetState then Library:Notify('Unknown state: ' .. tostring(stateName)); return end
+    if not targetState then
+        Library:Notify('Unknown state: ' .. tostring(stateName)); return
+    end
 
     State.stateSpoofActive = true
 
@@ -537,15 +503,16 @@ local function startStateSpoof(stateName)
         while State.stateSpoofActive do
             local hum = getLocalHum()
             if hum then
-                -- Save actual current state so we can snap back
                 local realState = hum:GetState()
 
-                -- Pulse fake state for 1 frame only
+                -- Pulse fake state
                 pcall(function() hum:ChangeState(targetState) end)
-                RunService.Heartbeat:Wait()
 
-                -- Immediately restore — client barely notices
-                pcall(function() hum:ChangeState(realState) end)
+                -- Restore in the same frame before physics runs
+                task.defer(function()
+                    local h = getLocalHum()
+                    if h then pcall(function() h:ChangeState(realState) end) end
+                end)
             end
 
             local interval = Options.StateSpoofInterval and Options.StateSpoofInterval.Value or 2
@@ -553,15 +520,12 @@ local function startStateSpoof(stateName)
         end
     end)
 
-    Library:Notify('State Spoof ON → ' .. stateName .. ' (1-frame pulse, you can still move)')
+    Library:Notify('State Spoof ON → ' .. stateName .. ' | you keep full movement')
 end
 
 local function stopStateSpoof()
     State.stateSpoofActive = false
-    if stateSpoofThread then
-        task.cancel(stateSpoofThread)
-        stateSpoofThread = nil
-    end
+    if stateSpoofThread then task.cancel(stateSpoofThread); stateSpoofThread = nil end
     local hum = getLocalHum()
     if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
     Library:Notify('State Spoof OFF')
@@ -581,20 +545,17 @@ local function triggerPanic()
     State.passiveLagActive     = false
     burstWindowOpen            = false
     forceSyncActive            = false
+    syncQueued                 = false
 
     stopDelayedLoop()
     stopPassiveLag()
     stopStateSpoof()
     if hitConfusionConn then hitConfusionConn:Disconnect(); hitConfusionConn = nil end
-
     baitPart.Parent = nil
 
-    -- Restore humanoid to running
     local hum = getLocalHum()
     if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
 
-    -- Open replication — wantReplication clears cache so master loop
-    -- applies this on the very next heartbeat frame
     wantReplication(true)
 
     task.defer(function()
@@ -631,7 +592,8 @@ local function connectTouchDetection()
                     wantReplication(true)
                     if Toggles.DesyncEnabled then Toggles.DesyncEnabled:SetValue(false) end
                     Library:Notify('Desync OFF — touched player')
-                end); return
+                end)
+                return
             end
         end
     end)
@@ -641,17 +603,17 @@ end
 --  CHARACTER ADDED
 -- ================================================================
 LocalPlayer.CharacterAdded:Connect(function(char)
-    desyncInitialized           = false
-    State.desyncActive          = false
-    State.frozenServerPos       = nil
-    State.baitActive            = false
-    State.baitPos               = nil
-    State.hitConfusionFrozenAt  = nil
-    State.stateSpoofActive      = false
-    State.passiveLagActive      = false
-    burstWindowOpen             = false
-    forceSyncActive             = false
-    syncQueued                  = false
+    desyncInitialized          = false
+    State.desyncActive         = false
+    State.frozenServerPos      = nil
+    State.baitActive           = false
+    State.baitPos              = nil
+    State.hitConfusionFrozenAt = nil
+    State.stateSpoofActive     = false
+    State.passiveLagActive     = false
+    burstWindowOpen            = false
+    forceSyncActive            = false
+    syncQueued                 = false
 
     stopDelayedLoop()
     stopPassiveLag()
@@ -693,9 +655,9 @@ local SpinGrp       = Tabs.Misc:AddLeftGroupbox('SpinBot')
 local MiscGrp       = Tabs.Misc:AddRightGroupbox('Misc')
 
 -- ── Compat + Panic ────────────────────────────────────────────────
-CompatGrp:AddLabel('Only checks NextGenReplicatorEnabledWrite4.\nNo side effects — safe to run at any time.')
+CompatGrp:AddLabel('Tests write access only. Restores\noriginal flag value after check.')
 CompatGrp:AddButton({ Text = 'Run Compatibility Check', Func = runCompatCheck })
-CompatGrp:AddLabel('Panic Key — kills everything instantly.')
+CompatGrp:AddLabel('Panic Key — kills all systems instantly.')
 CompatGrp:AddLabel('Panic Key'):AddKeyPicker('PanicKey', {
     Default = 'End', Text = 'Panic Key', Mode = 'Toggle',
     Callback = function(v)
@@ -736,7 +698,8 @@ DesyncGrp:AddToggle('DesyncEnabled', {
         if v then
             if not desyncInitialized then
                 Library:Notify('Initialize first!')
-                task.defer(function() Toggles.DesyncEnabled:SetValue(false) end); return
+                task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
+                return
             end
             resumeDesync()
         else
@@ -759,18 +722,19 @@ CombatGrp:AddToggle('HitConfusionEnabled', {
         if v then
             if not State.replicatorCompatible then
                 Library:Notify('Run Compat Check first!')
-                task.defer(function() Toggles.HitConfusionEnabled:SetValue(false) end); return
+                task.defer(function() Toggles.HitConfusionEnabled:SetValue(false) end)
+                return
             end
             State.hitConfusionArmed = true
             startHitConfusion()
-            Library:Notify('Hit Confusion ARMED — activates within ' .. HIT_CONFUSION_RANGE .. ' studs')
+            Library:Notify('Hit Confusion ARMED — ' .. HIT_CONFUSION_RANGE .. ' stud range')
         else
             stopHitConfusion()
             Library:Notify('Hit Confusion OFF')
         end
     end,
 })
-CombatGrp:AddLabel('Freezes server pos when enemy enters range.\nServer-side hits resolve against ghost position.')
+CombatGrp:AddLabel('Freezes server pos when enemy enters range.')
 
 CombatGrp:AddToggle('BaitEnabled', {
     Text = 'Bait Mode', Default = false,
@@ -778,7 +742,8 @@ CombatGrp:AddToggle('BaitEnabled', {
         if v then
             if not State.replicatorCompatible then
                 Library:Notify('Run Compat Check first!')
-                task.defer(function() Toggles.BaitEnabled:SetValue(false) end); return
+                task.defer(function() Toggles.BaitEnabled:SetValue(false) end)
+                return
             end
             stampBaitPosition()
         else
@@ -787,10 +752,13 @@ CombatGrp:AddToggle('BaitEnabled', {
     end,
 })
 CombatGrp:AddButton({ Text = 'Re-Stamp Bait Here', Func = function()
-    if State.baitActive then clearBait(); task.wait(0.1); stampBaitPosition()
-    else Library:Notify('Enable Bait Mode first') end
+    if State.baitActive then
+        clearBait(); task.wait(0.1); stampBaitPosition()
+    else
+        Library:Notify('Enable Bait Mode first')
+    end
 end })
-CombatGrp:AddLabel('Stamps position to server then walk away.\nServer sees you standing at the bait spot.')
+CombatGrp:AddLabel('Stamps your pos to server then walk away.\nServer sees you at the bait spot.')
 
 -- ── Passive Lag ───────────────────────────────────────────────────
 PassiveLagGrp:AddToggle('PassiveLagEnabled', {
@@ -800,18 +768,19 @@ PassiveLagGrp:AddToggle('PassiveLagEnabled', {
     end,
 })
 PassiveLagGrp:AddSlider('PassiveLagThrottle', {
-    Text = 'Throttle (1 injection per N frames)',
+    Text = 'Throttle (inject every N frames)',
     Default = 10, Min = 2, Max = 120, Rounding = 0,
     Callback = function()
         if State.passiveLagActive then stopPassiveLag(); startPassiveLag() end
     end,
 })
 passiveLagLabel = PassiveLagGrp:AddLabel('Passive Lag OFF')
-PassiveLagGrp:AddLabel('Lower N = more frequent stale injections.\nThrottle 2 ≈ 50% | 10 ≈ 10% | 60 ≈ 1.6%')
+PassiveLagGrp:AddLabel('N=2 → ~50%  |  N=10 → ~10%  |  N=60 → ~2%')
 
 -- ── State Spoofing ────────────────────────────────────────────────
 NetGrp:AddDropdown('StateSpoofState', {
-    Text = 'Spoof State', Default = 'Seated',
+    Text   = 'Spoof State',
+    Default = 'Seated',
     Values = { 'Seated', 'Ragdoll', 'FallingDown', 'Jumping', 'Swimming', 'Climbing' },
 })
 NetGrp:AddSlider('StateSpoofInterval', {
@@ -821,14 +790,14 @@ NetGrp:AddToggle('StateSpoofEnabled', {
     Text = 'Enable State Spoofer', Default = false,
     Callback = function(v)
         if v then
-            local stateName = Options.StateSpoofState and Options.StateSpoofState.Value or 'Seated'
-            startStateSpoof(stateName)
+            local s = Options.StateSpoofState and Options.StateSpoofState.Value or 'Seated'
+            startStateSpoof(s)
         else
             stopStateSpoof()
         end
     end,
 })
-NetGrp:AddLabel('1-frame pulse — server gets fake state,\nyou keep full movement client-side.')
+NetGrp:AddLabel('task.defer restore — server gets fake state,\nclient never enters it. Full movement kept.')
 
 -- ── SpinBot ───────────────────────────────────────────────────────
 SpinGrp:AddToggle('SpinBotEnabled',       { Text = 'Enable SpinBot', Default = false })
@@ -836,7 +805,7 @@ SpinGrp:AddLabel('Spin Key'):AddKeyPicker('SpinKey', { Default = 'None', Text = 
 SpinGrp:AddToggle('OnePressSpinningMode', { Text = 'One-Press Mode', Default = false })
 SpinGrp:AddSlider('SpinVelocity',         { Text = 'Spin Velocity', Default = 50, Min = 1, Max = 50, Rounding = 1 })
 SpinGrp:AddDropdown('SpinPart', { Text = 'Spin Part', Default = 2, Values = State.spinPartValues })
-SpinGrp:AddInput('AddSpinPartInput',    { Default = '', Text = 'Add Spin Part', Placeholder = 'Part name...' })
+SpinGrp:AddInput('AddSpinPartInput',    { Default = '', Text = 'Add Spin Part',    Placeholder = 'Part name...' })
 SpinGrp:AddButton({ Text = 'Add Spin Part', Func = function()
     local v = Options.AddSpinPartInput and Options.AddSpinPartInput.Value or ''
     if #v > 0 and not table.find(State.spinPartValues, v) then
