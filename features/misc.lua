@@ -1,5 +1,5 @@
 -- ================================================================
---  features/misc.lua (FULLY RESTORED & FIXED)
+--  features/misc.lua (FULL RESTORATION)
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
@@ -28,22 +28,18 @@ local function runCompatCheck()
         Library:Notify('[COMPAT] setfflag not available')
         return false
     end
-
     local original = 'True'
     if type(getfflag) == 'function' then
         local ok, val = pcall(getfflag, REPLICATOR_FLAG)
         if ok and val ~= nil then original = tostring(val) end
     end
-
     local writeOk = pcall(setfflag, REPLICATOR_FLAG, 'True')
     pcall(setfflag, REPLICATOR_FLAG, original)
-
+    
     if not writeOk then
         Library:Notify('[COMPAT] Write failed')
-        State.replicatorCompatible = false
         return false
     end
-
     State.replicatorCompatible = true
     Library:Notify('[COMPAT] Compatible ✓')
     return true
@@ -76,7 +72,7 @@ RunService.Heartbeat:Connect(function()
 end)
 
 -- ================================================================
---  PART HELPERS
+--  PART HELPERS & VISUALIZER
 -- ================================================================
 local function makePart(col, label)
     local p = Instance.new('Part')
@@ -92,86 +88,65 @@ local function makePart(col, label)
     return p, tx
 end
 
-local clientPart, clientLbl = makePart(Color3.fromRGB(60,  255, 100), 'CLIENT')
-local serverPart, serverLbl = makePart(Color3.fromRGB(255,  50,  50), 'SERVER')
-local baitPart,   baitLbl   = makePart(Color3.fromRGB(255, 165,   0), 'BAIT')
+local clientPart, clientLbl = makePart(Color3.fromRGB(60, 255, 100), 'CLIENT')
+local serverPart, serverLbl = makePart(Color3.fromRGB(255, 50, 50), 'SERVER')
+local baitPart,   baitLbl   = makePart(Color3.fromRGB(255, 165, 0), 'BAIT')
 local vizConn = nil
 
--- ================================================================
---  DESYNC ENGINE
--- ================================================================
-local desyncInitialized = false
-State.desyncMode        = State.desyncMode or 'instant'
-local delayedLoopActive = false
-
-local function startDelayedLoop()
-    if delayedLoopActive then return end
-    delayedLoopActive = true
-    task.spawn(function()
-        while State.desyncActive and State.desyncMode == 'delayed' do
-            local interval = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-            task.wait(interval)
-            if not State.desyncActive or State.desyncMode ~= 'delayed' then break end
-            
-            burstWindowOpen = true
-            setReplicatorDirect(true)
-            for _ = 1, 3 do RunService.Heartbeat:Wait() end
-            local hrp = getLocalHRP()
-            if hrp then State.frozenServerPos = hrp.Position end
-            setReplicatorDirect(false)
-            burstWindowOpen = false
-        end
-        delayedLoopActive = false
-    end)
-end
-
-local function pauseDesync()
-    State.desyncActive    = false
-    State.frozenServerPos = nil
-    delayedLoopActive     = false
-    wantReplication(true)
-    Library:Notify('Desync OFF')
-end
-
-local function resumeDesync()
-    if not State.replicatorCompatible then return end
-    local hrp = getLocalHRP()
-    if not hrp then return end
-    State.frozenServerPos = hrp.Position
-    State.desyncActive    = true
-    wantReplication(false)
-    if State.desyncMode == 'delayed' then startDelayedLoop() end
-end
-
--- ================================================================
---  VISUALIZER
--- ================================================================
 local function startViz()
-    if vizConn then vizConn:Disconnect(); vizConn = nil end
-    clientPart.Parent = workspace
-    serverPart.Parent = workspace
+    if vizConn then vizConn:Disconnect() end
+    clientPart.Parent = workspace; serverPart.Parent = workspace
+    if State.baitActive then baitPart.Parent = workspace end
     vizConn = RunService.Heartbeat:Connect(function()
         local hrp = getLocalHRP(); if not hrp then return end
         clientPart.CFrame = hrp.CFrame
         if State.desyncActive and State.frozenServerPos then
             serverPart.CFrame = CFrame.new(State.frozenServerPos)
-            local dist = math.floor((hrp.Position - State.frozenServerPos).Magnitude)
-            serverLbl.Text = 'SERVER [LAG] ' .. dist .. 'm'
         else
             serverPart.CFrame = hrp.CFrame
-            serverLbl.Text    = 'SERVER (synced)'
+        end
+        if State.baitActive and State.baitPos then
+            baitPart.CFrame = CFrame.new(State.baitPos)
         end
     end)
 end
 
-local function stopViz()
-    if vizConn then vizConn:Disconnect(); vizConn = nil end
-    clientPart.Parent = nil
-    serverPart.Parent = nil
+-- ================================================================
+--  DESYNC & PASSIVE LAG LOGIC
+-- ================================================================
+local function startDelayedLoop()
+    task.spawn(function()
+        while State.desyncActive and State.desyncMode == 'delayed' do
+            local interval = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
+            task.wait(interval)
+            if not State.desyncActive then break end
+            burstWindowOpen = true
+            setReplicatorDirect(true)
+            for _ = 1, 4 do RunService.Heartbeat:Wait() end
+            local hrp = getLocalHRP()
+            if hrp then State.frozenServerPos = hrp.Position end
+            setReplicatorDirect(false)
+            burstWindowOpen = false
+        end
+    end)
+end
+
+local function startPassiveLag()
+    local frameCount = 0
+    State.passiveLagConn = RunService.Heartbeat:Connect(function()
+        local hrp = getLocalHRP(); if not hrp then return end
+        local throttle = Options.PassiveLagThrottle and Options.PassiveLagThrottle.Value or 10
+        frameCount = frameCount + 1
+        if frameCount % throttle == 0 then
+            local realCF = hrp.CFrame
+            hrp.CFrame = realCF * CFrame.new(0, 0.01, 0)
+            task.defer(function() hrp.CFrame = realCF end)
+        end
+    end)
 end
 
 -- ================================================================
---  UI SECTION
+--  UI CONSTRUCTION
 -- ================================================================
 local CompatGrp     = Tabs.Misc:AddLeftGroupbox('FFlag Compatibility')
 local DesyncGrp     = Tabs.Misc:AddLeftGroupbox('Desync')
@@ -183,30 +158,72 @@ local MiscGrp       = Tabs.Misc:AddRightGroupbox('Misc')
 
 CompatGrp:AddButton({ Text = 'Run Compatibility Check', Func = runCompatCheck })
 
-DesyncGrp:AddButton({ Text = 'Initialize Desync', Func = function() desyncInitialized = true; Library:Notify('Ready') end })
 DesyncGrp:AddDropdown('DesyncMode', {
     Text = 'Desync Mode', Default = 'Instant',
     Values = { 'Instant', 'Delayed (Lag Mimic)' },
     Callback = function(v) State.desyncMode = (v == 'Instant') and 'instant' or 'delayed' end,
 })
-DesyncGrp:AddSlider('DelayedDesyncInterval', { Text = 'Lag Interval', Default = 5, Min = 1, Max = 30, Rounding = 0 })
+
 DesyncGrp:AddToggle('DesyncEnabled', {
     Text = 'Enable Desync', Default = false,
-    Callback = function(v) if v then resumeDesync() else pauseDesync() end end,
-})
-DesyncGrp:AddToggle('DesyncVisualizer', {
-    Text = 'Show 3D Visualizer', Default = false,
-    Callback = function(v) if v then startViz() else stopViz() end end,
+    Callback = function(v)
+        State.desyncActive = v
+        if v then
+            wantReplication(false)
+            if State.desyncMode == 'delayed' then startDelayedLoop() end
+        else
+            wantReplication(true)
+        end
+    end,
 })
 
--- (The rest of the Movement/Walkspeed toggles go here similar to your file)
+CombatGrp:AddToggle('HitConfusionEnabled', {
+    Text = 'Hit Validation Confusion', Default = false,
+    Callback = function(v) State.hitConfusionArmed = v end,
+})
+
+CombatGrp:AddToggle('BaitEnabled', {
+    Text = 'Bait Mode', Default = false,
+    Callback = function(v)
+        State.baitActive = v
+        if v then
+            local hrp = getLocalHRP()
+            if hrp then State.baitPos = hrp.Position end
+            wantReplication(false)
+        else
+            wantReplication(true)
+        end
+    end,
+})
+
+PassiveLagGrp:AddToggle('PassiveLagEnabled', {
+    Text = 'Enable Passive Lag', Default = false,
+    Callback = function(v)
+        if v then startPassiveLag() else if State.passiveLagConn then State.passiveLagConn:Disconnect() end end
+    end,
+})
+
+PassiveLagGrp:AddSlider('PassiveLagThrottle', { Text = 'Throttle', Default = 10, Min = 2, Max = 120, Rounding = 0 })
+
+-- ── SpinBot ───────────────────────────────────────────────────────
+SpinGrp:AddToggle('SpinBotEnabled', { Text = 'Enable SpinBot', Default = false })
+SpinGrp:AddSlider('SpinVelocity', { Text = 'Spin Velocity', Default = 50, Min = 1, Max = 100, Rounding = 1 })
+
+-- ── Movement ──────────────────────────────────────────────────────
 MiscGrp:AddToggle('WalkspeedToggle', { Text = 'Enable Custom Walkspeed', Default = false })
-MiscGrp:AddSlider('WalkspeedValue',  { Text = 'Speed', Default = 16, Min = 2, Max = 500, Rounding = 0 })
+MiscGrp:AddSlider('WalkspeedValue',  { Text = 'Speed', Default = 16, Min = 16, Max = 500, Rounding = 0 })
 
 RunService.Heartbeat:Connect(function()
-    if not (Toggles.WalkspeedToggle and Toggles.WalkspeedToggle.Value) then return end
-    local hum = getLocalHum()
-    if hum then hum.WalkSpeed = Options.WalkspeedValue.Value end
+    if Toggles.WalkspeedToggle and Toggles.WalkspeedToggle.Value then
+        local hum = getLocalHum()
+        if hum then hum.WalkSpeed = Options.WalkspeedValue.Value end
+    end
+    if Toggles.SpinBotEnabled and Toggles.SpinBotEnabled.Value then
+        local hrp = getLocalHRP()
+        if hrp then
+            hrp.CFrame = hrp.CFrame * CFrame.Angles(0, math.rad(Options.SpinVelocity.Value), 0)
+        end
+    end
 end)
 
 end
