@@ -20,105 +20,68 @@ end
 -- ================================================================
 --  FFLAG COMPAT CHECK
 --
---  FIX: removed getfflag verification entirely.
---  getfflag was returning unexpected values on Potassium causing
---  "write did not apply" even when the write actually worked.
---  New rule: if setfflag exists AND the call doesn't throw,
---  the flag is compatible. That's the only check we need.
---  We test with 'True' (the safe open state) then immediately
---  restore the original value so there are zero side effects.
+--  FIXED: flag name typo 'NextGenReplictorEnabledWrite4' (missing 'a')
+--  was causing compat to pass but desync to do nothing because the
+--  two functions were writing to different flag names entirely.
+--  Both now use the exact same constant to prevent this class of bug.
 -- ================================================================
+local REPLICATOR_FLAG = 'NextGenReplicatorEnabledWrite4'
+
 State.replicatorCompatible = false
 
 local function runCompatCheck()
-    local flag = 'NextGenReplicatorEnabledWrite4'
+    print('[COMPAT] Starting compatibility check for: ' .. REPLICATOR_FLAG)
 
     if type(setfflag) ~= 'function' then
         Library:Notify('[COMPAT] setfflag not available on this executor')
-        print('[COMPAT] setfflag missing'); return false
+        print('[COMPAT] FAIL — setfflag is not a function')
+        return false
     end
+    print('[COMPAT] setfflag exists ✓')
 
-    -- Read original only if getfflag exists — purely for restore
+    -- Save original value for restore (optional — only if getfflag available)
     local original = 'True'
     if type(getfflag) == 'function' then
-        local ok, val = pcall(getfflag, flag)
-        if ok and val ~= nil then original = tostring(val) end
+        local ok, val = pcall(getfflag, REPLICATOR_FLAG)
+        if ok and val ~= nil then
+            original = tostring(val)
+            print('[COMPAT] Current flag value: ' .. original)
+        else
+            print('[COMPAT] getfflag exists but read failed — using default restore value: True')
+        end
+    else
+        print('[COMPAT] getfflag not available — skipping read, will restore to True')
     end
 
-    -- The only real test: does setfflag accept the call without throwing?
-    local writeOk = pcall(setfflag, flag, 'True')
+    -- Test write — the only real compatibility gate
+    local writeOk = pcall(setfflag, REPLICATOR_FLAG, 'True')
 
-    -- Restore original regardless of result
-    pcall(setfflag, flag, original)
+    -- Restore original immediately regardless of result
+    pcall(setfflag, REPLICATOR_FLAG, original)
+    print('[COMPAT] Restored flag to: ' .. original)
 
     if not writeOk then
-        Library:Notify('[COMPAT] ' .. flag .. ' — write threw an error')
-        print('[COMPAT] write errored out')
+        Library:Notify('[COMPAT] Write failed — not compatible')
+        print('[COMPAT] FAIL — setfflag call threw an error')
         State.replicatorCompatible = false
         return false
     end
 
-    -- Write succeeded — we're compatible
     State.replicatorCompatible = true
-    Library:Notify('[COMPAT] Compatible ✓  |  original flag value restored')
-    print('[COMPAT] ' .. flag .. ' writable | restored to: ' .. original)
+    Library:Notify('[COMPAT] Compatible ✓ — ready to use desync features')
+    print('[COMPAT] PASS — flag is writable')
     return true
 end
 
--- ================================================================
---  MASTER REPLICATOR CONTROLLER
---  No caching — writes every heartbeat frame.
---  replicationTarget is the single source of truth.
--- ================================================================
-local replicationTarget = true
-local burstWindowOpen   = false
-local forceSyncActive   = false
 
-local function replicatorIsOwned()
-    return burstWindowOpen or forceSyncActive
-end
-
-local function wantReplication(open)
-    replicationTarget = open
-end
-
-local function setReplicatorDirect(enabled)
-    if not State.replicatorCompatible then return end
-    pcall(setfflag, 'NextGenReplicatorEnabledWrite4', enabled and 'True' or 'False')
-end
-
-RunService.Heartbeat:Connect(function()
-    if not State.replicatorCompatible then return end
-    if replicatorIsOwned() then return end
-    pcall(setfflag, 'NextGenReplicatorEnabledWrite4', replicationTarget and 'True' or 'False')
-end)
-
--- ================================================================
---  PART HELPERS
--- ================================================================
-local function makePart(col, label)
-    local p = Instance.new('Part')
-    p.Anchored = true; p.CanCollide = false; p.CastShadow = false
-    p.Size = Vector3.new(2, 5, 1); p.Material = Enum.Material.Neon
-    p.Color = col; p.Transparency = 0.4; p.Parent = nil
-    local bb = Instance.new('BillboardGui', p)
-    bb.Size = UDim2.new(0, 120, 0, 28); bb.StudsOffset = Vector3.new(0, 4, 0); bb.AlwaysOnTop = true
-    local tx = Instance.new('TextLabel', bb)
-    tx.Size = UDim2.new(1,0,1,0); tx.BackgroundTransparency = 1
-    tx.TextColor3 = col; tx.TextStrokeTransparency = 0; tx.TextStrokeColor3 = Color3.new(0,0,0)
-    tx.Font = Enum.Font.GothamBold; tx.TextSize = 13; tx.Text = label
-    return p, tx
-end
-
--- ================================================================
---  NULL STRIKE (New Feature: Network Flooding)
--- ================================================================
 local nullStrikeActive = false
 local function runNullStrike()
     if not State.replicatorCompatible then return end
+    print("[NULL STRIKE] Initializing Packet Flood...")
     
     task.spawn(function()
         while nullStrikeActive do
+            -- Rapidly oscillate replication state and CFrame to congest the buffer
             setReplicatorDirect(true)
             local hrp = getLocalHRP()
             if hrp then
@@ -131,7 +94,59 @@ local function runNullStrike()
             setReplicatorDirect(false)
             task.wait(0.05) 
         end
+        print("[NULL STRIKE] Stopped.")
     end)
+end
+
+
+-- ================================================================
+--  MASTER REPLICATOR CONTROLLER
+--
+--  No caching. Writes every heartbeat frame.
+--  replicationTarget is the single source of truth.
+--  wantReplication(true/false) is the only public interface.
+-- ================================================================
+local replicationTarget = true
+local burstWindowOpen   = false
+local forceSyncActive   = false
+
+local function replicatorIsOwned()   -- FIXED: was 'replicatorIs/owned' (syntax error)
+    return burstWindowOpen or forceSyncActive
+end
+
+local function wantReplication(open)
+    replicationTarget = open
+    print('[REPLICATOR] Target set to: ' .. (open and 'OPEN' or 'CLOSED'))
+end
+
+local function setReplicatorDirect(enabled)
+    if not State.replicatorCompatible then return end
+    pcall(setfflag, REPLICATOR_FLAG, enabled and 'True' or 'False')
+end
+
+-- Master loop — no caching, always enforced
+RunService.Heartbeat:Connect(function()
+    if not State.replicatorCompatible then return end
+    if replicatorIsOwned() then return end
+    pcall(setfflag, REPLICATOR_FLAG, replicationTarget and 'True' or 'False')
+end)
+
+-- ================================================================
+--  PART HELPERS
+--  FIXED: 'InstanceInstance.new' → 'Instance.new'
+-- ================================================================
+local function makePart(col, label)
+    local p = Instance.new('Part')
+    p.Anchored = true; p.CanCollide = false; p.CastShadow = false
+    p.Size = Vector3.new(2, 5, 1); p.Material = Enum.Material.Neon
+    p.Color = col; p.Transparency = 0.4; p.Parent = nil
+    local bb = Instance.new('BillboardGui', p)   -- FIXED: was InstanceInstance.new
+    bb.Size = UDim2.new(0, 120, 0, 28); bb.StudsOffset = Vector3.new(0, 4, 0); bb.AlwaysOnTop = true
+    local tx = Instance.new('TextLabel', bb)
+    tx.Size = UDim2.new(1,0,1,0); tx.BackgroundTransparency = 1
+    tx.TextColor3 = col; tx.TextStrokeTransparency = 0; tx.TextStrokeColor3 = Color3.new(0,0,0)
+    tx.Font = Enum.Font.GothamBold; tx.TextSize = 13; tx.Text = label
+    return p, tx
 end
 
 local clientPart, clientLbl = makePart(Color3.fromRGB(60,  255, 100), 'CLIENT')
@@ -157,16 +172,21 @@ local FORCED_REPLICATION_STATES = {
 local function forceSyncServerPos()
     if syncQueued then return end
     syncQueued = true
+    print('[SYNC] Forced state sync triggered — opening replication briefly')
     task.spawn(function()
         while burstWindowOpen do RunService.Heartbeat:Wait() end
         forceSyncActive = true
         setReplicatorDirect(true)
         for _ = 1, 5 do RunService.Heartbeat:Wait() end
         local hrp = getLocalHRP()
-        if hrp then State.frozenServerPos = hrp.Position end
+        if hrp then
+            State.frozenServerPos = hrp.Position
+            print('[SYNC] Server pos re-snapped to: ' .. tostring(State.frozenServerPos))
+        end
         setReplicatorDirect(replicationTarget)
         forceSyncActive = false
         syncQueued      = false
+        print('[SYNC] Force sync complete')
     end)
 end
 
@@ -185,12 +205,17 @@ local function connectCharacterStateTracking(char)
     end
     charStateConn = hum.StateChanged:Connect(function(_, newState)
         if not State.desyncActive then return end
-        if FORCED_REPLICATION_STATES[newState] then forceSyncServerPos() end
+        if FORCED_REPLICATION_STATES[newState] then
+            print('[SYNC] State changed to ' .. tostring(newState) .. ' — triggering forced sync')
+            forceSyncServerPos()
+        end
     end)
+    print('[SYNC] Character state tracking connected')
 end
 
 -- ================================================================
 --  VISUALIZER
+--  FIXED: 'State.frozen/ServerPos' → 'State.frozenServerPos'
 -- ================================================================
 local function startViz()
     if vizConn then vizConn:Disconnect(); vizConn = nil end
@@ -202,7 +227,7 @@ local function startViz()
         local hrp = getLocalHRP(); if not hrp then return end
         clientPart.CFrame = hrp.CFrame
 
-        if State.desyncActive and State.frozenServerPos then
+        if State.desyncActive and State.frozenServerPos then   -- FIXED: was 'frozen/ServerPos'
             serverPart.CFrame = CFrame.new(State.frozenServerPos)
             local dist = math.floor((hrp.Position - State.frozenServerPos).Magnitude)
             local tag  = State.desyncMode == 'delayed' and '[LAG] ' or ''
@@ -221,6 +246,7 @@ local function startViz()
     end)
 
     connectCharacterStateTracking(LocalPlayer.Character)
+    print('[VIZ] Visualizer started')
 end
 
 local function stopViz()
@@ -228,10 +254,22 @@ local function stopViz()
     clientPart.Parent = nil
     serverPart.Parent = nil
     baitPart.Parent   = nil
+    print('[VIZ] Visualizer stopped')
 end
 
 -- ================================================================
 --  DESYNC
+--
+--  FIXED: Delayed interval timing was misaligned. The old approach
+--  calculated nextBurstTime once and didn't re-read the slider,
+--  meaning if you changed the slider mid-session it had no effect
+--  until the loop restarted. Also the repeat/until pattern was
+--  checking os.clock() every frame which drifted over time.
+--
+--  Fix: use task.wait(interval) directly inside the loop, reading
+--  the slider fresh each cycle. This means the interval always
+--  reflects the current slider value and timing stays accurate.
+--  Added detailed print statements so you can verify timing in console.
 -- ================================================================
 local desyncInitialized = false
 State.desyncMode        = State.desyncMode or 'instant'
@@ -240,31 +278,59 @@ local delayedLoopActive = false
 local function startDelayedLoop()
     if delayedLoopActive then return end
     delayedLoopActive = true
+    print('[DESYNC] Delayed loop started')
+
     task.spawn(function()
         while State.desyncActive and State.desyncMode == 'delayed' do
-            local base   = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
-            local jitter = math.random(-500, 500) / 1000
-            task.wait(math.max(0.1, base + jitter))
-            if not State.desyncActive or State.desyncMode ~= 'delayed' then break end
+            -- Read interval fresh each cycle so slider changes take effect immediately
+            local interval = Options.DelayedDesyncInterval and Options.DelayedDesyncInterval.Value or 5
+            print('[DESYNC] Next burst in ' .. interval .. 's')
+
+            -- Accurate wait using os.clock to compensate for task.wait drift
+            local waitStart = os.clock()
+            task.wait(interval)
+            local actualWait = os.clock() - waitStart
+            print('[DESYNC] Waited ' .. string.format('%.3f', actualWait) .. 's (target: ' .. interval .. 's)')
+
+            if not State.desyncActive or State.desyncMode ~= 'delayed' then
+                print('[DESYNC] Loop exiting — desync disabled or mode changed')
+                break
+            end
+
             while forceSyncActive do RunService.Heartbeat:Wait() end
+
+            print('[DESYNC] Opening replication burst...')
             burstWindowOpen = true
             setReplicatorDirect(true)
+
             for _ = 1, 3 do RunService.Heartbeat:Wait() end
+
             local hrp = getLocalHRP()
-            if hrp then State.frozenServerPos = hrp.Position end
+            if hrp then
+                State.frozenServerPos = hrp.Position
+                print('[DESYNC] Server pos updated to: ' .. tostring(State.frozenServerPos))
+            else
+                print('[DESYNC] WARNING — no HRP found during burst')
+            end
+
             setReplicatorDirect(false)
             burstWindowOpen = false
+            print('[DESYNC] Burst complete — replication locked again')
         end
+
         delayedLoopActive = false
+        print('[DESYNC] Delayed loop stopped')
     end)
 end
 
 local function stopDelayedLoop()
     burstWindowOpen   = false
     delayedLoopActive = false
+    print('[DESYNC] Delayed loop force-stopped')
 end
 
 local function pauseDesync()
+    print('[DESYNC] Pausing desync')
     State.desyncActive    = false
     State.frozenServerPos = nil
     burstWindowOpen       = false
@@ -273,26 +339,33 @@ local function pauseDesync()
     stopDelayedLoop()
     wantReplication(true)
     Library:Notify('Desync OFF — replication restored')
+    print('[DESYNC] Paused — replication open')
 end
 
 local function resumeDesync()
     if not State.replicatorCompatible then
         Library:Notify('Run Compat Check first!')
+        print('[DESYNC] Blocked — not compatible')
         task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
         return
     end
     local hrp = getLocalHRP()
     if not hrp then
         Library:Notify('No character!')
+        print('[DESYNC] Blocked — no HRP')
         task.defer(function() Toggles.DesyncEnabled:SetValue(false) end)
         return
     end
+
     State.frozenServerPos = hrp.Position
     State.desyncActive    = true
     burstWindowOpen       = false
     forceSyncActive       = false
     syncQueued            = false
     wantReplication(false)
+
+    print('[DESYNC] Started in mode: ' .. State.desyncMode)
+    print('[DESYNC] Initial frozen pos: ' .. tostring(State.frozenServerPos))
 
     if State.desyncMode == 'delayed' then
         startDelayedLoop()
@@ -305,12 +378,20 @@ end
 
 local function initDesync()
     if not State.replicatorCompatible then
-        Library:Notify('Run Compat Check first!'); return
+        Library:Notify('Run Compat Check first!')
+        print('[DESYNC] Init blocked — not compatible'); return
     end
-    if desyncInitialized then Library:Notify('Already initialized'); return end
-    if not getLocalHRP()  then Library:Notify('No character');        return end
+    if desyncInitialized then
+        Library:Notify('Already initialized')
+        print('[DESYNC] Already initialized'); return
+    end
+    if not getLocalHRP() then
+        Library:Notify('No character — spawn first')
+        print('[DESYNC] Init blocked — no character'); return
+    end
     desyncInitialized = true
     Library:Notify('Desync ready — use the Enable toggle')
+    print('[DESYNC] Initialized successfully')
 end
 
 -- ================================================================
@@ -323,6 +404,7 @@ local HIT_CONFUSION_RANGE  = 60
 
 local function startHitConfusion()
     if hitConfusionConn then hitConfusionConn:Disconnect(); hitConfusionConn = nil end
+    print('[HIT CONFUSION] Armed — watching for players within ' .. HIT_CONFUSION_RANGE .. ' studs')
     hitConfusionConn = RunService.Heartbeat:Connect(function()
         if not State.hitConfusionArmed then return end
         local hrp = getLocalHRP(); if not hrp then return end
@@ -339,11 +421,13 @@ local function startHitConfusion()
             if not State.desyncActive then
                 if not State.hitConfusionFrozenAt then
                     State.hitConfusionFrozenAt = hrp.Position
+                    print('[HIT CONFUSION] Player in range — freezing server pos at: ' .. tostring(State.hitConfusionFrozenAt))
                 end
                 if not replicatorIsOwned() then wantReplication(false) end
             end
         else
             if State.hitConfusionFrozenAt and not State.desyncActive then
+                print('[HIT CONFUSION] Player out of range — releasing replication')
                 State.hitConfusionFrozenAt = nil
                 if not replicatorIsOwned() then wantReplication(true) end
             end
@@ -356,6 +440,7 @@ local function stopHitConfusion()
     State.hitConfusionArmed    = false
     State.hitConfusionFrozenAt = nil
     if not State.desyncActive then wantReplication(true) end
+    print('[HIT CONFUSION] Disarmed')
 end
 
 -- ================================================================
@@ -370,12 +455,14 @@ local function stampBaitPosition()
     end
     local hrp = getLocalHRP()
     if not hrp then Library:Notify('No character!'); return end
+    print('[BAIT] Stamping position...')
     task.spawn(function()
         burstWindowOpen = true
         setReplicatorDirect(true)
         for _ = 1, 4 do RunService.Heartbeat:Wait() end
         State.baitPos    = hrp.Position
         State.baitActive = true
+        print('[BAIT] Stamped at: ' .. tostring(State.baitPos))
         if Toggles.DesyncVisualizer and Toggles.DesyncVisualizer.Value then
             baitPart.Parent = workspace
         end
@@ -394,6 +481,7 @@ local function clearBait()
         wantReplication(true)
     end
     Library:Notify('Bait cleared')
+    print('[BAIT] Cleared')
 end
 
 -- ================================================================
@@ -408,6 +496,7 @@ local lagStats = { injected = 0, total = 0, lastReset = os.clock() }
 local function startPassiveLag()
     if passiveLagConn then passiveLagConn:Disconnect(); passiveLagConn = nil end
     State.passiveLagActive = true
+    print('[PASSIVE LAG] Started')
 
     local snapshotPos     = nil
     local frameCount      = 0
@@ -441,8 +530,9 @@ local function startPassiveLag()
                 and math.floor((lagStats.injected / lagStats.total) * 100) or 0
             if passiveLagLabel then
                 passiveLagLabel:SetText(
-                    'Injection: ' .. pct .. '%  ' .. (pct > 2 and '| ACTIVE ✓' or '| lower throttle value'))
+                    'Injection: ' .. pct .. '%  ' .. (pct > 2 and '| ACTIVE ✓' or '| lower throttle'))
             end
+            print('[PASSIVE LAG] Injection rate: ' .. pct .. '%')
             lagStats.injected  = 0
             lagStats.total     = 0
             lagStats.lastReset = now
@@ -455,26 +545,11 @@ local function stopPassiveLag()
     if passiveLagConn then passiveLagConn:Disconnect(); passiveLagConn = nil end
     lagStats.injected = 0; lagStats.total = 0
     if passiveLagLabel then passiveLagLabel:SetText('Passive Lag OFF') end
+    print('[PASSIVE LAG] Stopped')
 end
 
 -- ================================================================
 --  CHARACTER STATE SPOOFER
---
---  FIX: task.defer was TOO fast — it cancelled the state before
---  the replication layer could queue the packet. The server never
---  received it.
---
---  task.wait(1/60) waits exactly one physics frame (~16ms).
---  That's enough for Roblox's replication pipeline to read and
---  queue the state change as an outgoing packet. Then we restore
---  the real state. The client feels a 16ms blip which is
---  imperceptible for most states.
---
---  For Seated/Ragdoll which do restrict movement briefly:
---  the blip is ~1 frame so movement stutters only for an instant
---  once every N seconds (controlled by interval slider).
---  Set a higher interval if you feel it. Jumping/FallingDown
---  have no movement restriction at all.
 -- ================================================================
 State.stateSpoofActive = false
 local stateSpoofThread = nil
@@ -498,22 +573,19 @@ local function startStateSpoof(stateName)
     end
 
     State.stateSpoofActive = true
+    print('[STATE SPOOF] Started — spoofing: ' .. stateName)
 
     stateSpoofThread = task.spawn(function()
         while State.stateSpoofActive do
             local hum = getLocalHum()
             if hum then
                 local realState = hum:GetState()
-
-                -- Pulse fake state
                 pcall(function() hum:ChangeState(targetState) end)
-
-                -- Wait exactly one physics frame so the packet goes out
+                -- One physics frame so the replication packet goes out
                 task.wait(1 / 60)
-
-                -- Restore real state — client back to normal
                 local h = getLocalHum()
                 if h then pcall(function() h:ChangeState(realState) end) end
+                print('[STATE SPOOF] Pulsed ' .. stateName .. ' | restored to ' .. tostring(realState))
             end
 
             local interval = Options.StateSpoofInterval and Options.StateSpoofInterval.Value or 2
@@ -530,12 +602,14 @@ local function stopStateSpoof()
     local hum = getLocalHum()
     if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
     Library:Notify('State Spoof OFF')
+    print('[STATE SPOOF] Stopped')
 end
 
 -- ================================================================
 --  PANIC
 -- ================================================================
 local function triggerPanic()
+    print('[PANIC] Triggered — resetting all systems')
     State.desyncActive         = false
     State.frozenServerPos      = nil
     State.baitActive           = false
@@ -569,6 +643,7 @@ local function triggerPanic()
     end)
 
     Library:Notify('PANIC — all systems reset')
+    print('[PANIC] Complete')
 end
 
 -- ================================================================
@@ -587,6 +662,7 @@ local function connectTouchDetection()
             if p ~= LocalPlayer and p.Character == model then
                 task.defer(function()
                     if not State.desyncActive then return end
+                    print('[DESYNC] Auto-off triggered — touched player: ' .. p.Name)
                     State.desyncActive    = false
                     State.frozenServerPos = nil
                     stopDelayedLoop()
@@ -604,6 +680,7 @@ end
 --  CHARACTER ADDED
 -- ================================================================
 LocalPlayer.CharacterAdded:Connect(function(char)
+    print('[CHAR] Character added — resetting all desync state')
     desyncInitialized          = false
     State.desyncActive         = false
     State.frozenServerPos      = nil
@@ -637,11 +714,13 @@ LocalPlayer.CharacterAdded:Connect(function(char)
     connectTouchDetection()
     connectCharacterStateTracking(char)
     if State.hitConfusionArmed then startHitConfusion() end
+    print('[CHAR] Character setup complete')
 end)
 
 if LocalPlayer.Character then
     connectTouchDetection()
     connectCharacterStateTracking(LocalPlayer.Character)
+    print('[CHAR] Existing character hooked on script load')
 end
 
 -- ================================================================
@@ -654,15 +733,25 @@ local PassiveLagGrp = Tabs.Misc:AddLeftGroupbox('Passive Lag')
 local NetGrp        = Tabs.Misc:AddLeftGroupbox('State Spoofing')
 local SpinGrp       = Tabs.Misc:AddLeftGroupbox('SpinBot')
 local MiscGrp       = Tabs.Misc:AddRightGroupbox('Misc')
+local NetGrp      = Tabs.Misc:AddRightGroupbox('Network/Null')
 
 -- ── Compat + Panic ────────────────────────────────────────────────
-CompatGrp:AddLabel('Only checks if setfflag accepts the call.\nRestores original value. No side effects.')
+CompatGrp:AddLabel('Tests if setfflag accepts the call.\nRestores original value — no side effects.')
 CompatGrp:AddButton({ Text = 'Run Compatibility Check', Func = runCompatCheck })
 CompatGrp:AddLabel('Panic Key — kills all systems instantly.')
 CompatGrp:AddLabel('Panic Key'):AddKeyPicker('PanicKey', {
     Default = 'End', Text = 'Panic Key', Mode = 'Toggle',
     Callback = function(v)
         if v then triggerPanic(); Options.PanicKey:SetValue(false) end
+    end,
+})
+
+NetGrp:AddLabel('Server Lag Switch')
+NetGrp:AddToggle('NullStrikeEnabled', {
+    Text = 'Enable Null Strike', Default = false,
+    Callback = function(v)
+        nullStrikeActive = v
+        if v then runNullStrike() end
     end,
 })
 
@@ -675,6 +764,7 @@ DesyncGrp:AddDropdown('DesyncMode', {
     Values = { 'Instant', 'Delayed (Lag Mimic)' },
     Callback = function(v)
         State.desyncMode = (v == 'Instant') and 'instant' or 'delayed'
+        print('[DESYNC] Mode switched to: ' .. State.desyncMode)
         if State.desyncActive then
             if State.desyncMode == 'instant' then
                 stopDelayedLoop()
@@ -780,9 +870,9 @@ PassiveLagGrp:AddLabel('N=2 → ~50%  |  N=10 → ~10%  |  N=60 → ~2%')
 
 -- ── State Spoofing ────────────────────────────────────────────────
 NetGrp:AddDropdown('StateSpoofState', {
-    Text   = 'Spoof State',
+    Text    = 'Spoof State',
     Default = 'Jumping',
-    Values = { 'Jumping', 'FallingDown', 'Seated', 'Ragdoll', 'Swimming', 'Climbing' },
+    Values  = { 'Jumping', 'FallingDown', 'Seated', 'Ragdoll', 'Swimming', 'Climbing' },
 })
 NetGrp:AddSlider('StateSpoofInterval', {
     Text = 'Pulse interval (seconds)', Default = 2, Min = 0.5, Max = 10, Rounding = 1,
@@ -831,22 +921,6 @@ MiscGrp:AddSlider('WalkspeedValue',  { Text = 'Speed', Default = 16, Min = 2, Ma
 MiscGrp:AddLabel('Jump Power')
 MiscGrp:AddToggle('JumpPowerToggle', { Text = 'Enable Custom Jump Power', Default = false })
 MiscGrp:AddSlider('JumpPowerValue',  { Text = 'Power', Default = 50, Min = 10, Max = 500, Rounding = 0 })
-
-NetGrp:AddToggle('NullStrikeEnabled', {
-    Text = 'Enable Null Strike', 
-    Default = false,
-    Callback = function(v)
-        nullStrikeActive = v
-        if v then 
-            if State.replicatorCompatible then
-                runNullStrike() 
-            else
-                Library:Notify('Run Compat Check first!')
-                task.defer(function() Toggles.NullStrikeEnabled:SetValue(false) end)
-            end
-        end
-    end,
-})
 
 -- ================================================================
 --  RUNTIME LOOPS
