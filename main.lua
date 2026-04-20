@@ -37,6 +37,7 @@ local Tabs = {
     Aimbot = Window:AddTab('Aimbot'),
     ESP    = Window:AddTab('ESP'),
     Misc   = Window:AddTab('Misc'),
+    Dumper = Window:AddTab('Dumper'),
 }
 
 -- Place-specific tabs added BEFORE UI Settings
@@ -51,6 +52,7 @@ Tabs['UI Settings'] = Window:AddTab('UI Settings')
 load('features/aimbot.lua')(State, Tabs, Services, Library)
 load('features/esp.lua')(State, Tabs, Services, Library)
 load('features/misc.lua')(State, Tabs, Services, Library)
+load('features/dumper.lua')(State, Tabs, Services, Library)
 
 local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
