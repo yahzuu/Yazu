@@ -204,15 +204,18 @@ return function(State, Tabs, Services, Library)
         -- Append to the file with formatted globals
         local outputFile = outputFolder .. "/Environment_Globals.txt"
         for _, item in ipairs(globals) do
+            -- FIX 3: read current content first, then write back with new line appended
+            -- (replaces the unsupported 3-arg writefile append call)
+            local current = ""
+            pcall(function() current = readfile(outputFile) end)
             writefile(
                 outputFile,
-                existing .. 
+                current .. 
                 string.format("%s: %s (%s)\n", 
                     item.Key, 
                     item.Value, 
                     item.Type
-                ),
-                true -- Append mode
+                )
             )
         end
     end
@@ -221,8 +224,10 @@ return function(State, Tabs, Services, Library)
     -- UI SETUP (Integration with your existing tab system)
     -- ================================================================
     
-    local leftBox = Tabs:AddTab("Dumper")
-    local rightBox = Tabs:AddTab("Advanced Dumper")
+    -- FIX 1 & 2: Tabs is a plain table of pre-created tab objects from main.lua.
+    -- Use Tabs.Dumper (already created in main.lua) and add groupboxes to it.
+    local leftBox  = Tabs.Dumper:AddLeftGroupbox("Dumper")
+    local rightBox = Tabs.Dumper:AddRightGroupbox("Advanced Dumper")
 
     leftBox:AddDivider()
     
