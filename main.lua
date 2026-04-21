@@ -23,7 +23,7 @@ local State    = load('core/state.lua')
 local RunService       = Services.RunService
 local UserInputService = Services.UserInputService
 
-local Window = Library:CreateWindow({ Title = 'Yazu 0.012 ', Center = true, AutoShow = true })
+local Window = Library:CreateWindow({ Title = 'Yazu 0.011 ', Center = true, AutoShow = true })
 
 UserInputService.MouseIcon = ''
 RunService.RenderStepped:Connect(function()
@@ -33,17 +33,13 @@ end)
 -- ── 4. Tabs ───────────────────────────────────────────────────
 local placeId = game.PlaceId
 
-local function safeLoad(path)
-    local ok, err = pcall(function()
-        load(path)(State, Tabs, Services, Library)
-    end)
-    if not ok then warn("Failed to load " .. path .. ": " .. tostring(err)) end
-end
+local Tabs = {
+    Aimbot = Window:AddTab('Aimbot'),
+    ESP    = Window:AddTab('ESP'),
+    Misc   = Window:AddTab('Misc'),
+    Dumper = Window:AddTab('Dumper'),
+}
 
-safeLoad('features/aimbot.lua')
-safeLoad('features/esp.lua')
-safeLoad('features/misc.lua')
-safeLoad('features/dumper.lua')
 -- Place-specific tabs added BEFORE UI Settings
 if placeId == 185655149 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
@@ -53,17 +49,28 @@ end
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
 -- ── 5. Features ───────────────────────────────────────────────
-load('features/aimbot.lua')(State, Tabs, Services, Library)
-load('features/esp.lua')(State, Tabs, Services, Library)
-load('features/misc.lua')(State, Tabs, Services, Library)
-load('features/dumper.lua')(State, Tabs, Services, Library)
+-- Each feature is wrapped in pcall so one failing cannot block the others
+
+local function safeLoad(path)
+    local ok, err = pcall(function()
+        load(path)(State, Tabs, Services, Library)
+    end)
+    if not ok then
+        warn('[Yazu] Failed to load ' .. path .. ': ' .. tostring(err))
+    end
+end
+
+safeLoad('features/aimbot.lua')
+safeLoad('features/esp.lua')
+safeLoad('features/misc.lua')
+safeLoad('features/dumper.lua')
 
 local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
 }
 
 if placeFeatures[placeId] then
-    load(placeFeatures[placeId])(State, Tabs, Services, Library)
+    safeLoad(placeFeatures[placeId])
 end
 
 -- ── 6. UI Settings tab ────────────────────────────────────────
