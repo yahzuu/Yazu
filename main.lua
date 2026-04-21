@@ -49,6 +49,20 @@ end
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
 -- ── 5. Features ───────────────────────────────────────────────
+
+local dumperPath = 'features/dumper.lua'
+local success, dumperModule = pcall(function() return load(dumperPath) end)
+
+if success and type(dumperModule) == "function" then
+    -- We pass the exact table 'Tabs' which contains 'Dumper'
+    local ok, err = pcall(function()
+        dumperModule(State, Tabs, Services, Library)
+    end)
+    if not ok then warn("Dumper Init Error: " .. tostring(err)) end
+else
+    warn("Could not load dumper module from " .. dumperPath)
+end
+
 load('features/aimbot.lua')(State, Tabs, Services, Library)
 load('features/esp.lua')(State, Tabs, Services, Library)
 load('features/misc.lua')(State, Tabs, Services, Library)
