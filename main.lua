@@ -33,13 +33,17 @@ end)
 -- ── 4. Tabs ───────────────────────────────────────────────────
 local placeId = game.PlaceId
 
-local Tabs = {
-    Aimbot = Window:AddTab('Aimbot'),
-    ESP    = Window:AddTab('ESP'),
-    Misc   = Window:AddTab('Misc'),
-    Dumper = Window:AddTab('Dumper'),
-}
+local function safeLoad(path)
+    local ok, err = pcall(function()
+        load(path)(State, Tabs, Services, Library)
+    end)
+    if not ok then warn("Failed to load " .. path .. ": " .. tostring(err)) end
+end
 
+safeLoad('features/aimbot.lua')
+safeLoad('features/esp.lua')
+safeLoad('features/misc.lua')
+safeLoad('features/dumper.lua')
 -- Place-specific tabs added BEFORE UI Settings
 if placeId == 185655149 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
