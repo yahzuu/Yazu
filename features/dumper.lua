@@ -1,59 +1,38 @@
--- features/dumper.lua
--- Universal Environment Dumper v3.1 — Linoria UI Integration
--- Compatible with: linoria/lib (Library.lua)
---
--- USAGE (in your main loader script):
---   local Library = loadstring(readfile("Library.lua"))()
---   local Window  = Library:CreateWindow({ Title = "My Script", AutoShow = true })
---   local Tabs    = { Dumper = Window:AddTab("Dumper") }
---   loadstring(readfile("dumper.lua"))(Tabs, Library)
---
--- Arguments:
---   Tabs    — table with a .Dumper key pointing to a Linoria Tab object
---   Library — the Linoria Library instance
+-- ================================================================
+--  features/dumper.lua
+--  Universal Environment Dumper — Yazu / Linoria UI
+--  Called by main.lua as: load('features/dumper.lua')(State, Tabs, Services, Library)
+-- ================================================================
 
 return function(State, Tabs, Services, Library)
 
-    -- ================================================================
-    -- SERVICES
-    -- ================================================================
-    local runService     = game:GetService("RunService")
-    local playersService = game:GetService("Players")
-    local httpService    = game:GetService("HttpService")
-    local localPlayer    = playersService.LocalPlayer
+    -- ── Services (via shared Services table, same as every other feature) ──
+    local RunService  = Services.RunService
+    local Players     = Services.Players
+    local HttpService = Services.HttpService
+    local LocalPlayer = Services.LocalPlayer
 
-    -- ================================================================
-    -- FOLDER SETUP
-    -- ================================================================
-    local logFolder    = "UniversalDumperLogs"
-    local timestamp    = os.time()
-    local outputFolder = string.format("%s/%d", logFolder, timestamp)
-    makefolder(logFolder)
+    -- ── Folder setup ────────────────────────────────────────────────────────
+    local LOG_ROOT     = 'UniversalDumperLogs'
+    local outputFolder = string.format('%s/%d', LOG_ROOT, os.time())
+    makefolder(LOG_ROOT)
     makefolder(outputFolder)
 
-    -- ================================================================
-    -- UTILITY
-    -- ================================================================
-    local function safeCall(func)
-        local ok, err = pcall(func)
-        if not ok then
-            Library:Notify("Dump Error: " .. tostring(err))
-        end
+    -- ── Helpers ─────────────────────────────────────────────────────────────
+    local function safeCall(fn)
+        local ok, err = pcall(fn)
+        if not ok then Library:Notify('Dump error: ' .. tostring(err)) end
         return ok
     end
 
     local function safeRead(path)
         local ok, data = pcall(readfile, path)
-        return (ok and data) or ""
+        return (ok and data) or ''
     end
 
-    -- ================================================================
-    -- REMOTE SPY PATH BUILDER
-    -- ================================================================
     local function getInstancePath(inst)
-        if not inst or inst == game then return "game" end
-        local parts = {}
-        local obj   = inst
+        if not inst or inst == game then return 'game' end
+        local parts, obj = {}, inst
         while obj and obj ~= game do
             table.insert(parts, 1, tostring(obj.Name))
             obj = obj.Parent
@@ -61,597 +40,372 @@ return function(State, Tabs, Services, Library)
         local out = 'game:GetService("' .. parts[1] .. '")'
         for i = 2, #parts do
             local seg = parts[i]
-            if seg:match("[^%w_]") then
-                out = out .. '["' .. seg .. '"]'
-            else
-                out = out .. "." .. seg
-            end
+            out = out .. (seg:match('[^%w_]') and ('["' .. seg .. '"]') or ('.' .. seg))
         end
         return out
     end
 
     -- ================================================================
-    -- SCRIPT SOURCE DUMP
+    --  SCRIPT SOURCE DUMP
     -- ================================================================
     local function dumpScriptSources()
-        local scriptCount = 0
+        local count  = 0
         local chunks = {
-            "-- ============================================================",
-            "-- Universal Script Source Dump",
-            "-- Generated : " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "-- Place ID  : " .. tostring(game.PlaceId),
-            "-- ============================================================",
-            "",
+            '-- Script Source Dump',
+            '-- Generated : ' .. os.date('%Y-%m-%d %H:%M:%S'),
+            '-- Place ID  : ' .. tostring(game.PlaceId),
+            '',
         }
 
-        local function separator(label)
-            table.insert(chunks, string.rep("=", 60))
-            table.insert(chunks, "-- SERVICE: " .. label)
-            table.insert(chunks, string.rep("=", 60))
-            table.insert(chunks, "")
+        local function sep(label)
+            table.insert(chunks, string.rep('=', 60))
+            table.insert(chunks, '-- SERVICE: ' .. label)
+            table.insert(chunks, string.rep('=', 60))
+            table.insert(chunks, '')
         end
 
-        local function processScript(inst, sectionLabel)
-            if not (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script")) then
-                return
-            end
-            scriptCount += 1
-
-            local header = string.format(
-                "-- [%s] %s  (%s)",
-                sectionLabel, inst:GetFullName(), inst.ClassName
-            )
-
+        local function process(inst, label)
+            if not (inst:IsA('LocalScript') or inst:IsA('ModuleScript') or inst:IsA('Script')) then return end
+            count += 1
+            table.insert(chunks, string.format('-- [%s] %s  (%s)', label, inst:GetFullName(), inst.ClassName))
             local src
-            if inst:IsA("Script") then
-                src = "-- ServerScript: source not accessible from client."
+            if inst:IsA('Script') then
+                src = '-- ServerScript: not readable from client.'
             else
-                local ok, result = pcall(function()
-                    if type(decompile) == "function" then
+                local ok, res = pcall(function()
+                    if type(decompile) == 'function' then
                         local d = decompile(inst)
-                        if type(d) == "string" and #d > 0 then return d end
+                        if type(d) == 'string' and #d > 0 then return d end
                     end
                     local s = inst.Source
-                    if type(s) == "string" and #s > 0 then return s end
-                    return nil
+                    if type(s) == 'string' and #s > 0 then return s end
                 end)
-                if ok and result then
-                    src = result
-                else
-                    src = "-- Decompile failed" .. (ok and "" or (": " .. tostring(result)))
-                end
+                src = (ok and res) or '-- Decompile failed'
             end
-
-            table.insert(chunks, header)
             table.insert(chunks, src)
-            table.insert(chunks, "")
-            table.insert(chunks, string.rep("-", 60))
-            table.insert(chunks, "")
-
-            runService.RenderStepped:Wait()
+            table.insert(chunks, string.rep('-', 60))
+            table.insert(chunks, '')
+            RunService.RenderStepped:Wait()
         end
 
-        local serviceTargets = {
-            { "Workspace",         workspace },
-            { "ReplicatedStorage", game:GetService("ReplicatedStorage") },
-            { "ReplicatedFirst",   game:GetService("ReplicatedFirst")   },
-            { "StarterGui",        game:GetService("StarterGui")        },
-            { "StarterPack",       game:GetService("StarterPack")       },
-            { "Players",           playersService                       },
+        local targets = {
+            { 'Workspace',         workspace },
+            { 'ReplicatedStorage', game:GetService('ReplicatedStorage') },
+            { 'ReplicatedFirst',   game:GetService('ReplicatedFirst')   },
+            { 'StarterGui',        game:GetService('StarterGui')        },
+            { 'StarterPack',       game:GetService('StarterPack')       },
+            { 'Players',           Players                              },
         }
 
-        for _, pair in ipairs(serviceTargets) do
-            local label, svc = pair[1], pair[2]
-            separator(label)
-            for _, desc in ipairs(svc:GetDescendants()) do
-                processScript(desc, label)
-            end
+        for _, p in ipairs(targets) do
+            sep(p[1])
+            for _, desc in ipairs(p[2]:GetDescendants()) do process(desc, p[1]) end
         end
 
         pcall(function()
-            local lp = localPlayer
-            local lpTargets = {
-                { "LocalPlayer/Backpack",  lp.Backpack   },
-                { "LocalPlayer/PlayerGui", lp.PlayerGui  },
-                { "LocalPlayer/Character", lp.Character  },
-            }
-            for _, pair in ipairs(lpTargets) do
+            for _, pair in ipairs({
+                { 'LP/Backpack',  LocalPlayer.Backpack  },
+                { 'LP/PlayerGui', LocalPlayer.PlayerGui },
+                { 'LP/Character', LocalPlayer.Character },
+            }) do
                 if pair[2] then
-                    separator(pair[1])
-                    for _, desc in ipairs(pair[2]:GetDescendants()) do
-                        processScript(desc, pair[1])
-                    end
+                    sep(pair[1])
+                    for _, desc in ipairs(pair[2]:GetDescendants()) do process(desc, pair[1]) end
                 end
             end
         end)
 
-        writefile(
-            outputFolder .. "/Script_Source_Dump.lua",
-            table.concat(chunks, "\n")
-        )
-        return scriptCount
+        writefile(outputFolder .. '/Script_Source_Dump.lua', table.concat(chunks, '\n'))
+        return count
     end
 
     local function dumpSingleService(svcName)
         local svc
-        local ok, err = pcall(function()
-            svc = svcName == "Workspace" and workspace or game:GetService(svcName)
+        local ok = pcall(function()
+            svc = svcName == 'Workspace' and workspace or game:GetService(svcName)
         end)
-        if not ok then
-            Library:Notify("Service not found: " .. svcName)
-            return 0
-        end
+        if not ok then Library:Notify('Service not found: ' .. svcName); return 0 end
 
         local count  = 0
-        local chunks = {
-            "-- Script Dump: " .. svcName,
-            "-- Generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "",
-        }
+        local chunks = { '-- Dump: ' .. svcName, '-- ' .. os.date('%Y-%m-%d %H:%M:%S'), '' }
 
         for _, inst in ipairs(svc:GetDescendants()) do
-            if inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script") then
+            if inst:IsA('LocalScript') or inst:IsA('ModuleScript') or inst:IsA('Script') then
                 count += 1
                 local src
-                if inst:IsA("Script") then
-                    src = "-- ServerScript: not decompilable."
+                if inst:IsA('Script') then
+                    src = '-- ServerScript.'
                 else
-                    local srcOk, srcResult = pcall(function()
-                        if type(decompile) == "function" then
+                    local sok, sres = pcall(function()
+                        if type(decompile) == 'function' then
                             local d = decompile(inst)
-                            if type(d) == "string" and #d > 0 then return d end
+                            if type(d) == 'string' and #d > 0 then return d end
                         end
                         local s = inst.Source
-                        if type(s) == "string" and #s > 0 then return s end
-                        return nil
+                        if type(s) == 'string' and #s > 0 then return s end
                     end)
-                    src = (srcOk and srcResult) or "-- Decompile failed"
+                    src = (sok and sres) or '-- Decompile failed'
                 end
-
-                table.insert(chunks, "-- " .. inst:GetFullName() .. "  (" .. inst.ClassName .. ")")
+                table.insert(chunks, '-- ' .. inst:GetFullName() .. '  (' .. inst.ClassName .. ')')
                 table.insert(chunks, src)
-                table.insert(chunks, string.rep("-", 60))
-                table.insert(chunks, "")
-                runService.RenderStepped:Wait()
+                table.insert(chunks, string.rep('-', 60))
+                table.insert(chunks, '')
+                RunService.RenderStepped:Wait()
             end
         end
 
-        writefile(
-            string.format("%s/Dump_%s.lua", outputFolder, svcName),
-            table.concat(chunks, "\n")
-        )
+        writefile(string.format('%s/Dump_%s.lua', outputFolder, svcName), table.concat(chunks, '\n'))
         return count
     end
 
     -- ================================================================
-    -- INSTANCE TREE DUMP
+    --  OTHER DUMPS
     -- ================================================================
-    local function crawlInstance(instance, depth)
-        local result = {
-            Name      = instance.Name,
-            ClassName = instance.ClassName,
-            Children  = {},
-        }
-        if instance:IsA("BasePart") then
-            table.insert(result.Children, { Name = "Position", Value = tostring(instance.Position) })
-        end
-        if depth < 8 then
-            for _, child in ipairs(instance:GetChildren()) do
-                table.insert(result.Children, crawlInstance(child, depth + 1))
-            end
-        end
-        return result
-    end
-
     local function dumpInstanceTree()
-        local instanceData = crawlInstance(game, 0)
-        writefile(
-            outputFolder .. "/Instance_Tree.json",
-            httpService:JSONEncode(instanceData)
-        )
+        local function crawl(inst, depth)
+            local t = { Name = inst.Name, ClassName = inst.ClassName, Children = {} }
+            if depth < 8 then
+                for _, child in ipairs(inst:GetChildren()) do
+                    table.insert(t.Children, crawl(child, depth + 1))
+                end
+            end
+            return t
+        end
+        writefile(outputFolder .. '/Instance_Tree.json', HttpService:JSONEncode(crawl(game, 0)))
     end
 
-    -- ================================================================
-    -- NETWORK METADATA DUMP
-    -- ================================================================
     local function dumpNetworkMetadata()
-        local players     = playersService:GetPlayers()
-        local playerNames = {}
-        for _, p in ipairs(players) do
-            table.insert(playerNames, p.Name)
-        end
-
+        local plrs  = Players:GetPlayers()
+        local names = {}
+        for _, p in ipairs(plrs) do table.insert(names, p.Name) end
         local content = table.concat({
-            "=== Network Metadata ===",
-            "Timestamp : " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "Game ID   : " .. tostring(game.GameId),
-            "Place ID  : " .. tostring(game.PlaceId),
-            "Job ID    : " .. tostring(game.JobId),
-            "Players   : " .. tostring(#players) .. " — [" .. table.concat(playerNames, ", ") .. "]",
-            "",
-        }, "\n")
-
-        writefile(
-            outputFolder .. "/Network_Metadata.txt",
-            safeRead(outputFolder .. "/Network_Metadata.txt") .. content
-        )
+            '=== Network Metadata ===',
+            'Time     : ' .. os.date('%Y-%m-%d %H:%M:%S'),
+            'Game ID  : ' .. tostring(game.GameId),
+            'Place ID : ' .. tostring(game.PlaceId),
+            'Job ID   : ' .. tostring(game.JobId),
+            'Players  : ' .. #plrs .. ' — [' .. table.concat(names, ', ') .. ']',
+            '',
+        }, '\n')
+        writefile(outputFolder .. '/Network_Metadata.txt', safeRead(outputFolder .. '/Network_Metadata.txt') .. content)
     end
 
-    -- ================================================================
-    -- ENVIRONMENT GLOBALS DUMP
-    -- ================================================================
     local function dumpEnvironmentGlobals()
-        local lines = {
-            "=== Environment Globals ===",
-            "Timestamp: " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "",
-        }
+        local lines = { '=== Environment Globals ===', os.date('%Y-%m-%d %H:%M:%S'), '' }
         for k, v in pairs(getgenv()) do
-            table.insert(lines, string.format("%-40s = %-20s  [%s]", tostring(k), tostring(v), typeof(v)))
+            table.insert(lines, string.format('%-40s = %-20s  [%s]', tostring(k), tostring(v), typeof(v)))
         end
-        writefile(
-            outputFolder .. "/Environment_Globals.txt",
-            table.concat(lines, "\n")
-        )
+        writefile(outputFolder .. '/Environment_Globals.txt', table.concat(lines, '\n'))
     end
 
     -- ================================================================
-    -- REMOTE SPY  (__namecall hook)
+    --  REMOTE SPY
     -- ================================================================
-    local remoteSpyActive  = false
+    local spyActive        = false
     local remoteLog        = {}
     local remotesFired     = 0
     local namecallHooked   = false
     local originalNamecall = nil
 
-    local function buildCallScript(object, method, args)
+    local function buildScript(object, method, args)
         local lines = {
-            "-- Captured by UniversalDumper RemoteSpy",
-            "-- Time   : " .. os.date("%H:%M:%S"),
-            "-- Remote : " .. tostring(object.ClassName) .. " @ " .. getInstancePath(object),
-            "",
+            '-- RemoteSpy capture @ ' .. os.date('%H:%M:%S'),
+            '-- ' .. object.ClassName .. ' : ' .. getInstancePath(object),
+            '',
         }
         for i, v in ipairs(args) do
-            local t      = typeof(v)
-            local valStr
-            if     t == "Instance" then valStr = getInstancePath(v)
-            elseif t == "string"   then valStr = string.format("%q", v)
-            elseif t == "Vector3"  then valStr = string.format("Vector3.new(%s)", tostring(v))
-            elseif t == "CFrame"   then valStr = string.format("CFrame.new(%s)", tostring(v))
-            elseif t == "Color3"   then valStr = string.format("Color3.new(%s)", tostring(v))
-            elseif t == "EnumItem" then valStr = "Enum." .. tostring(v.EnumType) .. "." .. tostring(v.Name)
-            elseif t == "table"    then valStr = "{--[[ table ]]}"
-            else                        valStr = tostring(v)
+            local t = typeof(v)
+            local s
+            if     t == 'Instance' then s = getInstancePath(v)
+            elseif t == 'string'   then s = string.format('%q', v)
+            elseif t == 'Vector3'  then s = string.format('Vector3.new(%s)', tostring(v))
+            elseif t == 'CFrame'   then s = string.format('CFrame.new(%s)', tostring(v))
+            elseif t == 'Color3'   then s = string.format('Color3.new(%s)', tostring(v))
+            elseif t == 'EnumItem' then s = 'Enum.' .. tostring(v.EnumType) .. '.' .. tostring(v.Name)
+            elseif t == 'table'    then s = '{--[[table]]}'
+            else                        s = tostring(v)
             end
-            table.insert(lines, string.format("local A_%d = %s", i, valStr))
+            table.insert(lines, string.format('local A_%d = %s', i, s))
         end
         local argList = {}
-        for i = 1, #args do table.insert(argList, "A_" .. i) end
-        table.insert(lines, "local Remote = " .. getInstancePath(object))
-        table.insert(lines, "Remote:" .. method .. "(" .. table.concat(argList, ", ") .. ")")
-        return table.concat(lines, "\n")
+        for i = 1, #args do table.insert(argList, 'A_' .. i) end
+        table.insert(lines, 'local Remote = ' .. getInstancePath(object))
+        table.insert(lines, 'Remote:' .. method .. '(' .. table.concat(argList, ', ') .. ')')
+        return table.concat(lines, '\n')
     end
 
-    local function flushRemoteLog()
+    local function flushLog()
         if #remoteLog == 0 then return end
-        local lines = {
-            "=== Remote Spy Log ===",
-            "Flushed: " .. os.date("%Y-%m-%d %H:%M:%S"),
-            "Total calls: " .. tostring(remotesFired),
-            string.rep("-", 60),
-            "",
-        }
-        for _, entry in ipairs(remoteLog) do
-            table.insert(lines, entry.script)
-            table.insert(lines, string.rep("-", 40))
-            table.insert(lines, "")
+        local lines = { '=== Remote Spy Log ===', 'Flushed: ' .. os.date('%Y-%m-%d %H:%M:%S'), 'Total: ' .. remotesFired, string.rep('-', 60), '' }
+        for _, e in ipairs(remoteLog) do
+            table.insert(lines, e)
+            table.insert(lines, string.rep('-', 40))
+            table.insert(lines, '')
         end
-        writefile(outputFolder .. "/Remote_Log.lua", table.concat(lines, "\n"))
+        writefile(outputFolder .. '/Remote_Log.lua', table.concat(lines, '\n'))
     end
 
     local function hookNamecall()
         if namecallHooked then return true end
-
-        if not getrawmetatable then
-            Library:Notify("RemoteSpy: getrawmetatable() unavailable")
+        if not getrawmetatable or not getnamecallmethod then
+            Library:Notify('RemoteSpy: executor missing getrawmetatable/getnamecallmethod')
             return false
         end
-        if not getnamecallmethod then
-            Library:Notify("RemoteSpy: getnamecallmethod() unavailable")
-            return false
-        end
-
-        local gameMeta = getrawmetatable(game)
-        if not gameMeta then
-            Library:Notify("RemoteSpy: could not get game metatable")
-            return false
-        end
-
-        if setreadonly then
-            setreadonly(gameMeta, false)
-        elseif make_writeable then
-            make_writeable(gameMeta)
-        end
-
-        originalNamecall = gameMeta.__namecall
-
-        local wrapFn = (type(newcclosure) == "function") and newcclosure or function(f) return f end
-
-        gameMeta.__namecall = wrapFn(function(object, ...)
+        local meta = getrawmetatable(game)
+        if not meta then Library:Notify('RemoteSpy: no game metatable'); return false end
+        if setreadonly then setreadonly(meta, false) elseif make_writeable then make_writeable(meta) end
+        originalNamecall = meta.__namecall
+        local wrap = type(newcclosure) == 'function' and newcclosure or function(f) return f end
+        meta.__namecall = wrap(function(obj, ...)
             local method = getnamecallmethod()
-
-            if remoteSpyActive and method
-               and (method == "FireServer" or method == "InvokeServer"
-                    or method == "fireServer" or method == "invokeServer")
-            then
+            if spyActive and method and (method == 'FireServer' or method == 'InvokeServer') then
                 pcall(function()
-                    if object:IsA("RemoteEvent") or object:IsA("RemoteFunction") then
+                    if obj:IsA('RemoteEvent') or obj:IsA('RemoteFunction') then
                         local args = { ... }
-                        while #args > 0 and args[#args] == nil do
-                            args[#args] = nil
-                        end
-
                         remotesFired += 1
-
-                        table.insert(remoteLog, { script = buildCallScript(object, method, args) })
-
-                        if #remoteLog > 300 then
-                            table.remove(remoteLog, 1)
-                        end
-
-                        if remotesFired % 25 == 0 then
-                            flushRemoteLog()
-                        end
-
-                        Library:Notify(string.format(
-                            "[RemoteSpy] #%d  %s:%s",
-                            remotesFired, object.Name, method
-                        ), 3)
+                        table.insert(remoteLog, buildScript(obj, method, args))
+                        if #remoteLog > 300 then table.remove(remoteLog, 1) end
+                        if remotesFired % 25 == 0 then flushLog() end
+                        Library:Notify(string.format('[RemoteSpy] #%d %s:%s', remotesFired, obj.Name, method), 3)
                     end
                 end)
             end
-
-            return originalNamecall(object, ...)
+            return originalNamecall(obj, ...)
         end)
-
         namecallHooked = true
         return true
     end
 
-    local function startRemoteSpy()
-        if remoteSpyActive then
-            Library:Notify("Remote Spy already running")
-            return
-        end
-        if hookNamecall() then
-            remoteSpyActive = true
-            Library:Notify("Remote Spy: ENABLED")
-        end
+    -- ================================================================
+    --  UI — mirrors the exact pattern used in esp.lua / misc.lua
+    -- ================================================================
+    local LeftBox  = Tabs.Dumper:AddLeftGroupbox('Dumper')
+    local RightBox = Tabs.Dumper:AddRightGroupbox('Remote Spy')
+
+    -- ── Left: main dumps ────────────────────────────────────────────
+    LeftBox:AddButton({ Text = 'Full Dump (All Services)', Func = function()
+        safeCall(function()
+            local n = dumpScriptSources()
+            dumpInstanceTree()
+            dumpNetworkMetadata()
+            dumpEnvironmentGlobals()
+            Library:Notify(string.format('Full dump done — %d scripts saved', n))
+        end)
+    end })
+
+    LeftBox:AddButton({ Text = 'Dump Script Sources', Func = function()
+        local n = 0
+        safeCall(function() n = dumpScriptSources() end)
+        Library:Notify(string.format('Script dump done — %d scripts', n))
+    end })
+
+    LeftBox:AddButton({ Text = 'Dump Instance Tree', Func = function()
+        safeCall(dumpInstanceTree)
+        Library:Notify('Instance tree saved → Instance_Tree.json')
+    end })
+
+    LeftBox:AddButton({ Text = 'Dump Network Metadata', Func = function()
+        safeCall(dumpNetworkMetadata)
+        Library:Notify('Network metadata saved')
+    end })
+
+    LeftBox:AddButton({ Text = 'Dump Env Globals', Func = function()
+        safeCall(dumpEnvironmentGlobals)
+        Library:Notify('Env globals saved')
+    end })
+
+    LeftBox:AddButton({ Text = 'Show Output Path', Func = function()
+        Library:Notify(outputFolder)
+    end })
+
+    LeftBox:AddLabel('── By Service ──')
+
+    for _, svc in ipairs({ 'Workspace', 'ReplicatedStorage', 'ReplicatedFirst', 'StarterGui', 'StarterPack', 'Players' }) do
+        LeftBox:AddButton({ Text = 'Dump: ' .. svc, Func = function()
+            local n = 0
+            safeCall(function() n = dumpSingleService(svc) end)
+            Library:Notify(string.format('%s — %d scripts dumped', svc, n))
+        end })
     end
 
-    local function stopRemoteSpy()
-        if not remoteSpyActive then
-            Library:Notify("Remote Spy is not running")
-            return
-        end
-        remoteSpyActive = false
-        flushRemoteLog()
-        Library:Notify(string.format(
-            "Remote Spy: DISABLED — %d calls logged",
-            remotesFired
-        ))
+    LeftBox:AddLabel('── LocalPlayer ──')
+
+    for _, pair in ipairs({
+        { 'Backpack',  function() return LocalPlayer.Backpack  end },
+        { 'PlayerGui', function() return LocalPlayer.PlayerGui end },
+        { 'Character', function() return LocalPlayer.Character end },
+    }) do
+        local name, getter = pair[1], pair[2]
+        LeftBox:AddButton({ Text = 'Dump: LP/' .. name, Func = function()
+            local n = 0
+            local chunks = { '-- LP/' .. name .. ' dump', os.date('%Y-%m-%d %H:%M:%S'), '' }
+            safeCall(function()
+                local container = getter()
+                if not container then Library:Notify(name .. ' not found'); return end
+                for _, inst in ipairs(container:GetDescendants()) do
+                    if inst:IsA('LocalScript') or inst:IsA('ModuleScript') or inst:IsA('Script') then
+                        n += 1
+                        local src
+                        if inst:IsA('Script') then
+                            src = '-- ServerScript'
+                        else
+                            local ok, res = pcall(function()
+                                if type(decompile) == 'function' then
+                                    local d = decompile(inst)
+                                    if type(d) == 'string' and #d > 0 then return d end
+                                end
+                                return inst.Source
+                            end)
+                            src = (ok and res and #res > 0) and res or '-- Decompile failed'
+                        end
+                        table.insert(chunks, '-- ' .. inst:GetFullName())
+                        table.insert(chunks, src)
+                        table.insert(chunks, string.rep('-', 60))
+                        table.insert(chunks, '')
+                        RunService.RenderStepped:Wait()
+                    end
+                end
+                writefile(string.format('%s/Dump_LP_%s.lua', outputFolder, name), table.concat(chunks, '\n'))
+            end)
+            Library:Notify(string.format('LP/%s — %d scripts dumped', name, n))
+        end })
     end
 
-    local function clearRemoteLog()
+    -- ── Right: Remote Spy ────────────────────────────────────────────
+    RightBox:AddLabel('Hooks FireServer / InvokeServer')
+
+    RightBox:AddToggle('DumperRemoteSpy', {
+        Text     = 'Enable Remote Spy',
+        Default  = false,
+        Callback = function(val)
+            if val then
+                if hookNamecall() then
+                    spyActive = true
+                    Library:Notify('Remote Spy: ON')
+                else
+                    Toggles.DumperRemoteSpy:SetValue(false)
+                end
+            else
+                spyActive = false
+                flushLog()
+                Library:Notify(string.format('Remote Spy: OFF — %d calls logged', remotesFired))
+            end
+        end,
+    })
+
+    RightBox:AddButton({ Text = 'Flush Log Now', Func = function()
+        flushLog()
+        Library:Notify(string.format('Flushed %d entries', #remoteLog))
+    end })
+
+    RightBox:AddButton({ Text = 'Clear Log', Func = function()
         remoteLog    = {}
         remotesFired = 0
-        Library:Notify("Remote log cleared")
-    end
+        Library:Notify('Remote log cleared')
+    end })
 
-    -- ================================================================
-    -- UI — LEFT GROUPBOX: Dumper
-    -- All Linoria API calls verified against Library.lua:
-    --   :AddLeftGroupbox(name)  → Groupbox
-    --   :AddButton({ Text, Func, Tooltip? })
-    --   :AddLabel(text)
-    -- ================================================================
-    local leftBox = Tabs.Dumper:AddLeftGroupbox("Dumper")
+    RightBox:AddButton({ Text = 'Show Call Count', Func = function()
+        Library:Notify(string.format('Fired: %d  Buffered: %d', remotesFired, #remoteLog))
+    end })
 
-    -- Main dump actions
-    leftBox:AddButton({
-        Text = "Full Dump (All Services)",
-        Func = function()
-            safeCall(function()
-                local count = dumpScriptSources()
-                dumpInstanceTree()
-                dumpNetworkMetadata()
-                dumpEnvironmentGlobals()
-                Library:Notify(string.format(
-                    "Full dump done — %d scripts → %s", count, outputFolder
-                ))
-            end)
-        end,
-    })
-
-    leftBox:AddButton({
-        Text    = "Dump Script Sources (all in one file)",
-        Func    = function()
-            local count = 0
-            safeCall(function() count = dumpScriptSources() end)
-            Library:Notify(string.format("Script dump done — %d scripts", count))
-        end,
-    })
-
-    leftBox:AddButton({
-        Text = "Dump Instance Tree",
-        Func = function()
-            safeCall(dumpInstanceTree)
-            Library:Notify("Instance tree → Instance_Tree.json")
-        end,
-    })
-
-    leftBox:AddButton({
-        Text = "Dump Network Metadata",
-        Func = function()
-            safeCall(dumpNetworkMetadata)
-            Library:Notify("Network metadata saved")
-        end,
-    })
-
-    leftBox:AddButton({
-        Text = "Dump Env Globals",
-        Func = function()
-            safeCall(dumpEnvironmentGlobals)
-            Library:Notify("Env globals saved")
-        end,
-    })
-
-    leftBox:AddButton({
-        Text = "Show Log Folder Path",
-        Func = function()
-            Library:Notify("Logs: " .. outputFolder)
-        end,
-    })
-
-    -- Per-service dumps
-    leftBox:AddLabel("── Dump by Service ──")
-
-    local serviceList = {
-        "Workspace",
-        "ReplicatedStorage",
-        "ReplicatedFirst",
-        "StarterGui",
-        "StarterPack",
-        "Players",
-    }
-
-    for _, svcName in ipairs(serviceList) do
-        leftBox:AddButton({
-            Text = "Dump: " .. svcName,
-            Func = function()
-                local count = 0
-                safeCall(function() count = dumpSingleService(svcName) end)
-                Library:Notify(string.format(
-                    "Dumped %s — %d scripts", svcName, count
-                ))
-            end,
-        })
-    end
-
-    -- LocalPlayer dumps
-    leftBox:AddLabel("── LocalPlayer ──")
-
-    local lpTargets = {
-        { "Backpack",  function() return localPlayer.Backpack  end },
-        { "PlayerGui", function() return localPlayer.PlayerGui end },
-        { "Character", function() return localPlayer.Character end },
-    }
-
-    for _, pair in ipairs(lpTargets) do
-        local label, getContainer = pair[1], pair[2]
-        leftBox:AddButton({
-            Text = "Dump: LP/" .. label,
-            Func = function()
-                local count  = 0
-                local chunks = {
-                    "-- Dump: LocalPlayer/" .. label,
-                    "-- Generated: " .. os.date("%Y-%m-%d %H:%M:%S"),
-                    "",
-                }
-                safeCall(function()
-                    local container = getContainer()
-                    if not container then
-                        Library:Notify(label .. " not found")
-                        return
-                    end
-                    for _, inst in ipairs(container:GetDescendants()) do
-                        if inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script") then
-                            count += 1
-                            local src
-                            if inst:IsA("Script") then
-                                src = "-- ServerScript"
-                            else
-                                local ok, res = pcall(function()
-                                    if type(decompile) == "function" then
-                                        local d = decompile(inst)
-                                        if type(d) == "string" and #d > 0 then return d end
-                                    end
-                                    return inst.Source
-                                end)
-                                src = (ok and res and #res > 0) and res or "-- Decompile failed"
-                            end
-                            table.insert(chunks, "-- " .. inst:GetFullName())
-                            table.insert(chunks, src)
-                            table.insert(chunks, string.rep("-", 60))
-                            table.insert(chunks, "")
-                            runService.RenderStepped:Wait()
-                        end
-                    end
-                    writefile(
-                        string.format("%s/Dump_LP_%s.lua", outputFolder, label),
-                        table.concat(chunks, "\n")
-                    )
-                end)
-                Library:Notify(string.format("Dumped LP/%s — %d scripts", label, count))
-            end,
-        })
-    end
-
-    -- ================================================================
-    -- UI — RIGHT GROUPBOX: Remote Spy
-    -- ================================================================
-    local rightBox = Tabs.Dumper:AddRightGroupbox("Remote Spy")
-
-    rightBox:AddLabel("Hooks FireServer / InvokeServer")
-    rightBox:AddLabel("via __namecall intercept")
-
-    rightBox:AddButton({
-        Text = "Enable Remote Spy",
-        Func = startRemoteSpy,
-    })
-
-    rightBox:AddButton({
-        Text = "Disable + Save Log",
-        Func = stopRemoteSpy,
-    })
-
-    rightBox:AddButton({
-        Text = "Flush Log Now",
-        Func = function()
-            flushRemoteLog()
-            Library:Notify(string.format(
-                "Flushed %d entries → Remote_Log.lua", #remoteLog
-            ))
-        end,
-    })
-
-    rightBox:AddButton({
-        Text = "Clear Remote Log",
-        Func = clearRemoteLog,
-    })
-
-    rightBox:AddButton({
-        Text = "Show Remote Count",
-        Func = function()
-            Library:Notify(string.format(
-                "Remotes fired: %d (buffered: %d)",
-                remotesFired, #remoteLog
-            ))
-        end,
-    })
-
-    -- ================================================================
-    -- PUBLIC API (optional — lets caller access internals)
-    -- ================================================================
-    return {
-        dumpScriptSources      = dumpScriptSources,
-        dumpSingleService      = dumpSingleService,
-        dumpInstanceTree       = dumpInstanceTree,
-        dumpNetworkMetadata    = dumpNetworkMetadata,
-        dumpEnvironmentGlobals = dumpEnvironmentGlobals,
-        startRemoteSpy         = startRemoteSpy,
-        stopRemoteSpy          = stopRemoteSpy,
-        flushRemoteLog         = flushRemoteLog,
-        clearRemoteLog         = clearRemoteLog,
-    }
 end
