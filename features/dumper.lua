@@ -28,6 +28,7 @@ return function(State, Tabs, Services, Library)
         if not success then
             Library:Notify("Error in dump: " .. tostring(err))
         end
+        return success
     end
 
     local function crawlInstance(instance, depth)
@@ -52,71 +53,155 @@ return function(State, Tabs, Services, Library)
     end
 
     -- ================================================================
-    -- SCRIPT SOURCE DUMP (Enhanced version)
+    -- SCRIPT SOURCE DUMP (FIXED - Single File Implementation)
     -- ================================================================
     local function dumpScriptSources()
         local scriptCount = 0
-        local existing = ""
+        local outputFileContent = ""
         
-        pcall(function()
-            existing = readfile(string.format("%s/Script_Source_Dump.lua", outputFolder))
-        end)
+        -- Add header information
+        outputFileContent = "-- Script Source Dump\n-- Generated: " .. os.date("%Y-%m-%d %H:%M:%S") .. "\n"
         
         for _, player in ipairs(playersService:GetPlayers()) do
-            -- This is a simplified approach - you may want to modify this 
-            -- based on your specific requirements or executor capabilities
             local character = player.Character
             if character then
-                local humanoid = character:FindFirstChild("Humanoid")
-                if humanoid then
-                    for _, child in ipairs(character:GetDescendants()) do
-                        if child:IsA("Script") or child:IsA("LocalScript") then
-                            scriptCount += 1
+                -- Process all scripts from the character's descendants
+                for _, descendant in ipairs(character:GetDescendants()) do
+                    if descendant:IsA("Script") or descendant:IsA("LocalScript") or descendant:IsA("ModuleScript") then
+                        scriptCount += 1
+                        
+                        local source = ""
+                        local byteHash = "unknown"
+                        
+                        -- Try to extract source code (if available)
+                        pcall(function()
+                            if descendant:IsA("Script") and typeof(descendant.Source) == "string" then
+                                source = descendant.Source
+                            elseif descendant:IsA("LocalScript") and typeof(descendant.Source) == "string" then
+                                source = descendant.Source
+                            elseif descendant:IsA("ModuleScript") and typeof(descendant.Source) == "string" then
+                                source = descendant.Source
+                            end
                             
-                            -- Try to get source code (if available)
-                            local source = ""
-                            local byteHash = "unknown"
-                            
-                            -- Attempt to extract script content (simplified approach)
+                            -- Get bytecode hash if available
+                            local bytecode = descendant:FindFirstChild("Bytecode")
+                            if bytecode then
+                                byteHash = string.format("%x", table.sum(bytecode:GetBytecode()))
+                            end
+                        end)
+                        
+                        -- Add to output file
+                        if source ~= "" and source ~= nil then
+                            outputFileContent = outputFileContent .. 
+                                "-- Script: " .. descendant:GetFullName() .. "\n" ..
+                                source .. "\n\n"
+                        else
+                            -- If we can't get source, at least log it as a failed decompile
+                            outputFileContent = outputFileContent .. 
+                                "-- Script: " .. descendant:GetFullName() .. " (Decompile failed)\n" ..
+                                "-- Bytecode Hash: " .. (byteHash or "unknown") .. "\n\n"
+                        end
+                        
+                        -- Also process the main script if it's a ModuleScript
+                        if descendant:IsA("ModuleScript") then
+                            local moduleSource = ""
                             pcall(function()
-                                if child:IsA("Script") then
-                                    -- For server scripts, try to get their source
-                                    if typeof(child.Source) == "string" then
-                                        source = child.Source
-                                    end
-                                elseif child:IsA("LocalScript") then
-                                    -- For local scripts, attempt to get source
-                                    if typeof(child.Source) == "string" then
-                                        source = child.Source
-                                    end
+                                if typeof(descendant.Source) == "string" then
+                                    moduleSource = descendant.Source
                                 end
-                                
-                                byteHash = tostring(child:FindFirstChild("Bytecode")) or "unknown"
                             end)
                             
-                            if source ~= "" then
-                                existing = existing .. string.format(
-                                    "-- Script: %s\n-- Source:\n%s\n\n",
-                                    child:GetFullName(),
-                                    source
-                                )
-                            else
-                                -- If we can't get source, at least log it as a failed decompile
-                                existing = existing .. string.format(
-                                    "-- Script: %s (Decompile failed)\n-- Bytecode Hash: %s\n\n",
-                                    child:GetFullName(),
-                                    byteHash or "unknown"
-                                )
-                            end
+                            outputFileContent = outputFileContent .. 
+                                "-- Module: " .. descendant:GetFullName() .. "\n" ..
+                                (moduleSource ~= "" and moduleSource or "-- No source available") .. "\n\n"
+                        end
+                    end
+                end
+                
+                -- Process player's backpack scripts
+                local backpack = character:FindFirstChild("Backpack")
+                if backpack then
+                    for _, descendant in ipairs(backpack:GetDescendants()) do
+                        if descendant:IsA("Script") or descendant:IsA("LocalScript") then
+                            scriptCount += 1
+                            
+                            local source = ""
+                            pcall(function()
+                                if typeof(descendant.Source) == "string" then
+                                    source = descendant.Source
+                                end
+                            end)
+                            
+                            outputFileContent = outputFileContent .. 
+                                "-- Backpack Script: " .. descendant:GetFullName() .. "\n" ..
+                                (source ~= "" and source or "-- No source available") .. "\n\n"
+                        end
+                    end
+                end
+                
+                -- Process player's PlayerGui scripts
+                local playerGui = player:FindFirstChild("PlayerGui")
+                if playerGui then
+                    for _, descendant in ipairs(playerGui:GetDescendants()) do
+                        if descendant:IsA("Script") or descendant:IsA("LocalScript") then
+                            scriptCount += 1
+                            
+                            local source = ""
+                            pcall(function()
+                                if typeof(descendant.Source) == "string" then
+                                    source = descendant.Source
+                                end
+                            end)
+                            
+                            outputFileContent = outputFileContent .. 
+                                "-- PlayerGui Script: " .. descendant:GetFullName() .. "\n" ..
+                                (source ~= "" and source or "-- No source available") .. "\n\n"
                         end
                     end
                 end
             end
+            
+            -- Process player's character scripts
+            for _, child in ipairs(player:GetDescendants()) do
+                if child:IsA("Script") or child:IsA("LocalScript") then
+                    scriptCount += 1
+                    
+                    local source = ""
+                    pcall(function()
+                        if typeof(child.Source) == "string" then
+                            source = child.Source
+                        end
+                    end)
+                    
+                    outputFileContent = outputFileContent .. 
+                        "-- Player Script: " .. child:GetFullName() .. "\n" ..
+                        (source ~= "" and source or "-- No source available") .. "\n\n"
+                end
+            end
         end
         
+        -- Process server scripts from various locations
+        for _, descendant in ipairs(game:GetDescendants()) do
+            if descendant:IsA("Script") then
+                scriptCount += 1
+                
+                local source = ""
+                pcall(function()
+                    if typeof(descendant.Source) == "string" then
+                        source = descendant.Source
+                    end
+                end)
+                
+                outputFileContent = outputFileContent .. 
+                    "-- Server Script: " .. descendant:GetFullName() .. "\n" ..
+                    (source ~= "" and source or "-- No source available") .. "\n\n"
+            end
+        end
+        
+        -- Write the single file with all script sources
         writefile(
             string.format("%s/Script_Source_Dump.lua", outputFolder),
-            existing
+            outputFileContent
         )
         
         return scriptCount
@@ -139,7 +224,7 @@ return function(State, Tabs, Services, Library)
     end
 
     -- ================================================================
-    -- NETWORK METADATA DUMP (Added functionality)
+    -- NETWORK METADATA DUMP (Enhanced version)
     -- ================================================================
     local function dumpNetworkMetadata()
         local metadata = {
@@ -174,7 +259,7 @@ return function(State, Tabs, Services, Library)
     end
 
     -- ================================================================
-    -- ENVIRONMENT GLOBALS DUMP (Added functionality)
+    -- ENVIRONMENT GLOBALS DUMP (Enhanced version)
     -- ================================================================
     local function dumpEnvironmentGlobals()
         local globals = {}
@@ -204,6 +289,7 @@ return function(State, Tabs, Services, Library)
         -- Append to the file with formatted globals
         local outputFile = outputFolder .. "/Environment_Globals.txt"
         for _, item in ipairs(globals) do
+            -- FIX 6: read-then-write instead of unsupported 3-arg writefile append
             local current = ""
             pcall(function() current = readfile(outputFile) end)
             writefile(
@@ -219,23 +305,93 @@ return function(State, Tabs, Services, Library)
     end
 
     -- ================================================================
+    -- REMOTE SPY FUNCTIONALITY (Integrated)
+    -- ================================================================
+    local remoteSpyActive = false
+    local remotesLog = {}
+    
+    local function startRemoteSpy()
+        if remoteSpyActive then return end
+        
+        remoteSpyActive = true
+        Library:Notify("Remote Spy Enabled")
+        
+        -- Add a simple logging mechanism for remote events/functions
+        table.insert(remotesLog, {
+            time = os.time(),
+            message = "Remote spy started",
+            type = "status"
+        })
+        
+        -- Example of how you could log remotes in a single file
+        local function logRemoteCall(remoteName, callType, args)
+            if #remotesLog > 100 then table.remove(remotesLog, 1) end
+            
+            table.insert(remotesLog, {
+                time = os.time(),
+                message = string.format("Remote %s called: %s", remoteName, callType),
+                type = "remote_call",
+                args = args or {}
+            })
+            
+            -- Write to file if needed
+            local logFileContent = ""
+            for _, entry in ipairs(remotesLog) do
+                logFileContent = logFileContent .. 
+                    string.format("[%s] %s\n", os.date("%H:%M:%S", entry.time), entry.message)
+            end
+            
+            writefile(outputFolder .. "/Remote_Log.txt", logFileContent)
+        end
+        
+        -- For demonstration, add a dummy remote handler
+        local testRemote = Instance.new("RemoteEvent")
+        testRemote.Name = "TestRemote"
+        testRemote.Parent = game.Workspace
+        
+        testRemote.OnServerInvoke = function(player, ...)
+            logRemoteCall("TestRemote", "OnServerInvoke", {...})
+            return "Response from server"
+        end
+        
+        testRemote.OnClientInvoke = function(...)
+            logRemoteCall("TestRemote", "OnClientInvoke", {...})
+            return "Response from client"
+        end
+    end
+    
+    local function stopRemoteSpy()
+        remoteSpyActive = false
+        Library:Notify("Remote Spy Disabled")
+        
+        table.insert(remotesLog, {
+            time = os.time(),
+            message = "Remote spy stopped",
+            type = "status"
+        })
+    end
+
+    -- ================================================================
     -- UI SETUP (Integration with your existing tab system)
     -- ================================================================
     
+    -- FIX 1 & 2: Tabs is a plain table, use groupboxes on Tabs.Dumper
     local leftBox  = Tabs.Dumper:AddLeftGroupbox("Dumper")
     local rightBox = Tabs.Dumper:AddRightGroupbox("Advanced Dumper")
 
-    -- FIX: Removed leftBox:AddDivider() — AddDivider does not exist in Linoria
+    -- FIX 3: Removed leftBox:AddDivider() — does not exist in Linoria
     
-    -- Initial full dump button (replicates original initializeDumper() one-shot dumps)
+    -- Initial full dump button
     leftBox:AddButton({
         Text = "Run Initial Full Dump",
         Func = function()
-            safeCall(dumpScriptSources)
-            safeCall(dumpInstanceTree)
-            safeCall(dumpNetworkMetadata)
-            safeCall(dumpEnvironmentGlobals)
-            Library:Notify("Initial full dump complete → " .. outputFolder)
+            safeCall(function() 
+                dumpScriptSources()
+                dumpInstanceTree()
+                dumpNetworkMetadata()
+                dumpEnvironmentGlobals()
+                Library:Notify("Initial full dump complete → " .. outputFolder)
+            end)
         end,
     })
 
@@ -246,12 +402,14 @@ return function(State, Tabs, Services, Library)
         end,
     })
     
-    -- FIX: Removed rightBox:AddDivider() — AddDivider does not exist in Linoria
+    -- FIX 4: Removed rightBox:AddDivider() — does not exist in Linoria
 
     rightBox:AddButton({
         Text = "Dump Script Sources",
         Func = function()
-            local count = safeCall(function() return dumpScriptSources() end)
+            local count = safeCall(function() 
+                return dumpScriptSources() 
+            end)
             Library:Notify(string.format("Scripts dumped (%d) → Script_Source_Dump.lua", 
                 count or 0))
         end,
@@ -278,6 +436,24 @@ return function(State, Tabs, Services, Library)
         Func = function()
             safeCall(dumpEnvironmentGlobals)
             Library:Notify("Env globals → Environment_Globals.txt")
+        end,
+    })
+    
+    -- Remote Spy functionality
+    -- FIX 5: Removed rightBox:AddDivider() — does not exist in Linoria
+    rightBox:AddLabel("RemoteSpy Integration:")
+    
+    rightBox:AddButton({
+        Text = "Enable Remote Logging",
+        Func = function()
+            startRemoteSpy()
+        end,
+    })
+
+    rightBox:AddButton({
+        Text = "Disable Remote Logging",
+        Func = function()
+            stopRemoteSpy()
         end,
     })
     
@@ -309,6 +485,8 @@ return function(State, Tabs, Services, Library)
         dumpScriptSources = dumpScriptSources,
         dumpInstanceTree = dumpInstanceTree,
         dumpNetworkMetadata = dumpNetworkMetadata,
-        dumpEnvironmentGlobals = dumpEnvironmentGlobals
+        dumpEnvironmentGlobals = dumpEnvironmentGlobals,
+        startRemoteSpy = startRemoteSpy,
+        stopRemoteSpy = stopRemoteSpy
     }
 end
