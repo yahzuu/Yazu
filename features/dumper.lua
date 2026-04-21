@@ -484,12 +484,13 @@ return function(State, Tabs, Services, Library)
     end
 
     -- ================================================================
-    -- UI  — LEFT GROUPBOX: Main Dumps
+    -- UI  — LEFT GROUPBOX: Dumper  (one per tab — Linoria requirement)
     -- ================================================================
     local leftBox = Tabs.Dumper:AddLeftGroupbox("Dumper")
 
+    -- ── Main dumps ──────────────────────────────────────────────────
     leftBox:AddButton({
-        Text = "Full Dump  (All Services)",
+        Text = "Full Dump (All Services)",
         Func = function()
             safeCall(function()
                 local count = dumpScriptSources()
@@ -504,7 +505,7 @@ return function(State, Tabs, Services, Library)
     })
 
     leftBox:AddButton({
-        Text = "Dump Script Sources  (single file)",
+        Text = "Dump Script Sources (single file)",
         Func = function()
             local count = 0
             safeCall(function() count = dumpScriptSources() end)
@@ -543,10 +544,8 @@ return function(State, Tabs, Services, Library)
         end,
     })
 
-    -- ================================================================
-    -- UI  — LEFT GROUPBOX: Per-Service Script Dump (Dev Decompiler style)
-    -- ================================================================
-    local serviceBox = Tabs.Dumper:AddLeftGroupbox("Dump by Service")
+    -- ── Per-service script dumps (Dev Decompiler style) ─────────────
+    leftBox:AddLabel("Dump by Service:")
 
     local serviceList = {
         "Workspace",
@@ -558,7 +557,7 @@ return function(State, Tabs, Services, Library)
     }
 
     for _, svcName in ipairs(serviceList) do
-        serviceBox:AddButton({
+        leftBox:AddButton({
             Text = "Dump: " .. svcName,
             Func = function()
                 local count = 0
@@ -571,52 +570,8 @@ return function(State, Tabs, Services, Library)
         })
     end
 
-    -- ================================================================
-    -- UI  — RIGHT GROUPBOX: Remote Spy
-    -- ================================================================
-    local spyBox = Tabs.Dumper:AddRightGroupbox("Remote Spy")
-
-    spyBox:AddLabel("Hooks FireServer / InvokeServer via __namecall")
-
-    spyBox:AddButton({
-        Text = "Enable Remote Spy",
-        Func = startRemoteSpy,
-    })
-
-    spyBox:AddButton({
-        Text = "Disable + Save Log",
-        Func = stopRemoteSpy,
-    })
-
-    spyBox:AddButton({
-        Text = "Flush Log Now",
-        Func = function()
-            flushRemoteLog()
-            Library:Notify(string.format(
-                "Flushed %d entries → Remote_Log.lua", #remoteLog
-            ))
-        end,
-    })
-
-    spyBox:AddButton({
-        Text = "Clear Remote Log",
-        Func = clearRemoteLog,
-    })
-
-    spyBox:AddButton({
-        Text = "Show Remote Count",
-        Func = function()
-            Library:Notify(string.format(
-                "Remotes fired this session: %d (buffered: %d)",
-                remotesFired, #remoteLog
-            ))
-        end,
-    })
-
-    -- ================================================================
-    -- UI  — RIGHT GROUPBOX: LocalPlayer dumps
-    -- ================================================================
-    local lpBox = Tabs.Dumper:AddRightGroupbox("LocalPlayer Dumps")
+    -- ── LocalPlayer dumps ────────────────────────────────────────────
+    leftBox:AddLabel("LocalPlayer Dumps:")
 
     local lpTargets = {
         { "Backpack",  function() return localPlayer.Backpack  end },
@@ -626,8 +581,8 @@ return function(State, Tabs, Services, Library)
 
     for _, pair in ipairs(lpTargets) do
         local label, getContainer = pair[1], pair[2]
-        lpBox:AddButton({
-            Text = "Dump: LocalPlayer/" .. label,
+        leftBox:AddButton({
+            Text = "Dump: LP/" .. label,
             Func = function()
                 local count  = 0
                 local chunks = {
@@ -673,6 +628,48 @@ return function(State, Tabs, Services, Library)
             end,
         })
     end
+
+    -- ================================================================
+    -- UI  — RIGHT GROUPBOX: Remote Spy  (one per tab — Linoria requirement)
+    -- ================================================================
+    local rightBox = Tabs.Dumper:AddRightGroupbox("Remote Spy")
+
+    rightBox:AddLabel("Hooks FireServer / InvokeServer via __namecall")
+
+    rightBox:AddButton({
+        Text = "Enable Remote Spy",
+        Func = startRemoteSpy,
+    })
+
+    rightBox:AddButton({
+        Text = "Disable + Save Log",
+        Func = stopRemoteSpy,
+    })
+
+    rightBox:AddButton({
+        Text = "Flush Log Now",
+        Func = function()
+            flushRemoteLog()
+            Library:Notify(string.format(
+                "Flushed %d entries → Remote_Log.lua", #remoteLog
+            ))
+        end,
+    })
+
+    rightBox:AddButton({
+        Text = "Clear Remote Log",
+        Func = clearRemoteLog,
+    })
+
+    rightBox:AddButton({
+        Text = "Show Remote Count",
+        Func = function()
+            Library:Notify(string.format(
+                "Remotes fired this session: %d (buffered: %d)",
+                remotesFired, #remoteLog
+            ))
+        end,
+    })
 
     -- ================================================================
     -- PUBLIC API
