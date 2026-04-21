@@ -12,7 +12,7 @@
 --   Tabs    — table with a .Dumper key pointing to a Linoria Tab object
 --   Library — the Linoria Library instance
 
-return function(Tabs, Library)
+return function(State, Tabs, Services, Library)
 
     -- ================================================================
     -- SERVICES
