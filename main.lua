@@ -23,7 +23,7 @@ local State    = load('core/state.lua')
 local RunService       = Services.RunService
 local UserInputService = Services.UserInputService
 
-local Window = Library:CreateWindow({ Title = 'Yazu', Center = true, AutoShow = true })
+local Window = Library:CreateWindow({ Title = 'Yazu 0.1 ', Center = true, AutoShow = true })
 
 UserInputService.MouseIcon = ''
 RunService.RenderStepped:Connect(function()
