@@ -16,12 +16,24 @@ return function(State, Tabs, Services, Library)
 
     -- ================================================================
     -- FOLDER SETUP
+    -- Wrapped in pcall so a missing makefolder() does not crash the
+    -- entire feature and leave the Dumper tab empty.
     -- ================================================================
     local logFolder    = "UniversalDumperLogs"
     local timestamp    = os.time()
     local outputFolder = string.format("%s/%d", logFolder, timestamp)
-    makefolder(logFolder)
-    makefolder(outputFolder)
+    local filesystemOk = false
+
+    local folderOk, folderErr = pcall(function()
+        makefolder(logFolder)
+        makefolder(outputFolder)
+    end)
+
+    if folderOk then
+        filesystemOk = true
+    else
+        warn("[Dumper] Filesystem not available — file output disabled. Error: " .. tostring(folderErr))
+    end
 
     -- ================================================================
     -- UTILITY
@@ -40,6 +52,19 @@ return function(State, Tabs, Services, Library)
         return (ok and data) or ""
     end
 
+    -- Safely write a file — does nothing if filesystem is unavailable
+    local function safeWrite(path, content)
+        if not filesystemOk then
+            Library:Notify("File write skipped — filesystem not supported by this executor")
+            return false
+        end
+        local ok, err = pcall(writefile, path, content)
+        if not ok then
+            Library:Notify("Write error: " .. tostring(err))
+        end
+        return ok
+    end
+
     -- ================================================================
     -- REMOTE SPY PATH BUILDER (used by both spy and script dump)
     -- ================================================================
@@ -51,8 +76,18 @@ return function(State, Tabs, Services, Library)
             table.insert(parts, 1, tostring(obj.Name))
             obj = obj.Parent
         end
-        -- Wrap segments that have special characters
-        local out = 'game:GetService("' .. parts[1] .. '")'
+
+        -- Check whether parts[1] is actually a valid service name
+        -- before using GetService(), to avoid generating broken paths
+        local firstSegment
+        local isService = pcall(function() game:GetService(parts[1]) end)
+        if isService then
+            firstSegment = 'game:GetService("' .. parts[1] .. '")'
+        else
+            firstSegment = 'game["' .. parts[1] .. '"]'
+        end
+
+        local out = firstSegment
         for i = 2, #parts do
             local seg = parts[i]
             if seg:match("[^%w_]") then
@@ -94,7 +129,7 @@ return function(State, Tabs, Services, Library)
             if not (inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script")) then
                 return
             end
-            scriptCount += 1
+            scriptCount = scriptCount + 1
 
             local header = string.format(
                 "-- [%s] %s  (%s)",
@@ -174,7 +209,7 @@ return function(State, Tabs, Services, Library)
             end
         end)
 
-        writefile(
+        safeWrite(
             outputFolder .. "/Script_Source_Dump.lua",
             table.concat(chunks, "\n")
         )
@@ -205,7 +240,7 @@ return function(State, Tabs, Services, Library)
 
         for _, inst in ipairs(svc:GetDescendants()) do
             if inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script") then
-                count += 1
+                count = count + 1
                 local src
 
                 if inst:IsA("Script") then
@@ -231,7 +266,7 @@ return function(State, Tabs, Services, Library)
             end
         end
 
-        writefile(
+        safeWrite(
             string.format("%s/Dump_%s.lua", outputFolder, svcName),
             table.concat(chunks, "\n")
         )
@@ -260,7 +295,7 @@ return function(State, Tabs, Services, Library)
 
     local function dumpInstanceTree()
         local instanceData = crawlInstance(game, 0)
-        writefile(
+        safeWrite(
             outputFolder .. "/Instance_Tree.json",
             httpService:JSONEncode(instanceData)
         )
@@ -286,7 +321,7 @@ return function(State, Tabs, Services, Library)
             "",
         }, "\n")
 
-        writefile(
+        safeWrite(
             outputFolder .. "/Network_Metadata.txt",
             safeRead(outputFolder .. "/Network_Metadata.txt") .. content
         )
@@ -294,8 +329,15 @@ return function(State, Tabs, Services, Library)
 
     -- ================================================================
     -- ENVIRONMENT GLOBALS DUMP
+    -- Checks for getgenv() support before attempting to call it,
+    -- so this button works on all executors without crashing.
     -- ================================================================
     local function dumpEnvironmentGlobals()
+        if type(getgenv) ~= "function" then
+            Library:Notify("Env dump: getgenv() is not supported by this executor")
+            return
+        end
+
         local lines = {
             "=== Environment Globals ===",
             "Timestamp: " .. os.date("%Y-%m-%d %H:%M:%S"),
@@ -304,7 +346,7 @@ return function(State, Tabs, Services, Library)
         for k, v in pairs(getgenv()) do
             table.insert(lines, string.format("%-40s = %-20s  [%s]", tostring(k), tostring(v), typeof(v)))
         end
-        writefile(
+        safeWrite(
             outputFolder .. "/Environment_Globals.txt",
             table.concat(lines, "\n")
         )
@@ -371,7 +413,7 @@ return function(State, Tabs, Services, Library)
             table.insert(lines, string.rep("-", 40))
             table.insert(lines, "")
         end
-        writefile(outputFolder .. "/Remote_Log.lua", table.concat(lines, "\n"))
+        safeWrite(outputFolder .. "/Remote_Log.lua", table.concat(lines, "\n"))
     end
 
     local function hookNamecall()
@@ -421,7 +463,7 @@ return function(State, Tabs, Services, Library)
                             args[#args] = nil
                         end
 
-                        remotesFired += 1
+                        remotesFired = remotesFired + 1
 
                         local entry = {
                             script = buildCallScript(object, method, args),
@@ -478,7 +520,7 @@ return function(State, Tabs, Services, Library)
     end
 
     local function clearRemoteLog()
-        remoteLog   = {}
+        remoteLog    = {}
         remotesFired = 0
         Library:Notify("Remote log cleared")
     end
@@ -598,7 +640,7 @@ return function(State, Tabs, Services, Library)
                     end
                     for _, inst in ipairs(container:GetDescendants()) do
                         if inst:IsA("LocalScript") or inst:IsA("ModuleScript") or inst:IsA("Script") then
-                            count += 1
+                            count = count + 1
                             local src
                             if inst:IsA("Script") then
                                 src = "-- ServerScript"
@@ -619,7 +661,7 @@ return function(State, Tabs, Services, Library)
                             runService.RenderStepped:Wait()
                         end
                     end
-                    writefile(
+                    safeWrite(
                         string.format("%s/Dump_LP_%s.lua", outputFolder, label),
                         table.concat(chunks, "\n")
                     )
@@ -675,14 +717,14 @@ return function(State, Tabs, Services, Library)
     -- PUBLIC API
     -- ================================================================
     return {
-        dumpScriptSources    = dumpScriptSources,
-        dumpSingleService    = dumpSingleService,
-        dumpInstanceTree     = dumpInstanceTree,
-        dumpNetworkMetadata  = dumpNetworkMetadata,
+        dumpScriptSources      = dumpScriptSources,
+        dumpSingleService      = dumpSingleService,
+        dumpInstanceTree       = dumpInstanceTree,
+        dumpNetworkMetadata    = dumpNetworkMetadata,
         dumpEnvironmentGlobals = dumpEnvironmentGlobals,
-        startRemoteSpy       = startRemoteSpy,
-        stopRemoteSpy        = stopRemoteSpy,
-        flushRemoteLog       = flushRemoteLog,
-        clearRemoteLog       = clearRemoteLog,
+        startRemoteSpy         = startRemoteSpy,
+        stopRemoteSpy          = stopRemoteSpy,
+        flushRemoteLog         = flushRemoteLog,
+        clearRemoteLog         = clearRemoteLog,
     }
 end
