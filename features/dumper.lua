@@ -348,7 +348,8 @@ return function(State, Tabs, Services, Library)
         local testRemote = Instance.new("RemoteEvent")
         testRemote.Name = "TestRemote"
         testRemote.Parent = game.Workspace
-        
+
+        -- FIX: RemoteEvent uses :Connect(), not property assignment
         testRemote.OnServerEvent:Connect(function(player, ...)
             logRemoteCall("TestRemote", "OnServerEvent", {...})
         end)
