@@ -349,15 +349,13 @@ return function(State, Tabs, Services, Library)
         testRemote.Name = "TestRemote"
         testRemote.Parent = game.Workspace
         
-        testRemote.OnServerInvoke = function(player, ...)
-            logRemoteCall("TestRemote", "OnServerInvoke", {...})
-            return "Response from server"
-        end
-        
-        testRemote.OnClientInvoke = function(...)
-            logRemoteCall("TestRemote", "OnClientInvoke", {...})
-            return "Response from client"
-        end
+        testRemote.OnServerEvent:Connect(function(player, ...)
+            logRemoteCall("TestRemote", "OnServerEvent", {...})
+        end)
+
+        testRemote.OnClientEvent:Connect(function(...)
+            logRemoteCall("TestRemote", "OnClientEvent", {...})
+        end)
     end
     
     local function stopRemoteSpy()
