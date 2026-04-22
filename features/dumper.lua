@@ -439,124 +439,157 @@ end
 
 -- ================================================================
 --  REMOTE SPY
---  Hooks __namecall on the game metatable.
+--  Backend ported directly from Remote2Script v2 by Luckyxero.
 --
---  KEY FIX: varargs `...` cannot be accessed inside a nested
---  closure in Lua 5.1 (which Roblox uses). The args MUST be
---  captured into a local table BEFORE any inner function.
+--  Architecture mirrors R2Sv2 exactly:
+--    1. Hook captures args at TOP LEVEL of vararg function (Lua 5.1 rule)
+--    2. args[#args] = nil  strips the trailing nil Roblox appends to varargs
+--    3. method:match("Server")  broad match catches FireServer/InvokeServer
+--    4. Entries queued into namecallDump table, NOT processed inline
+--    5. RunService.Stepped drains the queue every frame (same as R2Sv2)
+--    6. getfenv(2).script  retrieves the caller script instance
+--    7. RemoteFunction return values captured via InvokeServer pcall
+--    8. GetPath / GetType / Table_TS  ported verbatim for correct serialisation
+--    9. Original namecall called with ORIGINAL ... not the stripped args
 -- ================================================================
 
-local spyIsActive      = false
-local spyLogBuffer     = {}
-local spyTotalFired    = 0
-local spyHookInstalled = false
-local spyOriginalCall  = nil
-
-local function buildRemoteScript(remoteObject, methodName, callArgs)
-    local lines = {
-        "-- ==============================",
-        "-- [RemoteSpy] Captured Call",
-        "-- Time   : " .. os.date("%H:%M:%S"),
-        "-- Remote : " .. tostring(remoteObject.ClassName) .. " @ " .. buildInstancePath(remoteObject),
-        "-- Method : " .. tostring(methodName),
-        "-- ==============================",
-        "",
-    }
-
-    for i = 1, #callArgs do
-        local arg     = callArgs[i]
-        local argType = type(arg)
-        local argRepr
-
-        if argType == "userdata" then
-            local typeOk, typeName = pcall(typeof, arg)
-            if not typeOk then
-                typeName = "userdata"
-            end
-
-            if typeName == "Instance" then
-                argRepr = buildInstancePath(arg)
-            elseif typeName == "Vector3" then
-                argRepr = string.format(
-                    "Vector3.new(%g, %g, %g)",
-                    arg.X, arg.Y, arg.Z
-                )
-            elseif typeName == "CFrame" then
-                local cx, cy, cz = arg.X, arg.Y, arg.Z
-                local rx, ry, rz = arg:ToEulerAnglesXYZ()
-                argRepr = string.format(
-                    "CFrame.new(%g, %g, %g) * CFrame.fromEulerAnglesXYZ(%g, %g, %g)",
-                    cx, cy, cz, rx, ry, rz
-                )
-            elseif typeName == "Color3" then
-                argRepr = string.format(
-                    "Color3.new(%g, %g, %g)",
-                    arg.R, arg.G, arg.B
-                )
-            elseif typeName == "EnumItem" then
-                argRepr = "Enum." .. tostring(arg.EnumType) .. "." .. tostring(arg.Name)
-            elseif typeName == "BrickColor" then
-                argRepr = 'BrickColor.new("' .. tostring(arg.Name) .. '")'
-            elseif typeName == "UDim2" then
-                argRepr = string.format(
-                    "UDim2.new(%g, %g, %g, %g)",
-                    arg.X.Scale, arg.X.Offset,
-                    arg.Y.Scale, arg.Y.Offset
-                )
-            elseif typeName == "UDim" then
-                argRepr = string.format("UDim.new(%g, %g)", arg.Scale, arg.Offset)
-            elseif typeName == "Vector2" then
-                argRepr = string.format("Vector2.new(%g, %g)", arg.X, arg.Y)
-            elseif typeName == "Rect" then
-                argRepr = string.format(
-                    "Rect.new(%g, %g, %g, %g)",
-                    arg.Min.X, arg.Min.Y, arg.Max.X, arg.Max.Y
-                )
-            else
-                argRepr = "--[[ " .. typeName .. " ]] " .. tostring(arg)
-            end
-
-        elseif argType == "string" then
-            argRepr = string.format("%q", arg)
-
-        elseif argType == "number" then
-            argRepr = tostring(arg)
-
-        elseif argType == "boolean" then
-            argRepr = tostring(arg)
-
-        elseif argType == "table" then
-            argRepr = "{--[[ table: inspect manually ]]}"
-
-        elseif argType == "function" then
-            argRepr = "--[[ function ]]"
-
-        else
-            argRepr = "--[[ " .. argType .. ": " .. tostring(arg) .. " ]]"
-        end
-
-        table.insert(lines, string.format("local Arg%d = %s", i, argRepr))
-    end
-
-    local argList = {}
-    for i = 1, #callArgs do
-        table.insert(argList, "Arg" .. i)
-    end
-
-    table.insert(lines, "")
-    table.insert(lines, "local Remote = " .. buildInstancePath(remoteObject))
-    table.insert(lines, "Remote:" .. methodName .. "(" .. table.concat(argList, ", ") .. ")")
-    table.insert(lines, "")
-
-    return table.concat(lines, "\n")
+-- HasSpecial: true if string contains any control char, whitespace, or punctuation.
+-- Used by GetPath to decide whether a path segment needs bracket notation.
+local HasSpecial = function(str)
+    return (str:match("%c") or str:match("%s") or str:match("%p")) ~= nil
 end
 
+-- GetPath: builds a valid Lua path expression pointing to any Instance.
+-- Ported verbatim from R2Sv2's GetPath function.
+local GetPath = function(Inst)
+    local Obj   = Inst
+    local parts = {}
+    local temp  = {}
+    local hasError = false
+
+    while Obj ~= game do
+        if Obj == nil then
+            hasError = true
+            break
+        end
+        -- Use ClassName when the parent is game (service root), else use Name
+        table.insert(temp, Obj.Parent == game and Obj.ClassName or tostring(Obj))
+        Obj = Obj.Parent
+    end
+
+    -- First segment is always game:GetService("ClassName")
+    table.insert(parts, 'game:GetService("' .. temp[#temp] .. '")')
+
+    -- Remaining segments use dot or bracket notation depending on the name
+    for i = #temp - 1, 1, -1 do
+        table.insert(parts,
+            HasSpecial(temp[i])
+            and '["' .. temp[i] .. '"]'
+            or  "."  .. temp[i]
+        )
+    end
+
+    return hasError
+        and "nil -- Path contained invalid instance"
+        or  table.concat(parts, "")
+end
+
+-- GetType: serialises any Roblox value to its Lua constructor string.
+-- Ported verbatim from R2Sv2's GetType function.
+local GetType = function(value)
+    local Types = {
+        EnumItem = function()
+            return "Enum." .. tostring(value.EnumType) .. "." .. tostring(value.Name)
+        end,
+        Instance = function()
+            return GetPath(value)
+        end,
+        CFrame = function()
+            return "CFrame.new(" .. tostring(value) .. ")"
+        end,
+        Vector3 = function()
+            return "Vector3.new(" .. tostring(value) .. ")"
+        end,
+        BrickColor = function()
+            return 'BrickColor.new("' .. tostring(value) .. '")'
+        end,
+        Color3 = function()
+            return "Color3.new(" .. tostring(value) .. ")"
+        end,
+        string = function()
+            local S = tostring(value)
+            return '"' .. S .. '"'
+        end,
+        Ray = function()
+            return "Ray.new(Vector3.new("
+                .. tostring(value.Origin)
+                .. "), Vector3.new("
+                .. tostring(value.Direction)
+                .. "))"
+        end,
+    }
+    local t = typeof(value)
+    if Types[t] ~= nil then
+        return Types[t]()
+    end
+    return tostring(value)
+end
+
+-- Table_TS: recursively serialises a Lua/Roblox table to a table literal string.
+-- Ported verbatim from R2Sv2's Table_TS function.
+-- Forward-declared so GetType can call it and it can call itself recursively.
+local Table_TS
+Table_TS = function(T)
+    local M = {}
+    for i, v in pairs(T) do
+        local I = "\n\t" .. (type(i) == "number"
+            and "["  .. i  .. "] = "
+            or  '["' .. i  .. '"] = ')
+        table.insert(M, I .. (type(v) == "table" and Table_TS(v) or GetType(v)))
+    end
+    return "\n{" .. table.concat(M, ", ") .. "\n}"
+end
+
+-- namecall_script: builds the complete Lua script string for one captured call.
+-- Ported verbatim from R2Sv2's namecall_script function.
+-- Uses `...` directly — valid here because this IS the vararg function level.
+local namecall_script = function(object, method, ...)
+    local scriptStr = "-- Script generated by Yazu RemoteSpy\n"
+                   .. "-- Ported from Remote2Script v2 by Luckyxero\n"
+                   .. " \n"
+    local argNames = {}
+    for i, v in pairs({...}) do
+        scriptStr = scriptStr
+            .. "local A_" .. i .. " = "
+            .. (type(v) == "table" and Table_TS(v) or GetType(v))
+            .. "\n"
+        table.insert(argNames, "A_" .. i)
+    end
+    scriptStr = scriptStr .. "local Event = " .. GetPath(object) .. "\n\n"
+    scriptStr = scriptStr .. "Event:" .. method .. "(" .. table.concat(argNames, ", ") .. ")"
+    return scriptStr
+end
+
+-- ----------------------------------------------------------------
+--  Spy state variables
+-- ----------------------------------------------------------------
+local spyIsActive      = false   -- whether the spy is currently logging
+local spyLogBuffer     = {}      -- list of {script, caller, object, method, freturn} entries
+local namecallDump     = {}      -- queue filled by the hook, drained by Stepped
+local spyTotalFired    = 0       -- running count of all intercepted calls
+local spyHookInstalled = false   -- whether __namecall has been patched
+local spyOriginalCall  = nil     -- saved reference to the original __namecall
+
+-- ----------------------------------------------------------------
+--  flushSpyLog: writes the current in-memory buffer to Remote_Log.lua.
+--  Called automatically every 25 calls and when spy is disabled.
+-- ----------------------------------------------------------------
 local function flushSpyLog()
     if #spyLogBuffer == 0 then
         return
     end
 
-    local header = {
+    local lines = {
         "-- ===========================================================",
         "-- Yazu Remote Spy Log",
         "-- Flushed  : " .. os.date("%Y-%m-%d %H:%M:%S"),
@@ -565,24 +598,39 @@ local function flushSpyLog()
         "",
     }
 
-    local allLines = {}
-    for _, v in ipairs(header) do
-        table.insert(allLines, v)
-    end
     for _, entry in ipairs(spyLogBuffer) do
-        table.insert(allLines, entry)
-        table.insert(allLines, string.rep("-", 40))
-        table.insert(allLines, "")
+        -- Write the generated call script
+        table.insert(lines, entry.script)
+        -- If we captured a return value (RemoteFunction), append it
+        if entry.freturn then
+            table.insert(lines, "-- Return value: " .. tostring(entry.freturn))
+        end
+        -- If we have the caller script instance, note its full name
+        if entry.caller then
+            local ok, name = pcall(function()
+                return entry.caller:GetFullName()
+            end)
+            if ok and name then
+                table.insert(lines, "-- Caller: " .. name)
+            end
+        end
+        table.insert(lines, string.rep("-", 40))
+        table.insert(lines, "")
     end
 
-    safeWrite("Remote_Log.lua", table.concat(allLines, "\n"))
+    safeWrite("Remote_Log.lua", table.concat(lines, "\n"))
 end
 
+-- ----------------------------------------------------------------
+--  installSpyHook: patches game.__namecall once.
+--  Safe to call multiple times — exits immediately if already hooked.
+-- ----------------------------------------------------------------
 local function installSpyHook()
     if spyHookInstalled then
         return true
     end
 
+    -- Verify required executor functions exist before touching the metatable
     if type(getrawmetatable) ~= "function" then
         Library:Notify("RemoteSpy: getrawmetatable() not available on this executor")
         return false
@@ -593,89 +641,160 @@ local function installSpyHook()
         return false
     end
 
+    -- Get the game object's metatable
     local gameMeta
     local metaOk, metaErr = pcall(function()
         gameMeta = getrawmetatable(game)
     end)
 
     if not metaOk or not gameMeta then
-        Library:Notify("RemoteSpy: getrawmetatable(game) failed: " .. tostring(metaErr))
+        Library:Notify("RemoteSpy: getrawmetatable(game) failed — " .. tostring(metaErr))
         return false
     end
 
+    -- Unlock the metatable so we can overwrite __namecall
     if type(setreadonly) == "function" then
         pcall(setreadonly, gameMeta, false)
     elseif type(make_writeable) == "function" then
         pcall(make_writeable, gameMeta)
     end
 
-    spyOriginalCall = rawget(gameMeta, "__namecall")
+    -- Save original __namecall before overwriting
+    spyOriginalCall = gameMeta.__namecall
 
     if not spyOriginalCall then
-        Library:Notify("RemoteSpy: __namecall is nil — cannot hook")
+        Library:Notify("RemoteSpy: __namecall is nil — cannot hook on this executor")
         return false
     end
 
-    local wrapFunction
-    if type(newcclosure) == "function" then
-        wrapFunction = newcclosure
-    else
-        wrapFunction = function(f) return f end
-    end
+    -- ============================================================
+    --  THE HOOK — ported directly from R2Sv2's on_namecall
+    --
+    --  CRITICAL RULES FOLLOWED:
+    --  [1] local args = {...}   — varargs captured at the OUTERMOST
+    --      level of this function, before ANY nested function call.
+    --      Lua 5.1 forbids reading `...` from inside a nested closure.
+    --
+    --  [2] args[#args] = nil    — strips the trailing nil Roblox
+    --      appends to the vararg list on every namecall invocation.
+    --
+    --  [3] method:match("Server") — broad pattern matches both
+    --      "FireServer" and "InvokeServer" (and their variants).
+    --
+    --  [4] "CharacterSoundEvent" is skipped — same as R2Sv2.
+    --
+    --  [5] The entry is QUEUED into namecallDump, not processed
+    --      inline. Heavy work (file I/O, notifications) happens on
+    --      the Stepped drain loop below, not inside the hook.
+    --
+    --  [6] The original is called with the ORIGINAL `...`, NOT with
+    --      unpack(args). We stripped the trailing nil from args only
+    --      for our own use; the game must receive the original call
+    --      untouched so no functionality is broken.
+    -- ============================================================
+    gameMeta.__namecall = function(object, ...)
+        local method = getnamecallmethod()
 
-    -- IMPORTANT: `...` is captured into `callArgs` immediately inside the
-    -- outer vararg function, BEFORE any nested closure.
-    -- In Lua 5.1 you cannot reference `...` from inside a nested function.
-    rawset(gameMeta, "__namecall", wrapFunction(function(self, ...)
-        local method    = getnamecallmethod()
-        local callArgs  = { ... }  -- capture varargs HERE, at the top level of this function
+        -- [1] Capture varargs into a plain table at the top level of this function
+        local args = {...}
 
-        if spyIsActive and method then
-            local methodLower = string.lower(method)
-            local isRemoteMethod = (methodLower == "fireserver")
-                or (methodLower == "invokeserver")
+        -- [2] Strip trailing nil that Roblox appends
+        args[#args] = nil
 
-            if isRemoteMethod then
-                local isRemote = false
+        -- Only intercept when spy is active, method contains "Server",
+        -- and the object is not the noisy CharacterSoundEvent remote
+        if spyIsActive
+            and method ~= nil
+            and method:match("Server")
+            and object.Name ~= "CharacterSoundEvent"
+        then
+            -- [3] Attempt to get the script that made this call (pcall: getfenv may be absent)
+            local callerScript = nil
+            pcall(function()
+                callerScript = getfenv(2).script
+            end)
+
+            -- [4] For RemoteFunction, capture the return value via InvokeServer
+            --     Wrapped in pcall so a network error never breaks the hook
+            local freturnStr = nil
+            if object.ClassName == "RemoteFunction" then
                 pcall(function()
-                    isRemote = self:IsA("RemoteEvent") or self:IsA("RemoteFunction")
+                    local freturn = {pcall(object.InvokeServer, object, unpack(args))}
+                    -- select(2, ...) drops the pcall success boolean, keeping only the values
+                    freturn = {select(2, unpack(freturn))}
+                    if #freturn == 0 then
+                        freturnStr = object.Name .. " is a void type RemoteFunction"
+                    else
+                        freturnStr = Table_TS(freturn)
+                    end
                 end)
-
-                if isRemote then
-                    -- callArgs is already a plain table here, safe to use in nested pcall
-                    pcall(function()
-                        spyTotalFired = spyTotalFired + 1
-
-                        local script = buildRemoteScript(self, method, callArgs)
-                        table.insert(spyLogBuffer, script)
-
-                        if #spyLogBuffer > 300 then
-                            table.remove(spyLogBuffer, 1)
-                        end
-
-                        if spyTotalFired % 25 == 0 then
-                            flushSpyLog()
-                        end
-
-                        Library:Notify(
-                            string.format(
-                                "[Spy] #%d  %s : %s",
-                                spyTotalFired, self.Name, method
-                            ),
-                            3
-                        )
-                    end)
-                end
             end
+
+            -- [5] Build the script string now (uses unpack(args) — safe, args is a plain table)
+            --     Then queue the complete entry for the Stepped drain loop
+            local builtScript = namecall_script(
+                object,
+                object.ClassName == "RemoteEvent" and "FireServer" or "InvokeServer",
+                unpack(args)
+            )
+
+            namecallDump[#namecallDump + 1] = {
+                script  = builtScript,
+                caller  = callerScript,
+                object  = object,
+                method  = method,
+                freturn = freturnStr,
+            }
         end
 
-        return spyOriginalCall(self, table.unpack(callArgs))
-    end))
+        -- [6] Always forward the ORIGINAL varargs to the real namecall
+        return spyOriginalCall(object, ...)
+    end
 
     spyHookInstalled = true
     return true
 end
 
+-- ----------------------------------------------------------------
+--  Stepped drain loop — mirrors R2Sv2's Step:Connect pattern.
+--  Empties namecallDump every frame, updating the buffer and firing
+--  notifications. Doing this outside the hook keeps the hook fast.
+-- ----------------------------------------------------------------
+RunService.Stepped:Connect(function()
+    while #namecallDump > 0 do
+        local entry = table.remove(namecallDump, 1)
+
+        spyTotalFired = spyTotalFired + 1
+
+        -- Add to in-memory buffer
+        table.insert(spyLogBuffer, entry)
+
+        -- Cap buffer at 300 entries to prevent unbounded memory growth
+        if #spyLogBuffer > 300 then
+            table.remove(spyLogBuffer, 1)
+        end
+
+        -- Auto-flush to file every 25 calls
+        if spyTotalFired % 25 == 0 then
+            flushSpyLog()
+        end
+
+        -- Notify with remote name and method
+        Library:Notify(
+            string.format(
+                "[Spy] #%d  %s : %s",
+                spyTotalFired,
+                entry.object.Name,
+                entry.method
+            ),
+            3
+        )
+    end
+end)
+
+-- ----------------------------------------------------------------
+--  Public controls
+-- ----------------------------------------------------------------
 local function enableRemoteSpy()
     if spyIsActive then
         Library:Notify("Remote Spy is already running")
@@ -697,7 +816,7 @@ local function disableRemoteSpy()
     flushSpyLog()
     Library:Notify(
         string.format(
-            "Remote Spy: DISABLED — %d calls logged",
+            "Remote Spy: DISABLED — %d calls logged to Remote_Log.lua",
             spyTotalFired
         )
     )
@@ -705,6 +824,7 @@ end
 
 local function clearRemoteLog()
     spyLogBuffer  = {}
+    namecallDump  = {}
     spyTotalFired = 0
     Library:Notify("Remote log buffer cleared")
 end
