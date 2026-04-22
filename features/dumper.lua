@@ -906,6 +906,16 @@ DumperGroupbox:AddButton({
 local ServiceGroupbox = Tabs.Dumper:AddLeftGroupbox('Dump by Service')
 
 ServiceGroupbox:AddButton({
+    Text = 'Force ReplicatedStorage Dump',
+    Func = function()
+        guarded(function()
+            local count = dumpSingleService('ReplicatedStorage')
+            Library:Notify('ReplicatedStorage — ' .. count .. ' scripts saved')
+        end)
+    end,
+})
+
+ServiceGroupbox:AddButton({
     Text = 'Workspace',
     Func = function()
         guarded(function()
