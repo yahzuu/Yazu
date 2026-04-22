@@ -45,6 +45,10 @@ if placeId == 185655149 then
     Tabs.BXBRG = Window:AddTab('BXBRG')
 end
 
+if placeId == 6137321701 then
+    Tabs.blair = Window:AddTab('blair')
+end
+
 -- UI Settings must always be last
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
@@ -67,6 +71,7 @@ safeLoad('features/dumper.lua')
 
 local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
+    [6137321701] = 'features/blair.lua',
 }
 
 if placeFeatures[placeId] then
