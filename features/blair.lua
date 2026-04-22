@@ -5,7 +5,7 @@
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
-print("helloa")
+print("hellosa")
 -- ── 1. SERVICES & DEPENDENCIES ────────────────────────────────
 local RunService    = Services.RunService
 local LocalPlayer   = Services.LocalPlayer
@@ -42,28 +42,22 @@ local function GetMod(name)
     return nil
 end
 
--- ── 4. UI SECTIONS ────────────────────────────────────────────
+-- ── 4. UI SECTIONS (REORGANIZED FOR VISIBILITY) ────────────────
 local MovementGrp   = BlairTab:AddLeftGroupbox('Movement & Physical')
-local GhostLogicGrp = BlairTab:AddLeftGroupbox('Ghost Logic & Detection')
 local SanityGrp     = BlairTab:AddLeftGroupbox('Sanity Management')
+local GhostLogicGrp = BlairTab:AddLeftGroupbox('Ghost Logic & Detection')
+
+local VisualsGrp    = BlairTab:AddRightGroupbox('Visuals & Tracking') -- Moved to TOP of right side
 local EvidenceGrp   = BlairTab:AddRightGroupbox('Evidence & Analysis')
 local AutomationGrp = BlairTab:AddRightGroupbox('Match Automation')
-local VisualsGrp    = BlairTab:AddRightGroupbox('Visuals & Tracking')
 
--- ── 5. UI ELEMENTS (EVERY FEATURE FROM SCS.TXT) ───────────────
+-- ── 5. UI ELEMENTS ────────────────────────────────────────────
 
 -- [MOVEMENT]
-MovementGrp:AddToggle('Blair_SpeedBoost', { Text = 'Hyper Speed Boost', Default = false, Tooltip = 'Sets WalkSpeed to 50+' })
+MovementGrp:AddToggle('Blair_SpeedBoost', { Text = 'Hyper Speed Boost', Default = false })
 MovementGrp:AddSlider('Blair_SpeedValue', { Text = 'Speed Customization', Default = 50, Min = 16, Max = 150, Rounding = 0 })
 MovementGrp:AddToggle('Blair_JumpPower',  { Text = 'Increased Jump', Default = false })
 MovementGrp:AddSlider('Blair_JumpValue',  { Text = 'Jump Height', Default = 100, Min = 50, Max = 250, Rounding = 0 })
-
--- [GHOST LOGIC]
-GhostLogicGrp:AddToggle('Blair_AutoDetect',   { Text = 'Auto-Detect Ghost Types', Default = false })
-GhostLogicGrp:AddToggle('Blair_FastIdentify', { Text = 'Fast Identification', Default = false })
-GhostLogicGrp:AddToggle('Blair_PredictEvid',  { Text = 'Predict Potential Evidence', Default = false })
-GhostLogicGrp:AddToggle('Blair_HuntTrigger',  { Text = 'Force Hunt Trigger', Default = false })
-GhostLogicGrp:AddToggle('Blair_ThreatMax',    { Text = 'Max Threat Level (Critical)', Default = false })
 
 -- [SANITY]
 SanityGrp:AddToggle('Blair_InstaSanity', { Text = 'Instant Sanity Restore', Default = false })
@@ -76,23 +70,28 @@ SanityGrp:AddButton({ Text = 'Restore Sanity Now', Func = function()
     end
 end})
 
+-- [GHOST LOGIC]
+GhostLogicGrp:AddToggle('Blair_AutoDetect',   { Text = 'Auto-Detect Ghost Types', Default = false })
+GhostLogicGrp:AddToggle('Blair_FastIdentify', { Text = 'Fast Identification', Default = false })
+GhostLogicGrp:AddToggle('Blair_PredictEvid',  { Text = 'Predict Potential Evidence', Default = false })
+GhostLogicGrp:AddToggle('Blair_HuntTrigger',  { Text = 'Force Hunt Trigger', Default = false })
+GhostLogicGrp:AddToggle('Blair_ThreatMax',    { Text = 'Max Threat Level (Critical)', Default = false })
+
+-- [VISUALS] - Explicitly added to VisualsGrp
+VisualsGrp:AddToggle('Blair_GhostTrack',  { Text = 'Real-time Ghost Tracking', Default = false })
+VisualsGrp:AddToggle('Blair_OverrideApp', { Text = 'Override Ghost Visibility', Default = false })
+VisualsGrp:AddToggle('Blair_GhostESP',    { Text = 'Ghost ESP (High-Vis)', Default = false })
+VisualsGrp:AddLabel('ESP Color'):AddColorPicker('Blair_ESP_Col', { Default = Color3.fromRGB(255, 0, 0) })
+
 -- [EVIDENCE]
 EvidenceGrp:AddToggle('Blair_ScanEvidence',   { Text = 'Instant Evidence Scanner', Default = false })
 EvidenceGrp:AddToggle('Blair_InstaAnalysis',  { Text = 'Instant Analysis Results', Default = false })
 EvidenceGrp:AddToggle('Blair_AutoCollect',    { Text = 'Auto-Collect Evidence', Default = false })
-EvidenceGrp:AddButton({ Text = 'Force Log All Evidence', Func = function()
-    for _, evidence in ipairs(Internal.GhostEvidence) do
-        print("[Yazu-Blair] Found Evidence: " .. evidence)
-    end
-    Library:Notify("All evidence logged to console.")
-end})
 
 -- [AUTOMATION]
 AutomationGrp:AddToggle('Blair_AutoObjectives', { Text = 'Auto-Complete Objectives', Default = false })
 AutomationGrp:AddToggle('Blair_AutoTrackObj',   { Text = 'Auto-Track Objectives', Default = false })
 AutomationGrp:AddToggle('Blair_InstaSanitize',  { Text = 'Instant Room Sanitization', Default = false })
-AutomationGrp:AddLabel('Loop Speed (Sec)'):AddSlider('Blair_AutoDelay', { Default = 5, Min = 1, Max = 30, Rounding = 1 })
-
 
 -- [VISUALS]
 VisualsGrp:AddToggle('Blair_GhostTrack',  { Text = 'Real-time Ghost Tracking', Default = false, Tooltip = 'Logs ghost coordinates to console' })
