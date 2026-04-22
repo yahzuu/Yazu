@@ -97,150 +97,6 @@ AutomationGrp:AddLabel('Loop Speed (Sec)'):AddSlider('Blair_AutoDelay', { Defaul
 VisualsGrp:AddToggle('Blair_GhostTrack',  { Text = 'Real-time Ghost Tracking', Default = false })
 VisualsGrp:AddToggle('Blair_OverrideApp', { Text = 'Override Ghost Visibility', Default = false })
 VisualsGrp:AddToggle('Blair_GhostESP',    { Text = 'Ghost ESP (High-Vis)', Default = false })
--- ================================================================
---  Yazu | features/blair.lua (Visuals & Tracking Extension)
---  Total Lines for this section: ~180
--- ================================================================
-
--- ── 1. UI SETUP (Add this to your VisualsGrp section) ──────────
-local VisualsGrp = BlairTab:AddRightGroupbox('Visuals & Tracking')
-
-VisualsGrp:AddToggle('Blair_GhostESP', { 
-    Text = 'Ghost ESP', 
-    Default = false, 
-    Tooltip = 'Highlights the ghost through walls' 
-})
-
-VisualsGrp:AddToggle('Blair_GhostTrack', { 
-    Text = 'Real-time Ghost Tracker', 
-    Default = false, 
-    Tooltip = 'Logs and displays ghost position coordinates' 
-})
-
-VisualsGrp:AddToggle('Blair_OverrideApp', { 
-    Text = 'Force Maximum Visibility', 
-    Default = false, 
-    Tooltip = 'Forces the ghost display system to be visible' 
-})
-
-VisualsGrp:AddToggle('Blair_Chams', { 
-    Text = 'Ghost Chams (Fill)', 
-    Default = false 
-})
-
-VisualsGrp:AddLabel('ESP Color'):AddColorPicker('GhostEspCol', { 
-    Default = Color3.fromRGB(255, 0, 0) 
-})
-
--- ── 2. INTERNAL TRACKING STATE ────────────────────────────────
-local VisualState = {
-    CurrentGhost = nil,
-    ESPObjects = {},
-    LastPosUpdate = 0
-}
-
--- ── 3. VISUALS & TRACKING LOGIC ───────────────────────────────
-
-task.spawn(function()
-    while true do
-        task.wait(0.5) -- Scan for ghosts every half second
-        
-        -- A. GHOST TRACKING LOGIC
-        if Toggles.Blair_GhostTrack and Toggles.Blair_GhostTrack.Value then
-            -- Check for the GhostTracker system from your script dump
-            local tracker = LocalPlayer:FindFirstChild("GhostTracker")
-            
-            -- We also search the workspace for the actual ghost model
-            for _, v in next, workspace:GetChildren() do
-                if v:IsA("Model") and (v.Name:find("Ghost") or v:FindFirstChild("GhostData")) then
-                    local hrp = v:FindFirstChild("HumanoidRootPart") or v.PrimaryPart
-                    if hrp then
-                        -- Log position like your original script
-                        local pos = hrp.Position
-                        print(string.format("[YAZU TRACKER] Ghost at: %.2f, %.2f, %.2f", pos.X, pos.Y, pos.Z))
-                        
-                        -- Update the tracker system if it exists
-                        if tracker and tracker:FindFirstChild("Position") then
-                            tracker.Position.Value = pos
-                        end
-                    end
-                end
-            end
-        end
-
-        -- B. GHOST APPEARANCE OVERRIDE
-        if Toggles.Blair_OverrideApp and Toggles.Blair_OverrideApp.Value then
-            local display = LocalPlayer:FindFirstChild("GhostDisplay")
-            if display then
-                -- Force visibility values from your dump
-                if display:FindFirstChild("Appearance") then
-                    display.Appearance.Value = "MAX_VISIBILITY"
-                end
-                if display:FindFirstChild("IsVisible") then
-                    display.IsVisible.Value = true
-                end
-                -- print("All ghosts now maximally visible!")
-            end
-        end
-
-        -- C. ESP & CHAMS LOGIC
-        if Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value then
-            for _, v in next, workspace:GetChildren() do
-                -- Check if it's a ghost model
-                if v:IsA("Model") and (v.Name:find("Ghost") or v:FindFirstChild("GhostData")) then
-                    
-                    -- Handle Highlight (ESP)
-                    local highlight = v:FindFirstChild("YazuESP")
-                    if not highlight then
-                        highlight = Instance.new("Highlight")
-                        highlight.Name = "YazuESP"
-                        highlight.Parent = v
-                    end
-                    
-                    highlight.FillColor = Options.GhostEspCol.Value
-                    highlight.OutlineColor = Color3.new(1, 1, 1)
-                    highlight.FillAlpha = Toggles.Blair_Chams.Value and 0.5 or 1
-                    highlight.OutlineAlpha = 0
-                    highlight.Enabled = true
-                end
-            end
-        else
-            -- Cleanup ESP if toggled off
-            for _, v in next, workspace:GetChildren() do
-                local h = v:FindFirstChild("YazuESP")
-                if h then h:Destroy() end
-            end
-        end
-    end
-end)
-
--- ── 4. CROSSHAIR VISUALS (FROM PREVIOUS SCRIPT) ───────────────
-local Crosshair = {
-    L1 = Drawing.new("Line"),
-    L2 = Drawing.new("Line")
-}
-
-RunService.RenderStepped:Connect(function()
-    local enabled = Toggles.Blair_Crosshair and Toggles.Blair_Crosshair.Value
-    Crosshair.L1.Visible = enabled
-    Crosshair.L2.Visible = enabled
-
-    if enabled then
-        local cam = workspace.CurrentCamera
-        local center = cam.ViewportSize / 2
-        local col = Options.GhostEspCol.Value -- Reuse the ESP color for the crosshair
-        
-        Crosshair.L1.Color = col
-        Crosshair.L1.Thickness = 2
-        Crosshair.L1.From = center - Vector2.new(12, 0)
-        Crosshair.L1.To = center + Vector2.new(12, 0)
-
-        Crosshair.L2.Color = col
-        Crosshair.L2.Thickness = 2
-        Crosshair.L2.From = center - Vector2.new(0, 12)
-        Crosshair.L2.To = center + Vector2.new(0, 12)
-    end
-end)
 
 -- ── 6. MAIN FEATURE LOGIC (THE BRAIN) ─────────────────────────
 
@@ -381,45 +237,101 @@ task.spawn(function()
 end)
 
 -- 6.5: VISUALS & ESP THREAD
+-- 6.5: VISUALS & ESP THREAD (EXPANDED)
 task.spawn(function()
+    -- Initialize Crosshair Drawings
+    local Crosshair = {
+        L1 = Drawing.new("Line"),
+        L2 = Drawing.new("Line")
+    }
+
+    -- Crosshair Update Loop (RenderStepped for smoothness)
+    RunService.RenderStepped:Connect(function()
+        local enabled = Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value -- Toggle with ESP
+        Crosshair.L1.Visible = enabled
+        Crosshair.L2.Visible = enabled
+
+        if enabled then
+            local cam = workspace.CurrentCamera
+            local center = cam.ViewportSize / 2
+            local col = Color3.fromRGB(255, 0, 0) -- Default red, matches ESP
+            
+            Crosshair.L1.Color = col
+            Crosshair.L1.Thickness = 2
+            Crosshair.L1.From = center - Vector2.new(12, 0)
+            Crosshair.L1.To = center + Vector2.new(12, 0)
+
+            Crosshair.L2.Color = col
+            Crosshair.L2.Thickness = 2
+            Crosshair.L2.From = center - Vector2.new(0, 12)
+            Crosshair.L2.To = center + Vector2.new(0, 12)
+        end
+    end)
+
+    -- Main Visual Scan Loop
     while true do
-        task.wait(1)
+        task.wait(0.5) -- Scan frequency
 
-        -- Real-time Tracking
+        -- A. Real-time Ghost Tracking & Coordinate Logging
         if Toggles.Blair_GhostTrack and Toggles.Blair_GhostTrack.Value then
-            local tracker = LocalPlayer:FindFirstChild("GhostTracker")
-            if tracker then
-                Internal.LastPosition = Vector3.new(math.random(-100,100), 5, math.random(-100,100))
-                -- print("Ghost Tracked Position: " .. tostring(Internal.LastPosition))
-            end
-        end
-
-        -- Ghost Appearance Override
-        if Toggles.Blair_OverrideApp and Toggles.Blair_OverrideApp.Value then
-            local display = LocalPlayer:FindFirstChild("GhostDisplay")
-            if display and display:FindFirstChild("Appearance") then
-                display.Appearance.Value = "MAX_VISIBILITY"
-                display.IsVisible.Value = true
-            end
-        end
-
-        -- Ghost ESP (Visual implementation)
-        if Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value then
+            local trackerSystem = LocalPlayer:FindFirstChild("GhostTracker")
+            
+            -- Search workspace for the actual ghost entity
             for _, v in next, workspace:GetChildren() do
                 if v:IsA("Model") and (v.Name:find("Ghost") or v:FindFirstChild("GhostData")) then
-                    if not v:FindFirstChild("YazuHighlight") then
-                        local h = Instance.new("Highlight", v)
-                        h.Name = "YazuHighlight"
-                        h.FillColor = Color3.fromRGB(255, 0, 0)
-                        h.OutlineColor = Color3.new(1, 1, 1)
+                    local hrp = v:FindFirstChild("HumanoidRootPart") or v.PrimaryPart
+                    if hrp then
+                        Internal.LastPosition = hrp.Position
+                        -- Log to console as requested in original script dump
+                        print(string.format("[YAZU TRACKER] Ghost Position: %.2f, %.2f, %.2f", 
+                            Internal.LastPosition.X, Internal.LastPosition.Y, Internal.LastPosition.Z))
+                        
+                        -- Update internal game value if it exists
+                        if trackerSystem and trackerSystem:FindFirstChild("Position") then
+                            trackerSystem.Position.Value = Internal.LastPosition
+                        end
                     end
                 end
             end
+        end
+
+        -- B. High-Visibility ESP & Chams
+        if Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value then
+            for _, v in next, workspace:GetChildren() do
+                if v:IsA("Model") and (v.Name:find("Ghost") or v:FindFirstChild("GhostData")) then
+                    -- Highlight ESP
+                    local highlight = v:FindFirstChild("YazuHighlight")
+                    if not highlight then
+                        highlight = Instance.new("Highlight")
+                        highlight.Name = "YazuHighlight"
+                        highlight.Parent = v
+                    end
+                    
+                    highlight.FillColor = Color3.fromRGB(255, 0, 0)
+                    highlight.OutlineColor = Color3.new(1, 1, 1)
+                    highlight.FillAlpha = 0.5
+                    highlight.OutlineAlpha = 0
+                    highlight.Enabled = true
+                end
+            end
         else
-            -- Clean up ESP
+            -- Cleanup ESP
             for _, v in next, workspace:GetChildren() do
                 local h = v:FindFirstChild("YazuHighlight")
                 if h then h:Destroy() end
+            end
+        end
+
+        -- C. Visibility Override (Ghost Appearance)
+        if Toggles.Blair_OverrideApp and Toggles.Blair_OverrideApp.Value then
+            local display = LocalPlayer:FindFirstChild("GhostDisplay")
+            if display then
+                if display:FindFirstChild("Appearance") then
+                    display.Appearance.Value = "MAX_VISIBILITY"
+                end
+                if display:FindFirstChild("IsVisible") then
+                    display.IsVisible.Value = true
+                end
             end
         end
     end
@@ -450,150 +362,6 @@ task.spawn(function()
     end
 end)
 
-    -- ================================================================
---  Yazu | features/blair.lua (Visuals & Tracking Extension)
---  Total Lines for this section: ~180
--- ================================================================
-
--- ── 1. UI SETUP (Add this to your VisualsGrp section) ──────────
-local VisualsGrp = BlairTab:AddRightGroupbox('Visuals & Tracking')
-
-VisualsGrp:AddToggle('Blair_GhostESP', { 
-    Text = 'Ghost ESP', 
-    Default = false, 
-    Tooltip = 'Highlights the ghost through walls' 
-})
-
-VisualsGrp:AddToggle('Blair_GhostTrack', { 
-    Text = 'Real-time Ghost Tracker', 
-    Default = false, 
-    Tooltip = 'Logs and displays ghost position coordinates' 
-})
-
-VisualsGrp:AddToggle('Blair_OverrideApp', { 
-    Text = 'Force Maximum Visibility', 
-    Default = false, 
-    Tooltip = 'Forces the ghost display system to be visible' 
-})
-
-VisualsGrp:AddToggle('Blair_Chams', { 
-    Text = 'Ghost Chams (Fill)', 
-    Default = false 
-})
-
-VisualsGrp:AddLabel('ESP Color'):AddColorPicker('GhostEspCol', { 
-    Default = Color3.fromRGB(255, 0, 0) 
-})
-
--- ── 2. INTERNAL TRACKING STATE ────────────────────────────────
-local VisualState = {
-    CurrentGhost = nil,
-    ESPObjects = {},
-    LastPosUpdate = 0
-}
-
--- ── 3. VISUALS & TRACKING LOGIC ───────────────────────────────
-
-task.spawn(function()
-    while true do
-        task.wait(0.5) -- Scan for ghosts every half second
-        
-        -- A. GHOST TRACKING LOGIC
-        if Toggles.Blair_GhostTrack and Toggles.Blair_GhostTrack.Value then
-            -- Check for the GhostTracker system from your script dump
-            local tracker = LocalPlayer:FindFirstChild("GhostTracker")
-            
-            -- We also search the workspace for the actual ghost model
-            for _, v in next, workspace:GetChildren() do
-                if v:IsA("Model") and (v.Name:find("Ghost") or v:FindFirstChild("GhostData")) then
-                    local hrp = v:FindFirstChild("HumanoidRootPart") or v.PrimaryPart
-                    if hrp then
-                        -- Log position like your original script
-                        local pos = hrp.Position
-                        print(string.format("[YAZU TRACKER] Ghost at: %.2f, %.2f, %.2f", pos.X, pos.Y, pos.Z))
-                        
-                        -- Update the tracker system if it exists
-                        if tracker and tracker:FindFirstChild("Position") then
-                            tracker.Position.Value = pos
-                        end
-                    end
-                end
-            end
-        end
-
-        -- B. GHOST APPEARANCE OVERRIDE
-        if Toggles.Blair_OverrideApp and Toggles.Blair_OverrideApp.Value then
-            local display = LocalPlayer:FindFirstChild("GhostDisplay")
-            if display then
-                -- Force visibility values from your dump
-                if display:FindFirstChild("Appearance") then
-                    display.Appearance.Value = "MAX_VISIBILITY"
-                end
-                if display:FindFirstChild("IsVisible") then
-                    display.IsVisible.Value = true
-                end
-                -- print("All ghosts now maximally visible!")
-            end
-        end
-
-        -- C. ESP & CHAMS LOGIC
-        if Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value then
-            for _, v in next, workspace:GetChildren() do
-                -- Check if it's a ghost model
-                if v:IsA("Model") and (v.Name:find("Ghost") or v:FindFirstChild("GhostData")) then
-                    
-                    -- Handle Highlight (ESP)
-                    local highlight = v:FindFirstChild("YazuESP")
-                    if not highlight then
-                        highlight = Instance.new("Highlight")
-                        highlight.Name = "YazuESP"
-                        highlight.Parent = v
-                    end
-                    
-                    highlight.FillColor = Options.GhostEspCol.Value
-                    highlight.OutlineColor = Color3.new(1, 1, 1)
-                    highlight.FillAlpha = Toggles.Blair_Chams.Value and 0.5 or 1
-                    highlight.OutlineAlpha = 0
-                    highlight.Enabled = true
-                end
-            end
-        else
-            -- Cleanup ESP if toggled off
-            for _, v in next, workspace:GetChildren() do
-                local h = v:FindFirstChild("YazuESP")
-                if h then h:Destroy() end
-            end
-        end
-    end
-end)
-
--- ── 4. CROSSHAIR VISUALS (FROM PREVIOUS SCRIPT) ───────────────
-local Crosshair = {
-    L1 = Drawing.new("Line"),
-    L2 = Drawing.new("Line")
-}
-
-RunService.RenderStepped:Connect(function()
-    local enabled = Toggles.Blair_Crosshair and Toggles.Blair_Crosshair.Value
-    Crosshair.L1.Visible = enabled
-    Crosshair.L2.Visible = enabled
-
-    if enabled then
-        local cam = workspace.CurrentCamera
-        local center = cam.ViewportSize / 2
-        local col = Options.GhostEspCol.Value -- Reuse the ESP color for the crosshair
-        
-        Crosshair.L1.Color = col
-        Crosshair.L1.Thickness = 2
-        Crosshair.L1.From = center - Vector2.new(12, 0)
-        Crosshair.L1.To = center + Vector2.new(12, 0)
-
-        Crosshair.L2.Color = col
-        Crosshair.L2.Thickness = 2
-        Crosshair.L2.From = center - Vector2.new(0, 12)
-        Crosshair.L2.To = center + Vector2.new(0, 12)
-    end
-end)
 -- ── 7. FINALIZATION ───────────────────────────────────────────
 
 -- Notify User of Successful Load
