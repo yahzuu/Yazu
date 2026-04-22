@@ -93,10 +93,16 @@ AutomationGrp:AddToggle('Blair_AutoTrackObj',   { Text = 'Auto-Track Objectives'
 AutomationGrp:AddToggle('Blair_InstaSanitize',  { Text = 'Instant Room Sanitization', Default = false })
 AutomationGrp:AddLabel('Loop Speed (Sec)'):AddSlider('Blair_AutoDelay', { Default = 5, Min = 1, Max = 30, Rounding = 1 })
 
+
 -- [VISUALS]
-VisualsGrp:AddToggle('Blair_GhostTrack',  { Text = 'Real-time Ghost Tracking', Default = false })
-VisualsGrp:AddToggle('Blair_OverrideApp', { Text = 'Override Ghost Visibility', Default = false })
-VisualsGrp:AddToggle('Blair_GhostESP',    { Text = 'Ghost ESP (High-Vis)', Default = false })
+VisualsGrp:AddToggle('Blair_GhostTrack',  { Text = 'Real-time Ghost Tracking', Default = false, Tooltip = 'Logs ghost coordinates to console' })
+VisualsGrp:AddToggle('Blair_OverrideApp', { Text = 'Override Ghost Visibility', Default = false, Tooltip = 'Forces ghost to stay rendered' })
+VisualsGrp:AddToggle('Blair_GhostESP',    { Text = 'Ghost ESP (High-Vis)', Default = false, Tooltip = 'Highlights ghost through walls' })
+
+VisualsGrp:AddLabel('ESP Color'):AddColorPicker('GhostEspCol', { 
+    Default = Color3.fromRGB(255, 0, 0),
+    Title = 'Ghost ESP Color' 
+})
 
 -- ── 6. MAIN FEATURE LOGIC (THE BRAIN) ─────────────────────────
 
