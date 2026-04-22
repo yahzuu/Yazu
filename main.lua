@@ -49,6 +49,10 @@ if placeId == 6137321701 then
     Tabs.blair = Window:AddTab('blair')
 end
 
+if placeId == 6348640020 then
+    Tabs.blair = Window:AddTab('blair')
+end
+
 -- UI Settings must always be last
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
