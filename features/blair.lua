@@ -1,6 +1,6 @@
 -- ================================================================
 --  features/blair.lua
---  Blair-specific features for Yazu
+--  Complete Blair Integration for Yazu Framework
 -- ================================================================
 
 return function(State, Tabs, Services, Library)
@@ -11,170 +11,201 @@ local LocalPlayer     = Services.LocalPlayer
 local RepStorage      = Services.ReplicatedStorage
 local UserInput       = Services.UserInputService
 
--- ── Variables ─────────────────────────────────────────────────
+-- ── 1. UI SETUP ───────────────────────────────────────────────
 local BlairTab = Tabs.Blair
 local MainGrp  = BlairTab:AddLeftGroupbox('Player Hacks')
-local EvidGrp  = BlairTab:AddRightGroupbox('Ghost & Evidence')
+local GhostGrp = BlairTab:AddRightGroupbox('Ghost & Evidence')
 local VisGrp   = BlairTab:AddLeftGroupbox('Visuals')
 local MiscGrp  = BlairTab:AddRightGroupbox('Miscellaneous')
 
-local OriginalSanityFunc = nil
-local GhostHighlights   = {}
+-- ── 2. INTERNAL STATE ─────────────────────────────────────────
+local BlairState = {
+    OriginalSanitySet = nil,
+    CrosshairLines    = {},
+    GhostHighlights   = {},
+}
 
--- ── Helpers ───────────────────────────────────────────────────
-local function GetSharedModule(name)
-    local sharedData = RepStorage:FindFirstChild("SharedData")
-    if sharedData then
-        local module = sharedData:FindFirstChild(name)
-        if module then return require(module) end
-    end
-    return nil
+-- ── 3. HELPER FUNCTIONS ───────────────────────────────────────
+local function GetModule(path)
+    local success, result = pcall(function()
+        return require(path)
+    end)
+    return success and result or nil
 end
 
-local function GetPlayerController()
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    local gameFolder = playerGui and playerGui:FindFirstChild("Game")
-    local controllerModule = gameFolder and gameFolder:FindFirstChild("PlayerController")
-    if controllerModule then return require(controllerModule) end
-    return nil
-end
+-- ── 4. FEATURE IMPLEMENTATIONS ────────────────────────────────
 
--- ── Crosshair Logic ───────────────────────────────────────────
-local CrosshairL1 = Drawing.new("Line")
-local CrosshairL2 = Drawing.new("Line")
+-- [CROSSHAIR LOGIC]
+local function CreateCrosshair()
+    local line1 = Drawing.new("Line")
+    local line2 = Drawing.new("Line")
+    
+    line1.Thickness = 2
+    line1.Color = Color3.fromRGB(255, 0, 0)
+    line2.Thickness = 2
+    line2.Color = Color3.fromRGB(255, 0, 0)
+    
+    BlairState.CrosshairLines = {line1, line2}
+end
+CreateCrosshair()
 
 local function UpdateCrosshair()
     local enabled = Toggles.Blair_Crosshair and Toggles.Blair_Crosshair.Value
-    CrosshairL1.Visible = enabled
-    CrosshairL2.Visible = enabled
-
+    local l1, l2 = BlairState.CrosshairLines[1], BlairState.CrosshairLines[2]
+    
+    l1.Visible = enabled
+    l2.Visible = enabled
+    
     if enabled then
         local cam = workspace.CurrentCamera
         local center = cam.ViewportSize / 2
         
-        CrosshairL1.From = center - Vector2.new(15, 0)
-        CrosshairL1.To   = center + Vector2.new(15, 0)
-        CrosshairL1.Color = Color3.fromRGB(255, 0, 0)
-        CrosshairL1.Thickness = 2
-
-        CrosshairL2.From = center - Vector2.new(0, 15)
-        CrosshairL2.To   = center + Vector2.new(0, 15)
-        CrosshairL2.Color = Color3.fromRGB(255, 0, 0)
-        CrosshairL2.Thickness = 2
+        l1.From = center - Vector2.new(15, 0)
+        l1.To   = center + Vector2.new(15, 0)
+        
+        l2.From = center - Vector2.new(0, 15)
+        l2.To   = center + Vector2.new(0, 15)
     end
 end
 
--- ── UI Elements & Logic ───────────────────────────────────────
+-- [SANITY HOOK]
+local function ToggleSanityFreeze(val)
+    local module = GetModule(RepStorage:WaitForChild("SharedData"):WaitForChild("SanityMonitor"))
+    if not module then return end
 
--- [Character Section]
-MainGrp:AddToggle('Blair_InfStamina', { Text = 'Infinite Stamina', Default = false })
-MainGrp:AddToggle('Blair_SanityFreeze', { 
-    Text = 'Sanity Freeze (100%)', 
-    Default = false,
-    Callback = function(val)
-        local sanityMod = GetSharedModule("SanityMonitor")
-        if sanityMod then
-            if val then
-                OriginalSanityFunc = sanityMod.setSanity
-                sanityMod.setSanity = function(newVal)
-                    if newVal < 100 then return OriginalSanityFunc(100) end
-                    return OriginalSanityFunc(newVal)
-                end
-            elseif OriginalSanityFunc then
-                sanityMod.setSanity = OriginalSanityFunc
-            end
+    if val then
+        BlairState.OriginalSanitySet = module.setSanity
+        module.setSanity = function(value)
+            -- If the game tries to set sanity lower than 100, force it to 100
+            return BlairState.OriginalSanitySet(100)
+        end
+    else
+        if BlairState.OriginalSanitySet then
+            module.setSanity = BlairState.OriginalSanitySet
         end
     end
-})
+end
 
--- [Ghost & Evidence Section]
-EvidGrp:AddToggle('Blair_AutoLog', { Text = 'Auto Evidence Logger', Default = false })
-EvidGrp:AddToggle('Blair_GhostESP', { Text = 'Ghost ESP', Default = false })
-EvidGrp:AddToggle('Blair_WritingInd', { Text = 'Ghost Writing Indicator', Default = false })
+-- ── 5. UI CONTROLS ─────────────────────────────────────────────
 
--- [Visuals Section]
+-- Player Group
+MainGrp:AddToggle('Blair_InfStamina', { Text = 'Infinite Stamina', Default = false })
+MainGrp:AddToggle('Blair_SanityFreeze', { Text = 'Sanity Freeze (100%)', Default = false, Callback = ToggleSanityFreeze })
+
+-- Ghost & Evidence Group
+GhostGrp:AddToggle('Blair_AutoEvidence', { Text = 'Auto Evidence Logger', Default = false })
+GhostGrp:AddToggle('Blair_WritingInd', { Text = 'Ghost Writing Indicator', Default = false })
+GhostGrp:AddToggle('Blair_GhostESP', { Text = 'Ghost ESP', Default = false })
+
+-- Visuals Group
 VisGrp:AddToggle('Blair_FullBright', { Text = 'Full Bright', Default = false })
 VisGrp:AddToggle('Blair_NoFlashDrain', { Text = 'No Flashlight Drain', Default = false })
-VisGrp:AddToggle('Blair_Crosshair', { Text = 'Crosshair', Default = false })
+VisGrp:AddToggle('Blair_Crosshair', { Text = 'Crosshair Overlay', Default = false })
 
--- [Misc Section]
+-- Misc Group
 MiscGrp:AddToggle('Blair_FastInteract', { Text = 'Fast Interaction', Default = false })
 MiscGrp:AddToggle('Blair_RadioSpam', { Text = 'Radio Spammer', Default = false })
 
--- ── Main Loop (Heartbeat) ─────────────────────────────────────
+-- ── 6. MAIN LOOPS ──────────────────────────────────────────────
+
+-- Heartbeat Loop for continuous features
 RunService.Heartbeat:Connect(function()
     -- 1. Infinite Stamina
     if Toggles.Blair_InfStamina and Toggles.Blair_InfStamina.Value then
-        local controller = GetPlayerController()
-        if controller then controller.Sprint = 0.5 end
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local controller = playerGui and GetModule(playerGui:WaitForChild("Game"):WaitForChild("PlayerController"))
+        if controller then
+            controller.Sprint = 0.5
+        end
     end
 
-    -- 2. Full Bright
-    if Toggles.Blair_FullBright and Toggles.Blair_FullBright.Value then
-        local lightMod = GetSharedModule("LightPartRemote")
-        if lightMod then lightMod.OverrideAmbient = true end
-    end
-
-    -- 3. Flashlight
-    if Toggles.Blair_NoFlashDrain and Toggles.Blair_NoFlashDrain.Value then
-        local flashMod = GetSharedModule("Flashlight")
-        if flashMod then flashMod.Intensity = 1 end
-    end
-
-    -- 4. Fast Interaction
+    -- 2. Fast Interaction
     if Toggles.Blair_FastInteract and Toggles.Blair_FastInteract.Value then
-        for _, obj in next, workspace:GetDescendants() do
-            if obj:IsA("ProximityPrompt") then
-                obj.HoldDuration = 0
+        for _, prompt in next, workspace:GetDescendants() do
+            if prompt:IsA("ProximityPrompt") then
+                prompt.HoldDuration = 0
             end
         end
     end
 
-    -- 5. Auto Evidence / Indicators
-    if Toggles.Blair_AutoLog and Toggles.Blair_AutoLog.Value then
-        local emf = GetSharedModule("EMFLocalCore")
-        local thermo = GetSharedModule("ThermometerLocalCore")
-        if emf and emf.EvidenceFound then Library:Notify("EMF Evidence Detected!") end
-        if thermo and thermo.TemperatureDrop then Library:Notify("Freezing Temps Detected!") end
+    -- 3. Full Bright
+    if Toggles.Blair_FullBright and Toggles.Blair_FullBright.Value then
+        local lightRemote = GetModule(RepStorage.SharedData:FindFirstChild("LightPartRemote"))
+        if lightRemote then 
+            lightRemote.OverrideAmbient = true 
+        end
+    end
+
+    -- 4. No Flashlight Drain
+    if Toggles.Blair_NoFlashDrain and Toggles.Blair_NoFlashDrain.Value then
+        local flashMod = GetModule(RepStorage.SharedData:FindFirstChild("Flashlight"))
+        if flashMod then 
+            flashMod.Intensity = 1 
+        end
+    end
+
+    -- 5. Crosshair
+    UpdateCrosshair()
+
+    -- 6. Evidence Monitoring (Notifications)
+    if Toggles.Blair_AutoEvidence and Toggles.Blair_AutoEvidence.Value then
+        local emf = GetModule(RepStorage.SharedData:FindFirstChild("EMFLocalCore"))
+        local thermo = GetModule(RepStorage.SharedData:FindFirstChild("ThermometerLocalCore"))
+        
+        if emf and emf.EvidenceFound then 
+            Library:Notify("[BLAIR] EMF Evidence Detected!", 3) 
+        end
+        if thermo and thermo.TemperatureDrop then 
+            Library:Notify("[BLAIR] Freezing Temps Detected!", 3) 
+        end
     end
 
     if Toggles.Blair_WritingInd and Toggles.Blair_WritingInd.Value then
-        local book = GetSharedModule("GhostWritingBook")
-        if book and book.EvidenceFound then Library:Notify("Ghost Writing Found!") end
+        local book = GetModule(RepStorage.SharedData:FindFirstChild("GhostWritingBook"))
+        if book and book.EvidenceFound then 
+            Library:Notify("[BLAIR] Ghost Writing Found!", 3)
+        end
     end
+end)
 
-    -- 6. Ghost ESP
-    if Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value then
-        for _, obj in next, workspace:GetChildren() do
-            if obj.Name:find("Ghost") and obj:IsA("Model") then
-                if not obj:FindFirstChild("YazuESP") then
-                    local h = Instance.new("Highlight")
-                    h.Name = "YazuESP"
-                    h.FillColor = Color3.fromRGB(255, 0, 0)
-                    h.OutlineColor = Color3.fromRGB(255, 255, 255)
-                    h.Parent = obj
-                end
+-- Dedicated Thread for Radio Spammer
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if Toggles.Blair_RadioSpam and Toggles.Blair_RadioSpam.Value then
+            local radio = GetModule(RepStorage.SharedData:FindFirstChild("RadioRemote"))
+            if radio then
+                pcall(function() radio.SendSignal("Yazu Framework Active") end)
             end
         end
-    else
-        for _, obj in next, workspace:GetChildren() do
-            local h = obj:FindFirstChild("YazuESP")
-            if h then h:Destroy() end
-        end
     end
-
-    -- 7. Crosshair
-    UpdateCrosshair()
 end)
 
--- ── Secondary Loop (Radio Spam) ───────────────────────────────
+-- Ghost ESP Loop
 task.spawn(function()
-    while task.wait(1) do
-        if Toggles.Blair_RadioSpam and Toggles.Blair_RadioSpam.Value then
-            local radio = GetSharedModule("RadioRemote")
-            if radio then radio.SendSignal("Signal Interference Detected") end
+    while true do
+        task.wait(0.5)
+        if Toggles.Blair_GhostESP and Toggles.Blair_GhostESP.Value then
+            for _, obj in next, workspace:GetChildren() do
+                -- Blair ghosts usually have "Ghost" in their name
+                if obj.Name:find("Ghost") and obj:IsA("Model") then
+                    if not obj:FindFirstChild("YazuHighlight") then
+                        local highlight = Instance.new("Highlight")
+                        highlight.Name = "YazuHighlight"
+                        highlight.FillColor = Color3.fromRGB(255, 0, 0)
+                        highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+                        highlight.Parent = obj
+                    end
+                end
+            end
+        else
+            -- Clean up highlights when toggled off
+            for _, obj in next, workspace:GetChildren() do
+                local h = obj:FindFirstChild("YazuHighlight")
+                if h then h:Destroy() end
+            end
         end
     end
 end)
 
-end
+end -- End Function
