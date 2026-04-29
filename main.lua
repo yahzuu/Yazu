@@ -72,6 +72,7 @@ safeLoad('features/aimbot.lua')
 safeLoad('features/esp.lua')
 safeLoad('features/misc.lua')
 safeLoad('features/dumper.lua')
+safeLoad('features/bloodlines.lua')
 
 local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
