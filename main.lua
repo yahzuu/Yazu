@@ -53,6 +53,9 @@ if placeId == 6348640020 then
     Tabs.blair = Window:AddTab('blair')
 end
 
+if placeId == 10266164381 then
+    Tabs.bloodlines = Window:AddTab('bloodlines')
+end
 -- UI Settings must always be last
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
@@ -72,12 +75,13 @@ safeLoad('features/aimbot.lua')
 safeLoad('features/esp.lua')
 safeLoad('features/misc.lua')
 safeLoad('features/dumper.lua')
-safeLoad('features/bloodlines.lua')
+
 
 local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
     [6137321701] = 'features/blair.lua',
     [6348640020] = 'features/blair.lua',
+    [10266164381] = 'features/bloodlines.lua',
 }
 
 if placeFeatures[placeId] then
