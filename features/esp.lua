@@ -180,7 +180,7 @@ local EspColorGrp = Tabs.ESP:AddRightGroupbox('Colors')
 
 EspGrp:AddToggle('ToggleEsp',   { Text = 'Enable ESP', Default = false, Callback = startEsp })
 EspGrp:AddToggle('SmartESP',    { Text = 'Smart ESP (skip whitelisted)', Default = false })
-EspGrp:AddSlider('MaxEspDist',  { Text = 'Max Distance (studs)', Default = 1000, Min = 50, Max = 10000, Rounding = 0 })
+EspGrp:AddSlider('MaxEspDist',  { Text = 'Max Distance (studs)', Default = 1000, Min = 50, Max = 3100000, Rounding = 0 })
 EspGrp:AddDropdown('EspFont', {
     Text = 'Font', Default = 1, Values = { 'UI', 'System', 'Plex', 'Monospace' },
     Callback = function(font)
@@ -662,7 +662,7 @@ RadarGrp:AddSlider('RadarRange', {
     Text     = 'World Range (studs)',
     Default  = RADAR_DEFAULT_RANGE,
     Min      = 50,
-    Max      = 2000,
+    Max      = 3100000,
     Rounding = 0,
 })
 RadarGrp:AddButton('Reset Radar Position', function()
