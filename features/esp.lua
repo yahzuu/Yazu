@@ -180,7 +180,7 @@ local EspColorGrp = Tabs.ESP:AddRightGroupbox('Colors')
 
 EspGrp:AddToggle('ToggleEsp',   { Text = 'Enable ESP', Default = false, Callback = startEsp })
 EspGrp:AddToggle('SmartESP',    { Text = 'Smart ESP (skip whitelisted)', Default = false })
-EspGrp:AddSlider('MaxEspDist',  { Text = 'Max Distance (studs)', Default = 1000, Min = 50, Max = 3100000, Rounding = 0 })
+EspGrp:AddSlider('MaxEspDist',  { Text = 'Max Distance (studs)', Default = 1000, Min = 50, Max = 100000, Rounding = 0 })
 EspGrp:AddDropdown('EspFont', {
     Text = 'Font', Default = 1, Values = { 'UI', 'System', 'Plex', 'Monospace' },
     Callback = function(font)
@@ -242,41 +242,142 @@ EspColorGrp:AddLabel('Name Outline Color'):AddColorPicker('EspNameOutline', { De
 --  radar can reference it without any extra State wiring.
 -- ================================================================
 
-local SpectateConn       = nil
-local SpectateTarget     = nil  -- Player currently being spectated (upvalue shared with Radar)
-local SpectatePollThread = nil  -- coroutine that waits for the character to stream in
+local SpectateConn        = nil
+local SpectateTarget      = nil  -- Player currently being spectated (upvalue shared with Radar)
+local SpectateRenderConn  = nil  -- RenderStepped loop that drives camera + streaming focus
+local SpectateCharConn    = nil  -- CharacterAdded watcher (reconnects on respawn)
 
-local function stopSpectate()
-    if SpectateConn       then SpectateConn:Disconnect(); SpectateConn = nil end
-    if SpectatePollThread then task.cancel(SpectatePollThread); SpectatePollThread = nil end
-    SpectateTarget = nil
-    local cam = workspace.CurrentCamera
-    if cam then
-        cam.CameraType    = Enum.CameraType.Follow
-        cam.CameraSubject = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid') or nil
+-- ── Streaming-aware spectate helpers ───────────────────────────
+--
+--  workspace.StreamingEnabled means far-away characters simply do not
+--  exist on the client.  To force Roblox to load them we do two things:
+--
+--  1. Set workspace.CurrentCamera.CFrame / .Focus to the target's last
+--     known server position every frame — this shifts the streaming
+--     focal point so the engine starts sending us those chunks.
+--
+--  2. Write LocalPlayer.ReplicationFocus to the target's root (if that
+--     property is writable by the executor).  This is the proper API for
+--     redirecting which area the server replicates to this client.
+--
+--  While the character is loading we stay in scriptable mode and manually
+--  position the camera at the target's last network-replicated position
+--  (readable from the humanoid state / character even before all parts
+--  exist).  The moment the full character arrives we switch to Attach.
+-- ───────────────────────────────────────────────────────────────
+
+local function getTargetPosition()
+    -- Returns the best available world position for SpectateTarget, or nil.
+    if not SpectateTarget then return nil end
+    local char = SpectateTarget.Character
+    if not char then return nil end
+    local root = char:FindFirstChild('HumanoidRootPart')
+    if root then return root.Position end
+    -- Fallback: any BasePart in the character (e.g. during streaming-in)
+    for _, v in next, char:GetChildren() do
+        if v:IsA('BasePart') then return v.Position end
     end
+    return nil
 end
 
-local function attachCamToTarget()
+local function setReplicationFocus(root)
+    -- Try to redirect server replication to the target's position.
+    -- This forces Roblox to stream the area around the target to our client.
+    pcall(function()
+        LocalPlayer.ReplicationFocus = root
+    end)
+    -- Also force the camera's Focus CFrame so the streaming system
+    -- uses the target location as the LOD origin even before Attach works.
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam and root then
+            cam.Focus = CFrame.new(root.Position)
+        end
+    end)
+end
+
+local function clearReplicationFocus()
+    pcall(function()
+        local lc = LocalPlayer.Character
+        local root = lc and lc:FindFirstChild('HumanoidRootPart')
+        LocalPlayer.ReplicationFocus = root or workspace
+    end)
+end
+
+local function tryAttachCam()
+    -- Returns true and attaches camera if the full character is loaded.
     local cam  = workspace.CurrentCamera; if not cam then return false end
     local char = SpectateTarget and SpectateTarget.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
-    if root then
-        cam.CameraType    = Enum.CameraType.Attach
-        cam.CameraSubject = root
-        return true
-    end
-    return false
+    if not root then return false end
+    cam.CameraType    = Enum.CameraType.Attach
+    cam.CameraSubject = root
+    setReplicationFocus(root)
+    return true
 end
 
--- Poll until the target's character/root actually exists (handles streaming + far players)
-local function pollAttachCam()
-    local attempts = 0
-    while SpectateTarget and attempts < 300 do  -- up to ~30 s at 10 Hz
-        if attachCamToTarget() then return end
-        task.wait(0.1)
-        attempts = attempts + 1
+local function stopSpectate()
+    if SpectateRenderConn then SpectateRenderConn:Disconnect(); SpectateRenderConn = nil end
+    if SpectateCharConn   then SpectateCharConn:Disconnect();   SpectateCharConn   = nil end
+    if SpectateConn       then SpectateConn:Disconnect();       SpectateConn       = nil end
+    SpectateTarget = nil
+    clearReplicationFocus()
+    local cam = workspace.CurrentCamera
+    if cam then
+        cam.CameraType    = Enum.CameraType.Follow
+        cam.CameraSubject = LocalPlayer.Character
+            and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid') or nil
     end
+end
+
+local function startSpectateLoop()
+    -- Kill any existing loop first
+    if SpectateRenderConn then SpectateRenderConn:Disconnect(); SpectateRenderConn = nil end
+
+    local attached = false
+
+    SpectateRenderConn = RunService.RenderStepped:Connect(function()
+        if not SpectateTarget then return end
+        local cam = workspace.CurrentCamera; if not cam then return end
+
+        local char = SpectateTarget.Character
+        local root = char and char:FindFirstChild('HumanoidRootPart')
+
+        if root then
+            -- Force streaming to load the area around the target every frame
+            setReplicationFocus(root)
+
+            if not attached then
+                -- Switch from Scriptable → Attach now that the root exists
+                cam.CameraType    = Enum.CameraType.Attach
+                cam.CameraSubject = root
+                attached = true
+            end
+        else
+            -- Character not streamed yet: manually position camera at last known pos
+            -- and keep hammering ReplicationFocus so Roblox sends us the data
+            attached = false
+            cam.CameraType = Enum.CameraType.Scriptable
+
+            local pos = getTargetPosition()
+            if pos then
+                cam.CFrame = CFrame.new(pos + Vector3.new(0, 5, 12), pos)
+                pcall(function() cam.Focus = CFrame.new(pos) end)
+                -- Drive replication toward that position directly
+                pcall(function()
+                    LocalPlayer.ReplicationFocus = workspace.Terrain
+                    -- Terrain is a writable fallback; actual position is set via cam.Focus
+                end)
+            end
+
+            -- Also directly request character load via RequestStreamAroundAsync if available
+            pcall(function()
+                if pos and workspace.RequestStreamAroundAsync then
+                    workspace:RequestStreamAroundAsync(pos, 0)
+                end
+            end)
+        end
+    end)
 end
 
 local function spectatePlayer(targetName)
@@ -286,17 +387,13 @@ local function spectatePlayer(targetName)
     if not target or target == LocalPlayer then return end
     SpectateTarget = target
 
-    -- Try immediately; if character isn't streamed yet, keep polling in background
-    if not attachCamToTarget() then
-        SpectatePollThread = task.spawn(pollAttachCam)
-    end
+    -- Start the per-frame loop immediately (handles both loaded and unloaded chars)
+    startSpectateLoop()
 
-    -- Re-attach on every future respawn (also covers coming back into streaming range)
-    SpectateConn = SpectateTarget.CharacterAdded:Connect(function()
+    -- Re-start the loop on respawn so we re-attach cleanly after death
+    SpectateCharConn = SpectateTarget.CharacterAdded:Connect(function()
         task.wait(0.1)
-        -- Cancel any in-flight poll and start a fresh one for the new character
-        if SpectatePollThread then task.cancel(SpectatePollThread) end
-        SpectatePollThread = task.spawn(pollAttachCam)
+        startSpectateLoop()
     end)
 end
 
@@ -662,7 +759,7 @@ RadarGrp:AddSlider('RadarRange', {
     Text     = 'World Range (studs)',
     Default  = RADAR_DEFAULT_RANGE,
     Min      = 50,
-    Max      = 3100000,
+    Max      = 25000,
     Rounding = 0,
 })
 RadarGrp:AddButton('Reset Radar Position', function()
