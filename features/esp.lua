@@ -242,11 +242,13 @@ EspColorGrp:AddLabel('Name Outline Color'):AddColorPicker('EspNameOutline', { De
 --  radar can reference it without any extra State wiring.
 -- ================================================================
 
-local SpectateConn   = nil
-local SpectateTarget = nil  -- Player currently being spectated (upvalue shared with Radar)
+local SpectateConn       = nil
+local SpectateTarget     = nil  -- Player currently being spectated (upvalue shared with Radar)
+local SpectatePollThread = nil  -- coroutine that waits for the character to stream in
 
 local function stopSpectate()
-    if SpectateConn then SpectateConn:Disconnect(); SpectateConn = nil end
+    if SpectateConn       then SpectateConn:Disconnect(); SpectateConn = nil end
+    if SpectatePollThread then task.cancel(SpectatePollThread); SpectatePollThread = nil end
     SpectateTarget = nil
     local cam = workspace.CurrentCamera
     if cam then
@@ -256,12 +258,24 @@ local function stopSpectate()
 end
 
 local function attachCamToTarget()
-    local cam  = workspace.CurrentCamera; if not cam then return end
+    local cam  = workspace.CurrentCamera; if not cam then return false end
     local char = SpectateTarget and SpectateTarget.Character
     local root = char and char:FindFirstChild('HumanoidRootPart')
     if root then
         cam.CameraType    = Enum.CameraType.Attach
         cam.CameraSubject = root
+        return true
+    end
+    return false
+end
+
+-- Poll until the target's character/root actually exists (handles streaming + far players)
+local function pollAttachCam()
+    local attempts = 0
+    while SpectateTarget and attempts < 300 do  -- up to ~30 s at 10 Hz
+        if attachCamToTarget() then return end
+        task.wait(0.1)
+        attempts = attempts + 1
     end
 end
 
@@ -271,11 +285,18 @@ local function spectatePlayer(targetName)
     local target = Players:FindFirstChild(targetName)
     if not target or target == LocalPlayer then return end
     SpectateTarget = target
-    attachCamToTarget()
-    -- Re-attach on respawn
+
+    -- Try immediately; if character isn't streamed yet, keep polling in background
+    if not attachCamToTarget() then
+        SpectatePollThread = task.spawn(pollAttachCam)
+    end
+
+    -- Re-attach on every future respawn (also covers coming back into streaming range)
     SpectateConn = SpectateTarget.CharacterAdded:Connect(function()
         task.wait(0.1)
-        attachCamToTarget()
+        -- Cancel any in-flight poll and start a fresh one for the new character
+        if SpectatePollThread then task.cancel(SpectatePollThread) end
+        SpectatePollThread = task.spawn(pollAttachCam)
     end)
 end
 
@@ -346,12 +367,20 @@ end)
 --  The spectated player's blip is drawn in cyan so it's easy to spot.
 -- ================================================================
 
-local radarDrawings = {}  -- static BG drawing objects (border, bg, crosshair, label)
-local radarBlips    = {}  -- [player] = { dot=Drawing, name=Drawing }
-local RadarConn     = nil
+local radarDrawings  = {}  -- static BG drawing objects (border, bg, crosshair, label)
+local radarBlips     = {}  -- [player] = { dot=Drawing, name=Drawing }
+local RadarConn      = nil
+local RadarDragConn1 = nil
+local RadarDragConn2 = nil
+local RadarDragConn3 = nil
 
 local RADAR_DEFAULT_SIZE  = 300   -- px
 local RADAR_DEFAULT_RANGE = 300   -- studs
+
+-- Persisted radar center so it survives size-slider changes without resetting position
+local radarCenter     = nil   -- Vector2, nil until first startRadar call
+local radarDragging   = false
+local radarDragOffset = Vector2.new(0, 0)  -- mouse pos relative to center when drag began
 
 local function clearRadarStatic()
     for _, d in next, radarDrawings do pcall(function() d:Remove() end) end
@@ -452,7 +481,11 @@ local radarBG = nil   -- holds refs returned by buildRadarBG
 local lastRadarSize = nil
 
 local function stopRadar()
-    if RadarConn then RadarConn:Disconnect(); RadarConn = nil end
+    if RadarConn      then RadarConn:Disconnect();      RadarConn      = nil end
+    if RadarDragConn1 then RadarDragConn1:Disconnect(); RadarDragConn1 = nil end
+    if RadarDragConn2 then RadarDragConn2:Disconnect(); RadarDragConn2 = nil end
+    if RadarDragConn3 then RadarDragConn3:Disconnect(); RadarDragConn3 = nil end
+    radarDragging = false
     clearRadarStatic()
     clearAllRadarBlips()
     radarBG       = nil
@@ -468,36 +501,76 @@ local function startRadar(on)
     local function getSize()  return Options.RadarSize  and Options.RadarSize.Value  or RADAR_DEFAULT_SIZE  end
     local function getRange() return Options.RadarRange and Options.RadarRange.Value or RADAR_DEFAULT_RANGE end
 
-    local cam   = workspace.CurrentCamera
-    local vs    = cam and cam.ViewportSize or Vector2.new(1920,1080)
-    local sz    = getSize()
-    local ctr   = Vector2.new(vs.X - sz/2 - 20, vs.Y - sz/2 - 20)
-    radarBG     = buildRadarBG(ctr, sz)
+    -- Initialise center only on first launch; preserve it across size changes / re-enables
+    if not radarCenter then
+        local cam = workspace.CurrentCamera
+        local vs  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+        local sz  = getSize()
+        radarCenter = Vector2.new(vs.X - sz/2 - 20, vs.Y - sz/2 - 20)
+    end
+
+    local sz = getSize()
+    radarBG       = buildRadarBG(radarCenter, sz)
     lastRadarSize = sz
+
+    -- ── Drag handling ──────────────────────────────────────────────
+    -- InputBegan: start drag when left-clicking inside the radar square
+    RadarDragConn1 = UserInputService.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        local mp    = UserInputService:GetMouseLocation()
+        local half  = (Options.RadarSize and Options.RadarSize.Value or RADAR_DEFAULT_SIZE) / 2
+        local ctr   = radarCenter
+        if math.abs(mp.X - ctr.X) <= half and math.abs(mp.Y - ctr.Y) <= half then
+            radarDragging   = true
+            radarDragOffset = mp - ctr
+        end
+    end)
+
+    -- InputChanged: move radar with the mouse while dragging
+    RadarDragConn2 = UserInputService.InputChanged:Connect(function(input)
+        if not radarDragging then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local mp = UserInputService:GetMouseLocation()
+        radarCenter = mp - radarDragOffset
+    end)
+
+    -- InputEnded: release drag
+    RadarDragConn3 = UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            radarDragging = false
+        end
+    end)
+    -- ──────────────────────────────────────────────────────────────
 
     RadarConn = RunService.RenderStepped:Connect(function()
         local cam2 = workspace.CurrentCamera; if not cam2 then return end
-        local vs2  = cam2.ViewportSize
         local sz2  = getSize()
         local rng  = getRange()
-        local ctr2 = Vector2.new(vs2.X - sz2/2 - 20, vs2.Y - sz2/2 - 20)
+        -- Use the draggable radarCenter upvalue; clamp to viewport so it can't go off-screen
+        local vs2  = cam2.ViewportSize
         local half = sz2 / 2
+        radarCenter = Vector2.new(
+            math.clamp(radarCenter.X, half + 4, vs2.X - half - 4),
+            math.clamp(radarCenter.Y, half + 4, vs2.Y - half - 4)
+        )
+        local ctr2 = radarCenter
 
         -- Rebuild BG only if size changed (avoids per-frame allocation)
         if sz2 ~= lastRadarSize then
             radarBG       = buildRadarBG(ctr2, sz2)
             lastRadarSize = sz2
         else
-            -- Reposition existing BG elements
-            radarBG.border.Size     = Vector2.new(sz2+6, sz2+6)
-            radarBG.border.Position = ctr2 - Vector2.new(half+3, half+3)
-            radarBG.bg.Size         = Vector2.new(sz2, sz2)
-            radarBG.bg.Position     = ctr2 - Vector2.new(half, half)
-            radarBG.ch_h.From       = Vector2.new(ctr2.X - half, ctr2.Y)
-            radarBG.ch_h.To         = Vector2.new(ctr2.X + half, ctr2.Y)
-            radarBG.ch_v.From       = Vector2.new(ctr2.X, ctr2.Y - half)
-            radarBG.ch_v.To         = Vector2.new(ctr2.X, ctr2.Y + half)
-            radarBG.lbl.Position    = Vector2.new(ctr2.X, ctr2.Y - half - 14)
+            -- Reposition existing BG elements to current (possibly dragged) center
+            radarBG.border.Size      = Vector2.new(sz2+6, sz2+6)
+            radarBG.border.Position  = ctr2 - Vector2.new(half+3, half+3)
+            radarBG.bg.Size          = Vector2.new(sz2, sz2)
+            radarBG.bg.Position      = ctr2 - Vector2.new(half, half)
+            radarBG.ch_h.From        = Vector2.new(ctr2.X - half, ctr2.Y)
+            radarBG.ch_h.To          = Vector2.new(ctr2.X + half, ctr2.Y)
+            radarBG.ch_v.From        = Vector2.new(ctr2.X, ctr2.Y - half)
+            radarBG.ch_v.To          = Vector2.new(ctr2.X, ctr2.Y + half)
+            radarBG.lbl.Position     = Vector2.new(ctr2.X, ctr2.Y - half - 14)
             radarBG.selfDot.Position = ctr2 - Vector2.new(3.5, 3.5)
         end
 
@@ -592,6 +665,14 @@ RadarGrp:AddSlider('RadarRange', {
     Max      = 2000,
     Rounding = 0,
 })
+RadarGrp:AddButton('Reset Radar Position', function()
+    -- Snap back to default bottom-right corner
+    local cam = workspace.CurrentCamera
+    local vs  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+    local sz  = Options.RadarSize and Options.RadarSize.Value or RADAR_DEFAULT_SIZE
+    radarCenter   = Vector2.new(vs.X - sz/2 - 20, vs.Y - sz/2 - 20)
+    radarDragging = false
+end)
 
 -- ================================================================
 --  ANTI-AFK
