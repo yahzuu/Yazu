@@ -233,4 +233,508 @@ EspColorGrp:AddLabel('Override ESP Color (optional)'):AddColorPicker('EspColour'
 EspColorGrp:AddToggle('UseEspColourOverride', { Text = 'Use Color Override', Default = false })
 EspColorGrp:AddLabel('Name Outline Color'):AddColorPicker('EspNameOutline', { Default = Color3.new(0,0,0), Title = 'Name Outline' })
 
+-- ================================================================
+--  SPECTATE
+-- ================================================================
+--  Locks the camera to a selected player's HumanoidRootPart using
+--  Enum.CameraType.Attach.  Camera restores to Follow on disable.
+--  Spectated player is tracked in the upvalue SpectateTarget so the
+--  radar can reference it without any extra State wiring.
+-- ================================================================
+
+local SpectateConn   = nil
+local SpectateTarget = nil  -- Player currently being spectated (upvalue shared with Radar)
+
+local function stopSpectate()
+    if SpectateConn then SpectateConn:Disconnect(); SpectateConn = nil end
+    SpectateTarget = nil
+    local cam = workspace.CurrentCamera
+    if cam then
+        cam.CameraType    = Enum.CameraType.Follow
+        cam.CameraSubject = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid') or nil
+    end
+end
+
+local function attachCamToTarget()
+    local cam  = workspace.CurrentCamera; if not cam then return end
+    local char = SpectateTarget and SpectateTarget.Character
+    local root = char and char:FindFirstChild('HumanoidRootPart')
+    if root then
+        cam.CameraType    = Enum.CameraType.Attach
+        cam.CameraSubject = root
+    end
+end
+
+local function spectatePlayer(targetName)
+    stopSpectate()
+    if not targetName or targetName == '' then return end
+    local target = Players:FindFirstChild(targetName)
+    if not target or target == LocalPlayer then return end
+    SpectateTarget = target
+    attachCamToTarget()
+    -- Re-attach on respawn
+    SpectateConn = SpectateTarget.CharacterAdded:Connect(function()
+        task.wait(0.1)
+        attachCamToTarget()
+    end)
+end
+
+local SpectateGrp = Tabs.ESP:AddLeftGroupbox('Spectate')
+
+SpectateGrp:AddToggle('SpectateEnabled', {
+    Text    = 'Enable Spectate',
+    Default = false,
+    Callback = function(on)
+        if not on then
+            stopSpectate()
+        else
+            local sel = Options.SpectateTarget and Options.SpectateTarget.Value
+            if sel and sel ~= '' then spectatePlayer(sel) end
+        end
+    end,
+})
+
+local function getPlayerNames()
+    local names = {}
+    for _, p in next, Players:GetPlayers() do
+        if p ~= LocalPlayer then names[#names+1] = p.Name end
+    end
+    table.sort(names)
+    if #names == 0 then names = { '(no players)' } end
+    return names
+end
+
+SpectateGrp:AddDropdown('SpectateTarget', {
+    Text    = 'Target Player',
+    Default = 1,
+    Values  = getPlayerNames(),
+    Callback = function(name)
+        if Toggles.SpectateEnabled and Toggles.SpectateEnabled.Value then
+            spectatePlayer(name)
+        end
+    end,
+})
+
+SpectateGrp:AddButton('Refresh Player List', function()
+    local names = getPlayerNames()
+    if Options.SpectateTarget then
+        if Options.SpectateTarget.SetValues then
+            Options.SpectateTarget:SetValues(names)
+        end
+    end
+end)
+
+-- Stop spectating if the target leaves
+Players.PlayerRemoving:Connect(function(p)
+    if p == SpectateTarget then
+        stopSpectate()
+        if Toggles.SpectateEnabled then Toggles.SpectateEnabled:SetValue(false) end
+    end
+end)
+
+-- ================================================================
+--  RADAR / MAP
+-- ================================================================
+--  Pure Drawing-based top-down minimap drawn in the lower-right
+--  corner.  Size and world range are controlled by sliders so the
+--  user can scale it freely at runtime.
+--
+--  Center origin:
+--    • Spectate ON  → spectated player's HRP
+--    • Spectate OFF → LocalPlayer's HRP
+--
+--  The spectated player's blip is drawn in cyan so it's easy to spot.
+-- ================================================================
+
+local radarDrawings = {}  -- static BG drawing objects (border, bg, crosshair, label)
+local radarBlips    = {}  -- [player] = { dot=Drawing, name=Drawing }
+local RadarConn     = nil
+
+local RADAR_DEFAULT_SIZE  = 300   -- px
+local RADAR_DEFAULT_RANGE = 300   -- studs
+
+local function clearRadarStatic()
+    for _, d in next, radarDrawings do pcall(function() d:Remove() end) end
+    radarDrawings = {}
+end
+
+local function clearAllRadarBlips()
+    for player, blip in next, radarBlips do
+        pcall(function() blip.dot:Remove()  end)
+        pcall(function() blip.name:Remove() end)
+    end
+    radarBlips = {}
+end
+
+-- Top-down world → screen-space radar conversion
+local function worldToRadarPos(origin, targetPos, radarCenter, halfSize, worldRange)
+    local diff  = targetPos - origin
+    local scale = halfSize / worldRange
+    return Vector2.new(radarCenter.X + diff.X * scale,
+                       radarCenter.Y + diff.Z * scale)
+end
+
+-- Build (or rebuild) the static background drawing objects
+local function buildRadarBG(center, size)
+    clearRadarStatic()
+    local half = size / 2
+
+    local border = newDraw('Square', {
+        Visible      = true, Filled = true,
+        Color        = Color3.fromRGB(0, 0, 0),
+        Transparency = 0.5,
+        Size         = Vector2.new(size + 6, size + 6),
+        Position     = center - Vector2.new(half + 3, half + 3),
+    })
+    local bg = newDraw('Square', {
+        Visible      = true, Filled = true,
+        Color        = Color3.fromRGB(10, 12, 22),
+        Transparency = 0.3,
+        Size         = Vector2.new(size, size),
+        Position     = center - Vector2.new(half, half),
+    })
+    local ch_h = newDraw('Line', {
+        Visible      = true,
+        Color        = Color3.fromRGB(255,255,255),
+        Transparency = 0.75,
+        Thickness    = 1,
+        From         = Vector2.new(center.X - half, center.Y),
+        To           = Vector2.new(center.X + half, center.Y),
+    })
+    local ch_v = newDraw('Line', {
+        Visible      = true,
+        Color        = Color3.fromRGB(255,255,255),
+        Transparency = 0.75,
+        Thickness    = 1,
+        From         = Vector2.new(center.X, center.Y - half),
+        To           = Vector2.new(center.X, center.Y + half),
+    })
+    local lbl = newDraw('Text', {
+        Visible      = true,
+        Text         = 'RADAR',
+        Size         = 11,
+        Color        = Color3.fromRGB(180,180,200),
+        Outline      = true,
+        OutlineColor = Color3.new(0,0,0),
+        Center       = true,
+        Position     = Vector2.new(center.X, center.Y - half - 14),
+    })
+    -- Self-dot (always at center)
+    local selfDot = newDraw('Square', {
+        Visible  = true,
+        Filled   = true,
+        Color    = Color3.fromRGB(255,255,255),
+        Size     = Vector2.new(7,7),
+        Position = center - Vector2.new(3.5, 3.5),
+    })
+
+    table.insert(radarDrawings, border)
+    table.insert(radarDrawings, bg)
+    table.insert(radarDrawings, ch_h)
+    table.insert(radarDrawings, ch_v)
+    table.insert(radarDrawings, lbl)
+    table.insert(radarDrawings, selfDot)
+
+    return { border=border, bg=bg, ch_h=ch_h, ch_v=ch_v, lbl=lbl, selfDot=selfDot }
+end
+
+-- Ensure a blip exists for a player (called lazily during radar loop)
+local function ensureBlip(player)
+    if player == LocalPlayer then return end
+    if radarBlips[player] then return end
+    radarBlips[player] = {
+        dot  = newDraw('Square', { Visible=false, Filled=true, Size=Vector2.new(6,6) }),
+        name = newDraw('Text',   { Visible=false, Size=10, Outline=true, OutlineColor=Color3.new(0,0,0), Center=true }),
+    }
+end
+
+local radarBG = nil   -- holds refs returned by buildRadarBG
+local lastRadarSize = nil
+
+local function stopRadar()
+    if RadarConn then RadarConn:Disconnect(); RadarConn = nil end
+    clearRadarStatic()
+    clearAllRadarBlips()
+    radarBG       = nil
+    lastRadarSize = nil
+end
+
+local function startRadar(on)
+    stopRadar()
+    if not on then return end
+
+    for _, p in next, Players:GetPlayers() do ensureBlip(p) end
+
+    local function getSize()  return Options.RadarSize  and Options.RadarSize.Value  or RADAR_DEFAULT_SIZE  end
+    local function getRange() return Options.RadarRange and Options.RadarRange.Value or RADAR_DEFAULT_RANGE end
+
+    local cam   = workspace.CurrentCamera
+    local vs    = cam and cam.ViewportSize or Vector2.new(1920,1080)
+    local sz    = getSize()
+    local ctr   = Vector2.new(vs.X - sz/2 - 20, vs.Y - sz/2 - 20)
+    radarBG     = buildRadarBG(ctr, sz)
+    lastRadarSize = sz
+
+    RadarConn = RunService.RenderStepped:Connect(function()
+        local cam2 = workspace.CurrentCamera; if not cam2 then return end
+        local vs2  = cam2.ViewportSize
+        local sz2  = getSize()
+        local rng  = getRange()
+        local ctr2 = Vector2.new(vs2.X - sz2/2 - 20, vs2.Y - sz2/2 - 20)
+        local half = sz2 / 2
+
+        -- Rebuild BG only if size changed (avoids per-frame allocation)
+        if sz2 ~= lastRadarSize then
+            radarBG       = buildRadarBG(ctr2, sz2)
+            lastRadarSize = sz2
+        else
+            -- Reposition existing BG elements
+            radarBG.border.Size     = Vector2.new(sz2+6, sz2+6)
+            radarBG.border.Position = ctr2 - Vector2.new(half+3, half+3)
+            radarBG.bg.Size         = Vector2.new(sz2, sz2)
+            radarBG.bg.Position     = ctr2 - Vector2.new(half, half)
+            radarBG.ch_h.From       = Vector2.new(ctr2.X - half, ctr2.Y)
+            radarBG.ch_h.To         = Vector2.new(ctr2.X + half, ctr2.Y)
+            radarBG.ch_v.From       = Vector2.new(ctr2.X, ctr2.Y - half)
+            radarBG.ch_v.To         = Vector2.new(ctr2.X, ctr2.Y + half)
+            radarBG.lbl.Position    = Vector2.new(ctr2.X, ctr2.Y - half - 14)
+            radarBG.selfDot.Position = ctr2 - Vector2.new(3.5, 3.5)
+        end
+
+        -- Resolve origin
+        local useSpec   = Toggles.SpectateEnabled and Toggles.SpectateEnabled.Value and SpectateTarget
+        local origChar  = useSpec and SpectateTarget.Character or LocalPlayer.Character
+        local origRoot  = origChar and origChar:FindFirstChild('HumanoidRootPart')
+
+        if not origRoot then
+            for _, blip in next, radarBlips do
+                blip.dot.Visible = false; blip.name.Visible = false
+            end
+            return
+        end
+        local origin = origRoot.Position
+        local showNames = Toggles.RadarNames and Toggles.RadarNames.Value
+
+        for player, blip in next, radarBlips do
+            local char = player.Character
+            local root = char and char:FindFirstChild('HumanoidRootPart')
+            if not root then
+                blip.dot.Visible = false; blip.name.Visible = false
+                continue
+            end
+
+            local pos2D = worldToRadarPos(origin, root.Position, ctr2, half, rng)
+            local inBounds = math.abs(pos2D.X - ctr2.X) <= half
+                          and math.abs(pos2D.Y - ctr2.Y) <= half
+
+            blip.dot.Visible = inBounds
+            blip.name.Visible = inBounds and showNames
+
+            if inBounds then
+                -- Colour logic: spectated = cyan, otherwise match ESP colours
+                local col
+                if player == SpectateTarget then
+                    col = Color3.fromRGB(0, 220, 255)
+                elseif Toggles.EspUseTeamColor and Toggles.EspUseTeamColor.Value and player.TeamColor then
+                    col = player.TeamColor.Color
+                else
+                    local isAlly = player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team
+                    col = isAlly
+                        and (Options.AllyColor  and Options.AllyColor.Value  or Color3.fromRGB(0,255,0))
+                        or  (Options.EnemyColor and Options.EnemyColor.Value or Color3.fromRGB(255,0,0))
+                end
+
+                blip.dot.Color    = col
+                blip.dot.Size     = Vector2.new(6,6)
+                blip.dot.Position = pos2D - Vector2.new(3,3)
+
+                if showNames then
+                    blip.name.Text     = player.Name
+                    blip.name.Color    = col
+                    blip.name.Position = pos2D - Vector2.new(0,10)
+                end
+            end
+        end
+    end)
+end
+
+-- Keep blip table in sync with player join/leave
+Players.PlayerAdded:Connect(function(p)
+    if Toggles.RadarEnabled and Toggles.RadarEnabled.Value then ensureBlip(p) end
+end)
+Players.PlayerRemoving:Connect(function(p)
+    if radarBlips[p] then
+        pcall(function() radarBlips[p].dot:Remove()  end)
+        pcall(function() radarBlips[p].name:Remove() end)
+        radarBlips[p] = nil
+    end
+end)
+
+-- ── Radar UI ───────────────────────────────────────────────────
+local RadarGrp = Tabs.ESP:AddRightGroupbox('Radar')
+RadarGrp:AddToggle('RadarEnabled', {
+    Text    = 'Enable Radar',
+    Default = false,
+    Callback = startRadar,
+})
+RadarGrp:AddToggle('RadarNames', { Text = 'Show Names on Radar', Default = false })
+RadarGrp:AddSlider('RadarSize', {
+    Text     = 'Radar Size (px)',
+    Default  = RADAR_DEFAULT_SIZE,
+    Min      = 100,
+    Max      = 600,
+    Rounding = 0,
+})
+RadarGrp:AddSlider('RadarRange', {
+    Text     = 'World Range (studs)',
+    Default  = RADAR_DEFAULT_RANGE,
+    Min      = 50,
+    Max      = 2000,
+    Rounding = 0,
+})
+
+-- ================================================================
+--  ANTI-AFK
+-- ================================================================
+--  Hooks LocalPlayer.Idled (fires after ~5 min of no input) and
+--  sends a harmless VirtualUser button press to reset the timer.
+--  Falls back to a periodic humanoid jump if VirtualUser is blocked.
+-- ================================================================
+
+local AntiAfkConn = nil
+
+local function setAntiAfk(on)
+    if AntiAfkConn then AntiAfkConn:Disconnect(); AntiAfkConn = nil end
+    if not on then return end
+
+    local ok, VU = pcall(function() return game:GetService('VirtualUser') end)
+    if ok and VU then
+        -- Primary: respond to the Idled event Roblox fires before kicking
+        AntiAfkConn = LocalPlayer.Idled:Connect(function()
+            VU:Button2Down(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+            task.wait(0.1)
+            VU:Button2Up(Vector2.new(0,0), workspace.CurrentCamera.CFrame)
+        end)
+    else
+        -- Fallback: jump every 4 minutes
+        local lastFire = tick()
+        AntiAfkConn = RunService.Heartbeat:Connect(function()
+            if tick() - lastFire < 240 then return end
+            lastFire = tick()
+            local char = LocalPlayer.Character
+            local hum  = char and char:FindFirstChildWhichIsA('Humanoid')
+            if hum then hum.Jump = true end
+        end)
+    end
+end
+
+-- ================================================================
+--  POTATO GRAPHICS
+-- ================================================================
+--  Saves current settings, then hammers everything to minimum.
+--  Toggling OFF fully restores the saved state.
+--
+--  What gets nuked:
+--    • Rendering quality level → Level01
+--    • GlobalShadows → false
+--    • All PostEffect objects in Lighting → Disabled
+--    • Atmosphere / Sky → removed from Lighting
+--    • ParticleEmitter, Beam, Trail, Fire, Smoke, Sparkles → Rate=0
+-- ================================================================
+
+local savedGfx = nil   -- holds pre-potato state for restoration
+local removedLightingChildren = {}  -- Atmosphere / Sky refs
+
+local function applyPotatoGraphics()
+    local ls = game:GetService('Lighting')
+    savedGfx = {
+        quality       = settings().Rendering.QualityLevel,
+        globalShadows = ls.GlobalShadows,
+        brightness    = ls.Brightness,
+        shadowSoft    = ls.ShadowSoftness,
+        postEffects   = {},
+    }
+
+    -- Rendering quality
+    pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+
+    -- Lighting
+    ls.GlobalShadows  = false
+    ls.Brightness     = 1
+    ls.ShadowSoftness = 0
+
+    -- Post effects
+    for _, v in next, ls:GetChildren() do
+        if v:IsA('PostEffect') then
+            savedGfx.postEffects[v] = v.Enabled
+            v.Enabled = false
+        end
+    end
+
+    -- Atmosphere & Sky: detach so they stop rendering
+    removedLightingChildren = {}
+    for _, v in next, ls:GetChildren() do
+        if v:IsA('Atmosphere') or v:IsA('Sky') then
+            v.Parent = nil
+            table.insert(removedLightingChildren, v)
+        end
+    end
+
+    -- Kill VFX across the entire workspace
+    for _, v in next, workspace:GetDescendants() do
+        if v:IsA('ParticleEmitter') or v:IsA('Beam') or v:IsA('Trail') then
+            pcall(function() v.Enabled = false end)
+        elseif v:IsA('Fire') or v:IsA('Smoke') or v:IsA('Sparkles') then
+            pcall(function() v.Enabled = false end)
+        end
+    end
+end
+
+local function restoreGraphics()
+    if not savedGfx then return end
+    local ls = game:GetService('Lighting')
+
+    pcall(function() settings().Rendering.QualityLevel = savedGfx.quality end)
+    ls.GlobalShadows  = savedGfx.globalShadows
+    ls.Brightness     = savedGfx.brightness
+    ls.ShadowSoftness = savedGfx.shadowSoft
+
+    for v, wasEnabled in next, savedGfx.postEffects do
+        pcall(function() v.Enabled = wasEnabled end)
+    end
+
+    -- Restore detached Lighting children
+    for _, v in next, removedLightingChildren do
+        pcall(function() v.Parent = ls end)
+    end
+    removedLightingChildren = {}
+
+    -- Re-enable VFX
+    for _, v in next, workspace:GetDescendants() do
+        if v:IsA('ParticleEmitter') or v:IsA('Beam') or v:IsA('Trail')
+        or v:IsA('Fire') or v:IsA('Smoke') or v:IsA('Sparkles') then
+            pcall(function() v.Enabled = true end)
+        end
+    end
+
+    savedGfx = nil
+end
+
+-- ── Misc UI groupbox ───────────────────────────────────────────
+local MiscGrp = Tabs.ESP:AddLeftGroupbox('Misc')
+
+MiscGrp:AddToggle('AntiAfk', {
+    Text     = 'Anti-AFK',
+    Default  = false,
+    Callback = setAntiAfk,
+})
+
+MiscGrp:AddToggle('PotatoGraphics', {
+    Text     = 'Potato Graphics',
+    Default  = false,
+    Callback = function(on)
+        if on then applyPotatoGraphics() else restoreGraphics() end
+    end,
+})
+
 end -- return function
