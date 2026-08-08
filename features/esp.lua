@@ -634,8 +634,6 @@ local function startRadar(on)
     stopRadar()
     if not on then return end
 
-    for _, p in next, Players:GetPlayers() do ensureBlip(p) end
-
     local function getSize()  return Options.RadarSize  and Options.RadarSize.Value  or RADAR_DEFAULT_SIZE  end
     local function getRange() return Options.RadarRange and Options.RadarRange.Value or RADAR_DEFAULT_RANGE end
 
@@ -650,6 +648,10 @@ local function startRadar(on)
     local sz = getSize()
     radarBG       = buildRadarBG(radarCenter, sz)
     lastRadarSize = sz
+
+    -- Create blips AFTER BG so they render on top (Drawing API = creation order)
+    clearAllRadarBlips()
+    for _, p in next, Players:GetPlayers() do ensureBlip(p) end
 
     -- ── Drag handling ──────────────────────────────────────────────
     -- InputBegan: start drag when left-clicking inside the radar square
@@ -698,6 +700,12 @@ local function startRadar(on)
         if sz2 ~= lastRadarSize then
             radarBG       = buildRadarBG(ctr2, sz2)
             lastRadarSize = sz2
+            -- Recreate all blip drawings AFTER the BG so they render on top
+            -- (Drawing API renders in creation order)
+            local players = {}
+            for p in next, radarBlips do players[#players+1] = p end
+            clearAllRadarBlips()
+            for _, p in next, players do ensureBlip(p) end
         else
             -- Reposition existing BG elements to current (possibly dragged) center
             radarBG.glow.Size         = Vector2.new(sz2+10, sz2+10)
@@ -722,7 +730,11 @@ local function startRadar(on)
 
         if not origRoot then
             for _, blip in next, radarBlips do
-                blip.dot.Visible = false; blip.name.Visible = false
+                blip.glow.Visible    = false
+                blip.dot.Visible     = false
+                blip.outline.Visible = false
+                blip.name.Visible    = false
+                blip.dist.Visible    = false
             end
             return
         end
