@@ -496,11 +496,16 @@ local function clearAllRadarBlips()
 end
 
 -- Top-down world → screen-space radar conversion
-local function worldToRadarPos(origin, targetPos, radarCenter, halfSize, worldRange)
+-- yaw = camera yaw in radians; radar rotates so forward = up on screen
+local function worldToRadarPos(origin, targetPos, radarCenter, halfSize, worldRange, yaw)
     local diff  = targetPos - origin
     local scale = halfSize / worldRange
-    return Vector2.new(radarCenter.X + diff.X * scale,
-                       radarCenter.Y + diff.Z * scale)
+    -- Rotate diff.XZ by -yaw so the camera's forward direction always points up
+    local cos, sin = math.cos(-yaw), math.sin(-yaw)
+    local rx = diff.X * cos - diff.Z * sin
+    local rz = diff.X * sin + diff.Z * cos
+    return Vector2.new(radarCenter.X + rx * scale,
+                       radarCenter.Y + rz * scale)
 end
 
 -- Build (or rebuild) the static background drawing objects
@@ -562,22 +567,31 @@ local function buildRadarBG(center, size)
         Center       = true,
         Position     = Vector2.new(center.X, center.Y - half - 16),
     })
-    -- Self-dot (you): bright white square at center
-    local selfDot = newDraw('Square', {
-        Visible  = true,
-        Filled   = true,
-        Color    = Color3.fromRGB(255, 255, 255),
-        Size     = Vector2.new(10, 10),
-        Position = center - Vector2.new(5, 5),
-    })
-    -- Self-dot outline for contrast
-    local selfOutline = newDraw('Square', {
+    -- Self arrow: triangle pointing UP (= camera forward, since radar rotates with FOV)
+    -- Three lines: left-side, right-side, base
+    local arrowL = newDraw('Line', {
         Visible   = true,
-        Filled    = false,
-        Color     = Color3.fromRGB(0, 0, 0),
-        Thickness = 1,
-        Size      = Vector2.new(10, 10),
-        Position  = center - Vector2.new(5, 5),
+        Color     = Color3.fromRGB(255, 255, 255),
+        Thickness = 2,
+        Transparency = 0,
+        From = Vector2.new(center.X,     center.Y - 9),  -- tip (top)
+        To   = Vector2.new(center.X - 6, center.Y + 5),  -- bottom-left
+    })
+    local arrowR = newDraw('Line', {
+        Visible   = true,
+        Color     = Color3.fromRGB(255, 255, 255),
+        Thickness = 2,
+        Transparency = 0,
+        From = Vector2.new(center.X,     center.Y - 9),  -- tip (top)
+        To   = Vector2.new(center.X + 6, center.Y + 5),  -- bottom-right
+    })
+    local arrowB = newDraw('Line', {
+        Visible   = true,
+        Color     = Color3.fromRGB(255, 255, 255),
+        Thickness = 2,
+        Transparency = 0,
+        From = Vector2.new(center.X - 6, center.Y + 5),  -- bottom-left
+        To   = Vector2.new(center.X + 6, center.Y + 5),  -- bottom-right
     })
 
     -- Insert order = draw order; BG first so blips render on top
@@ -587,13 +601,14 @@ local function buildRadarBG(center, size)
     table.insert(radarDrawings, ch_h)
     table.insert(radarDrawings, ch_v)
     table.insert(radarDrawings, lbl)
-    table.insert(radarDrawings, selfDot)
-    table.insert(radarDrawings, selfOutline)
+    table.insert(radarDrawings, arrowL)
+    table.insert(radarDrawings, arrowR)
+    table.insert(radarDrawings, arrowB)
 
     return {
         glow=glow, border=border, bg=bg,
         ch_h=ch_h, ch_v=ch_v, lbl=lbl,
-        selfDot=selfDot, selfOutline=selfOutline
+        arrowL=arrowL, arrowR=arrowR, arrowB=arrowB
     }
 end
 
@@ -719,8 +734,13 @@ local function startRadar(on)
             radarBG.ch_v.From         = Vector2.new(ctr2.X, ctr2.Y - half)
             radarBG.ch_v.To           = Vector2.new(ctr2.X, ctr2.Y + half)
             radarBG.lbl.Position      = Vector2.new(ctr2.X, ctr2.Y - half - 16)
-            radarBG.selfDot.Position    = ctr2 - Vector2.new(5, 5)
-            radarBG.selfOutline.Position = ctr2 - Vector2.new(5, 5)
+            -- Arrow always at center (radar rotates around origin, tip always = forward = up)
+            radarBG.arrowL.From = Vector2.new(ctr2.X,     ctr2.Y - 9)
+            radarBG.arrowL.To   = Vector2.new(ctr2.X - 6, ctr2.Y + 5)
+            radarBG.arrowR.From = Vector2.new(ctr2.X,     ctr2.Y - 9)
+            radarBG.arrowR.To   = Vector2.new(ctr2.X + 6, ctr2.Y + 5)
+            radarBG.arrowB.From = Vector2.new(ctr2.X - 6, ctr2.Y + 5)
+            radarBG.arrowB.To   = Vector2.new(ctr2.X + 6, ctr2.Y + 5)
         end
 
         -- Resolve origin
@@ -739,6 +759,19 @@ local function startRadar(on)
             return
         end
         local origin = origRoot.Position
+
+        -- Resolve yaw: use the live camera yaw when spectating (most accurate),
+        -- else fall back to the HRP's own look direction (handles 3rd-person local)
+        local yaw
+        if useSpec and cam2.CameraType == Enum.CameraType.Attach then
+            -- Camera is attached to the spectated player — read its actual yaw
+            local camLook = cam2.CFrame.LookVector
+            yaw = math.atan2(camLook.X, camLook.Z)
+        else
+            local look = origRoot.CFrame.LookVector
+            yaw = math.atan2(look.X, look.Z)
+        end
+
         local showNames = Toggles.RadarNames and Toggles.RadarNames.Value
         local showDist  = Toggles.RadarDist  and Toggles.RadarDist.Value
 
@@ -754,7 +787,7 @@ local function startRadar(on)
                 continue
             end
 
-            local pos2D   = worldToRadarPos(origin, root.Position, ctr2, half, rng)
+            local pos2D   = worldToRadarPos(origin, root.Position, ctr2, half, rng, yaw)
             local inBounds = math.abs(pos2D.X - ctr2.X) <= half
                           and math.abs(pos2D.Y - ctr2.Y) <= half
 
