@@ -1157,24 +1157,44 @@ local FREECAM_KEYS = {
 }
 
 local function stopFreeCam()
+    -- Only restore camera state when freecam was genuinely active.
+    -- Guarding here fixes two problems:
+    --   1. startFreeCam() calls stopFreeCam() before saving state; without the
+    --      guard that first call would write cam.CameraType = Follow (savedCamType
+    --      is nil) and then startFreeCam() would capture Follow as the "original",
+    --      losing whatever type the game actually had.
+    --   2. Rapid toggle can no longer re-save state mid-session because a call
+    --      from startFreeCam() when freeCamActive=false skips the restore entirely.
+    if freeCamActive then
+        local cam = workspace.CurrentCamera
+        if cam then
+            cam.CameraType = savedCamType or Enum.CameraType.Follow
+
+            -- Guard against a destroyed Humanoid: if the character respawned while
+            -- in freecam the saved Humanoid instance is gone (Parent == nil) and
+            -- assigning it as CameraSubject silently fails.  Fall back to the
+            -- current character's Humanoid in that case.
+            local subject = savedCamSubject
+            if subject and not subject.Parent then
+                subject = LocalPlayer.Character
+                    and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid')
+            end
+            cam.CameraSubject = subject or (LocalPlayer.Character
+                and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid'))
+        end
+        -- Restore mouse behaviour so the game camera works normally again
+        pcall(function() UIS.MouseBehavior = savedMouseBehavior or Enum.MouseBehavior.Default end)
+        savedMouseBehavior = nil
+        -- Restore replication focus to self
+        pcall(function()
+            local hrp = getLocalHRP()
+            LocalPlayer.ReplicationFocus = hrp or workspace
+        end)
+    end
     freeCamActive = false
     if freeCamConn      then freeCamConn:Disconnect();      freeCamConn      = nil end
     if freeCamInputConn then freeCamInputConn:Disconnect(); freeCamInputConn = nil end
     if freeCamWheelConn then freeCamWheelConn:Disconnect(); freeCamWheelConn = nil end
-    local cam = workspace.CurrentCamera
-    if cam then
-        cam.CameraType    = savedCamType    or Enum.CameraType.Follow
-        cam.CameraSubject = savedCamSubject or (LocalPlayer.Character
-            and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid'))
-    end
-    -- Restore mouse behaviour so the game camera works normally again
-    pcall(function() UIS.MouseBehavior = savedMouseBehavior or Enum.MouseBehavior.Default end)
-    savedMouseBehavior = nil
-    -- Restore replication focus to self
-    pcall(function()
-        local hrp = getLocalHRP()
-        LocalPlayer.ReplicationFocus = hrp or workspace
-    end)
     freeCamSpeedMult = 1
 end
 
