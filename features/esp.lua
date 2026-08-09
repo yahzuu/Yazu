@@ -137,7 +137,7 @@ local function startEsp(toggle)
             d.box.Position     = Vector2.new(sHead.X - boxW/2, sHead.Y)
 
             d.name.Visible      = Toggles.EspNames and Toggles.EspNames.Value or false
-            d.name.Text         = player.DisplayName
+            d.name.Text         = player.Name  -- always the actual Roblox username, never DisplayName
             d.name.Color        = col
             d.name.OutlineColor = nameOutlineCol
             d.name.Transparency = opacity
@@ -147,7 +147,8 @@ local function startEsp(toggle)
             d.health.Visible  = showHealth or false
             if showHealth then
                 local hp = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
-                d.health.Text         = '[' .. MathHandler:Abbreviate(math.floor(hum.Health)) .. ' hp]'
+                -- Raw number — never abbreviate health (1500 should not show as "2K")
+                d.health.Text         = '[' .. math.floor(hum.Health) .. ' hp]'
                 d.health.Color        = Color3.new(1 - hp, hp, 0)
                 d.health.Transparency = opacity
                 d.health.Position     = Vector2.new(sHead.X, sHead.Y - 30)
@@ -156,7 +157,8 @@ local function startEsp(toggle)
             local showDist = Toggles.EspDist and Toggles.EspDist.Value
             d.dist.Visible = showDist or false
             if showDist then
-                d.dist.Text         = '[' .. MathHandler:Abbreviate(math.floor(dist3D)) .. 'm]'
+                -- Raw studs — never convert to K/M regardless of distance
+                d.dist.Text         = '[' .. math.floor(dist3D) .. 'm]'
                 d.dist.Color        = col
                 d.dist.Transparency = opacity
                 d.dist.Position     = Vector2.new(sHead.X, sRoot.Y + 4)
