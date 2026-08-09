@@ -120,17 +120,24 @@ local function startEsp(toggle)
                 hideAll(); continue
             end
 
-            local rootSP, _   = cam:WorldToViewportPoint(root.Position)
-            local headSP      = cam:WorldToViewportPoint(head.Position)
-            local dist3D      = lpHRP and (lpHRP.Position - root.Position).Magnitude or 0
+            local rootSP, rootOnScreen = cam:WorldToViewportPoint(root.Position)
+            local headSP, headOnScreen = cam:WorldToViewportPoint(head.Position)
+            local dist3D = lpHRP and (lpHRP.Position - root.Position).Magnitude or 0
 
-            -- Only skip if beyond max distance; never skip based on viewport frustum
-            -- so ESP works through walls and at any angle
+            -- rootSP.Z is depth from camera. Negative = behind camera.
+            -- When behind camera, X/Y are mirrored to the opposite side of the screen,
+            -- causing names/boxes to appear on the wrong player. Must skip entirely.
+            if rootSP.Z < 0 then hideAll(); continue end
+
+            -- Only skip if beyond max distance
             if dist3D > maxDist then hideAll(); continue end
 
             local sRoot = Vector2.new(rootSP.X, rootSP.Y)
-            local sHead = Vector2.new(headSP.X, headSP.Y)
-            local boxH  = math.abs(sRoot.Y - sHead.Y) * 2
+            -- If head is behind camera, fall back to root position to avoid negative box
+            local sHead = headSP.Z > 0
+                and Vector2.new(headSP.X, headSP.Y)
+                or  Vector2.new(rootSP.X, rootSP.Y - 20)
+            local boxH  = math.max(math.abs(sRoot.Y - sHead.Y) * 2, 1)
             local boxW  = boxH * 0.55
 
             local col
