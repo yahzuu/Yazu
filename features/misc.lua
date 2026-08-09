@@ -1259,7 +1259,7 @@ end)
 
 -- ── Click to Teleport ────────────────────────────────────────────
 --
---  Left-click teleports your HRP to the raycast hit point.
+--  LCtrl + Left-click teleports your HRP to the raycast hit point.
 --  Guards: ignores character parts, adds a small Y offset so you
 --  land on top of the surface, and handles geometry by nudging
 --  the position slightly upward to avoid spawning inside a wall.
@@ -1273,6 +1273,7 @@ Toggles.ClickTeleport:OnChanged(function(v)
     clickTpConn = UIS.InputBegan:Connect(function(input, gp)
         if gp then return end
         if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        if not UIS:IsKeyDown(Enum.KeyCode.LeftControl) then return end
         if not (Toggles.ClickTeleport and Toggles.ClickTeleport.Value) then return end
 
         local cam = workspace.CurrentCamera; if not cam then return end
