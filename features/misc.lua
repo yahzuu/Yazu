@@ -730,10 +730,10 @@ local CompatGrp     = Tabs.Misc:AddLeftGroupbox('FFlag Compatibility')
 local DesyncGrp     = Tabs.Misc:AddLeftGroupbox('Desync')
 local CombatGrp     = Tabs.Misc:AddLeftGroupbox('Combat')
 local PassiveLagGrp = Tabs.Misc:AddLeftGroupbox('Passive Lag')
-local NetGrp        = Tabs.Misc:AddLeftGroupbox('State Spoofing')
+local StateSpoofGrp = Tabs.Misc:AddLeftGroupbox('State Spoofing')
 local SpinGrp       = Tabs.Misc:AddLeftGroupbox('SpinBot')
 local MiscGrp       = Tabs.Misc:AddRightGroupbox('Misc')
-local NetGrp      = Tabs.Misc:AddRightGroupbox('Network/Null')
+local NetGrp        = Tabs.Misc:AddRightGroupbox('Network/Null')
 
 -- ── Compat + Panic ────────────────────────────────────────────────
 CompatGrp:AddLabel('Tests if setfflag accepts the call.\nRestores original value — no side effects.')
@@ -869,15 +869,15 @@ passiveLagLabel = PassiveLagGrp:AddLabel('Passive Lag OFF')
 PassiveLagGrp:AddLabel('N=2 → ~50%  |  N=10 → ~10%  |  N=60 → ~2%')
 
 -- ── State Spoofing ────────────────────────────────────────────────
-NetGrp:AddDropdown('StateSpoofState', {
+StateSpoofGrp:AddDropdown('StateSpoofState', {
     Text    = 'Spoof State',
     Default = 'Jumping',
     Values  = { 'Jumping', 'FallingDown', 'Seated', 'Ragdoll', 'Swimming', 'Climbing' },
 })
-NetGrp:AddSlider('StateSpoofInterval', {
+StateSpoofGrp:AddSlider('StateSpoofInterval', {
     Text = 'Pulse interval (seconds)', Default = 2, Min = 0.5, Max = 10, Rounding = 1,
 })
-NetGrp:AddToggle('StateSpoofEnabled', {
+StateSpoofGrp:AddToggle('StateSpoofEnabled', {
     Text = 'Enable State Spoofer', Default = false,
     Callback = function(v)
         if v then
@@ -888,7 +888,7 @@ NetGrp:AddToggle('StateSpoofEnabled', {
         end
     end,
 })
-NetGrp:AddLabel('Jumping/FallingDown = no movement restriction.\nSeated/Ragdoll = 1 frame blip per pulse.')
+StateSpoofGrp:AddLabel('Jumping/FallingDown = no movement restriction.\nSeated/Ragdoll = 1 frame blip per pulse.')
 
 -- ── SpinBot ───────────────────────────────────────────────────────
 SpinGrp:AddToggle('SpinBotEnabled',       { Text = 'Enable SpinBot', Default = false })
@@ -929,6 +929,9 @@ MiscGrp:AddSlider('WalkspeedValue',   { Text = 'Speed', Default = 16, Min = 2, M
 MiscGrp:AddLabel('Jump Power')
 MiscGrp:AddToggle('JumpPowerToggle',  { Text = 'Enable Custom Jump Power', Default = false })
 MiscGrp:AddSlider('JumpPowerValue',   { Text = 'Power', Default = 50, Min = 10, Max = 500, Rounding = 0 })
+MiscGrp:AddLabel('')
+MiscGrp:AddButton({ Text = 'Restore Default Movement', Func = function() restoreMovement() end })
+MiscGrp:AddLabel('Stops fly/cam/ghost/noclip — resets speed,\njump, PlatformStand, re-enables control scripts.')
 
 -- ================================================================
 --  RUNTIME LOOPS
@@ -992,8 +995,7 @@ local function stopBetterNoClip()
         for _, v in next, char:GetDescendants() do
             if v:IsA('BasePart') then
                 v.CanCollide = true
-                v.CustomPhysicalProperties = PhysicalProperties.new(
-                    Enum.Material.SmoothPlastic)
+                pcall(function() v.CustomPhysicalProperties = nil end)
             end
         end
         local hum = char:FindFirstChildWhichIsA('Humanoid')
@@ -1001,14 +1003,14 @@ local function stopBetterNoClip()
     end
 end
 
-Toggles:GetToggle('BetterNoClip'):OnChanged(function(v)
+Toggles.BetterNoClip:OnChanged(function(v)
     if v then startBetterNoClip() else stopBetterNoClip() end
 end)
 
 -- ── Infinite Jump ────────────────────────────────────────────────
+local UIS      = Services.UserInputService or game:GetService('UserInputService')
 local jumpConn = nil
-UserInputService = Services.UserInputService or game:GetService('UserInputService')
-jumpConn = UserInputService.JumpRequest:Connect(function()
+jumpConn = UIS.JumpRequest:Connect(function()
     if not (Toggles.InfiniteJump and Toggles.InfiniteJump.Value) then return end
     local hum = getLocalHum()
     if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
@@ -1018,7 +1020,6 @@ end)
 local flyConn      = nil
 local flyBodyVel   = nil
 local flyBodyGyro  = nil
-local UIS = Services.UserInputService or game:GetService('UserInputService')
 
 local function stopFly()
     if flyConn then flyConn:Disconnect(); flyConn = nil end
@@ -1068,7 +1069,7 @@ local function startFly()
     end)
 end
 
-Toggles:GetToggle('FlyToggle'):OnChanged(function(v)
+Toggles.FlyToggle:OnChanged(function(v)
     if v then startFly() else stopFly() end
 end)
 
@@ -1121,7 +1122,7 @@ local function startGhost()
     end)
 end
 
-Toggles:GetToggle('GhostMode'):OnChanged(function(v)
+Toggles.GhostMode:OnChanged(function(v)
     if v then startGhost() else stopGhost() end
 end)
 
@@ -1133,14 +1134,17 @@ end)
 --  camera position every frame, so Roblox streams in chunks
 --  wherever you fly — same technique as spectate streaming fix.
 -- ─────────────────────────────────────────────────────────────────
-local freeCamActive   = false
-local freeCamConn     = nil
-local freeCamInputConn = nil
-local freeCamWheelConn = nil
-local savedCamType    = nil
-local savedCamSubject = nil
-local freeCamCF       = CFrame.new(0, 10, 0)
-local freeCamSpeedMult = 1  -- scroll-wheel modifier
+local freeCamActive      = false
+local freeCamConn        = nil
+local freeCamInputConn   = nil
+local freeCamWheelConn   = nil
+local savedCamType       = nil
+local savedCamSubject    = nil
+local savedMouseBehavior = nil
+local freeCamCF          = CFrame.new(0, 10, 0)
+local freeCamPitch       = 0    -- accumulated pitch, radians
+local freeCamYaw         = 0    -- accumulated yaw,   radians
+local freeCamSpeedMult   = 1    -- scroll-wheel modifier
 
 local FREECAM_KEYS = {
     forward  = Enum.KeyCode.W,
@@ -1163,6 +1167,9 @@ local function stopFreeCam()
         cam.CameraSubject = savedCamSubject or (LocalPlayer.Character
             and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid'))
     end
+    -- Restore mouse behaviour so the game camera works normally again
+    pcall(function() UIS.MouseBehavior = savedMouseBehavior or Enum.MouseBehavior.Default end)
+    savedMouseBehavior = nil
     -- Restore replication focus to self
     pcall(function()
         local hrp = getLocalHRP()
@@ -1177,9 +1184,15 @@ local function startFreeCam()
     savedCamType    = cam.CameraType
     savedCamSubject = cam.CameraSubject
 
-    -- Start freecam at current camera position
+    -- Seed pitch/yaw from current camera so view doesn't snap on enter
+    freeCamPitch, freeCamYaw = cam.CFrame:ToEulerAnglesYXZ()
     freeCamCF = cam.CFrame
     cam.CameraType = Enum.CameraType.Scriptable
+
+    -- Lock mouse to centre so GetMouseDelta() returns real deltas.
+    -- Scriptable cameras get no automatic mouse look from Roblox's CameraModule.
+    savedMouseBehavior = UIS.MouseBehavior
+    pcall(function() UIS.MouseBehavior = Enum.MouseBehavior.LockCenter end)
 
     freeCamActive = true
     local lastTime = os.clock()
@@ -1190,34 +1203,40 @@ local function startFreeCam()
         local dt  = math.min(now - lastTime, 0.1)
         lastTime  = now
 
+        -- ── Mouse look ─────────────────────────────────────────────
+        -- GetMouseDelta() only works while MouseBehavior is LockCenter / LockCurrentPosition.
+        -- We accumulate yaw (Y-axis) and pitch (X-axis) ourselves; Roblox does not
+        -- drive Scriptable camera rotation automatically.
+        local delta  = UIS:GetMouseDelta()
+        freeCamYaw   = freeCamYaw   - delta.X * 0.003
+        freeCamPitch = math.clamp(freeCamPitch - delta.Y * 0.003, -math.pi/2 + 0.05, math.pi/2 - 0.05)
+        local rotation = CFrame.fromEulerAnglesYXZ(freeCamPitch, freeCamYaw, 0)
+
+        -- ── WASD + QE movement ─────────────────────────────────────
         local speed = (Options.FreeCamSpeed and Options.FreeCamSpeed.Value or 80)
             * freeCamSpeedMult
             * (UIS:IsKeyDown(FREECAM_KEYS.sprint) and 3 or 1)
             * dt
 
         local move = Vector3.zero
-        if UIS:IsKeyDown(FREECAM_KEYS.forward)  then move = move + freeCamCF.LookVector  end
-        if UIS:IsKeyDown(FREECAM_KEYS.backward) then move = move - freeCamCF.LookVector  end
-        if UIS:IsKeyDown(FREECAM_KEYS.right)    then move = move + freeCamCF.RightVector end
-        if UIS:IsKeyDown(FREECAM_KEYS.left)     then move = move - freeCamCF.RightVector end
-        if UIS:IsKeyDown(FREECAM_KEYS.up)       then move = move + Vector3.yAxis         end
-        if UIS:IsKeyDown(FREECAM_KEYS.down)     then move = move - Vector3.yAxis         end
+        if UIS:IsKeyDown(FREECAM_KEYS.forward)  then move = move + rotation.LookVector  end
+        if UIS:IsKeyDown(FREECAM_KEYS.backward) then move = move - rotation.LookVector  end
+        if UIS:IsKeyDown(FREECAM_KEYS.right)    then move = move + rotation.RightVector end
+        if UIS:IsKeyDown(FREECAM_KEYS.left)     then move = move - rotation.RightVector end
+        if UIS:IsKeyDown(FREECAM_KEYS.up)       then move = move + Vector3.yAxis        end
+        if UIS:IsKeyDown(FREECAM_KEYS.down)     then move = move - Vector3.yAxis        end
 
+        local pos = freeCamCF.Position
         if move.Magnitude > 0 then
-            freeCamCF = CFrame.new(freeCamCF.Position + move.Unit * speed) *
-                (freeCamCF - freeCamCF.Position)
+            pos = pos + move.Unit * speed
         end
 
-        -- Keep camera rotation locked to mouse look (Roblox handles mouse delta
-        -- for Scriptable cameras natively in the CoreScript CameraModule, so we
-        -- just update position — rotation is driven by RightMouseButton drag)
+        freeCamCF  = CFrame.new(pos) * rotation
         cam.CFrame = freeCamCF
 
         -- ── Force chunk streaming to freecam position ──────────────
-        local pos = freeCamCF.Position
         pcall(function() cam.Focus = CFrame.new(pos) end)
         pcall(function() LocalPlayer.ReplicationFocus = workspace.Terrain end)
-        -- RequestStreamAroundAsync is the hard force — asks server for this area now
         pcall(function()
             if workspace.RequestStreamAroundAsync then
                 workspace:RequestStreamAroundAsync(pos, 0)
@@ -1234,7 +1253,7 @@ local function startFreeCam()
     end)
 end
 
-Toggles:GetToggle('FreeCamToggle'):OnChanged(function(v)
+Toggles.FreeCamToggle:OnChanged(function(v)
     if v then startFreeCam() else stopFreeCam() end
 end)
 
@@ -1247,7 +1266,7 @@ end)
 -- ─────────────────────────────────────────────────────────────────
 local clickTpConn = nil
 
-Toggles:GetToggle('ClickTeleport'):OnChanged(function(v)
+Toggles.ClickTeleport:OnChanged(function(v)
     if clickTpConn then clickTpConn:Disconnect(); clickTpConn = nil end
     if not v then return end
 
@@ -1324,6 +1343,77 @@ RunService.Heartbeat:Connect(function()
         end
     end
 end)
+
+-- ── Restore Movement ─────────────────────────────────────────────
+--  One button that undoes everything:
+--    • Stops fly / freecam / ghost / noclip
+--    • Turns off every movement toggle
+--    • Resets WalkSpeed, JumpPower, PlatformStand, AutoRotate
+--    • Restores CanCollide + CustomPhysicalProperties on all parts
+--    • Tries to re-enable the Roblox default control module so
+--      sprint, crouch, and any game-side locomotion work again
+-- ─────────────────────────────────────────────────────────────────
+local function restoreMovement()
+    -- 1. Stop all active movement loops cleanly
+    stopFly()
+    stopFreeCam()
+    stopGhost()
+    stopBetterNoClip()
+
+    -- 2. Flip every movement toggle off (deferred so their Callbacks fire)
+    task.defer(function()
+        for _, k in ipairs({
+            'FlyToggle', 'FreeCamToggle', 'GhostMode', 'BetterNoClip',
+            'NoClipToggle', 'InfiniteJump', 'WalkspeedToggle', 'JumpPowerToggle',
+        }) do
+            if Toggles[k] then Toggles[k]:SetValue(false) end
+        end
+    end)
+
+    -- 3. Reset humanoid to Roblox defaults
+    local char = LocalPlayer.Character
+    if char then
+        local hum = char:FindFirstChildWhichIsA('Humanoid')
+        if hum then
+            hum.WalkSpeed     = 16
+            hum.JumpPower     = 50
+            hum.PlatformStand = false
+            hum.AutoRotate    = true
+            pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+        end
+        -- Restore collision + clear any lingering ghost transparency
+        for _, v in next, char:GetDescendants() do
+            if v:IsA('BasePart') then
+                v.CanCollide = true
+                if ghostOrigTransparencies[v] ~= nil then
+                    v.Transparency = ghostOrigTransparencies[v]
+                end
+                pcall(function() v.CustomPhysicalProperties = nil end)
+            end
+        end
+        ghostOrigTransparencies = {}
+    end
+
+    -- 4. Re-enable Roblox's default control module.
+    --    This restores sprint/crouch/anything the game wires through PlayerModule.
+    pcall(function()
+        local PS = LocalPlayer:FindFirstChild('PlayerScripts')
+        local PM = PS and PS:FindFirstChild('PlayerModule')
+        if PM then
+            local m = require(PM)
+            if type(m) == 'table' then
+                if m.controls and type(m.controls.Enable) == 'function' then
+                    m.controls:Enable()
+                elseif type(m.Enable) == 'function' then
+                    m:Enable()
+                end
+            end
+        end
+    end)
+
+    Library:Notify('Movement fully restored to defaults')
+    print('[RESTORE] WalkSpeed=16 JumpPower=50 PlatformStand=false controls re-enabled')
+end
 
 -- ── Clean up movement on character reset ─────────────────────────
 LocalPlayer.CharacterAdded:Connect(function()
