@@ -40,8 +40,9 @@ end
 
 local function createEsp(player)
     if player == LocalPlayer then return end
-    if espData[player] then return end  -- already exists, don't double-create
+    if espData[player] then return end
     espData[player] = {
+        playerName = player.Name,  -- snapshot at creation; never changes for this Player instance
         box    = newDraw('Square', { Visible=false, Thickness=1, Filled=false, Color=Color3.fromRGB(255,0,0) }),
         name   = newDraw('Text',   { Visible=false, Size=14, Outline=true, OutlineColor=Color3.new(0,0,0), Color=Color3.fromRGB(255,255,255), Center=true }),
         health = newDraw('Text',   { Visible=false, Size=12, Outline=true, OutlineColor=Color3.new(0,0,0), Color=Color3.fromRGB(0,255,0),     Center=true }),
@@ -51,8 +52,14 @@ local function createEsp(player)
 end
 
 local function removeEsp(player)
-    if not espData[player] then return end
-    for _, d in next, espData[player] do d:Remove() end
+    local e = espData[player]
+    if not e then return end
+    -- Explicit field removal — avoids iterating non-Drawing values (e.g. playerName string)
+    pcall(function() e.box:Remove()    end)
+    pcall(function() e.name:Remove()   end)
+    pcall(function() e.health:Remove() end)
+    pcall(function() e.dist:Remove()   end)
+    pcall(function() e.tracer:Remove() end)
     espData[player] = nil
 end
 
@@ -67,7 +74,13 @@ for _, p in next, Players:GetPlayers() do
 end
 
 local function setAllEspHidden()
-    for _, d in next, espData do for _, dr in next, d do dr.Visible = false end end
+    for _, e in next, espData do
+        pcall(function() e.box.Visible    = false end)
+        pcall(function() e.name.Visible   = false end)
+        pcall(function() e.health.Visible = false end)
+        pcall(function() e.dist.Visible   = false end)
+        pcall(function() e.tracer.Visible = false end)
+    end
 end
 
 local function startEsp(toggle)
@@ -93,12 +106,18 @@ local function startEsp(toggle)
             local head = char and char:FindFirstChild('Head')
             local hum  = char and char:FindFirstChildWhichIsA('Humanoid')
 
-            if not (root and head and hum) then
-                for _, dr in next, d do dr.Visible = false end; continue
+            local function hideAll()
+                d.box.Visible    = false
+                d.name.Visible   = false
+                d.health.Visible = false
+                d.dist.Visible   = false
+                d.tracer.Visible = false
             end
 
+            if not (root and head and hum) then hideAll(); continue end
+
             if smartESP and table.find(State.whitelistedIds, player.UserId) then
-                for _, dr in next, d do dr.Visible = false end; continue
+                hideAll(); continue
             end
 
             local rootSP, _   = cam:WorldToViewportPoint(root.Position)
@@ -107,9 +126,7 @@ local function startEsp(toggle)
 
             -- Only skip if beyond max distance; never skip based on viewport frustum
             -- so ESP works through walls and at any angle
-            if dist3D > maxDist then
-                for _, dr in next, d do dr.Visible = false end; continue
-            end
+            if dist3D > maxDist then hideAll(); continue end
 
             local sRoot = Vector2.new(rootSP.X, rootSP.Y)
             local sHead = Vector2.new(headSP.X, headSP.Y)
@@ -137,7 +154,7 @@ local function startEsp(toggle)
             d.box.Position     = Vector2.new(sHead.X - boxW/2, sHead.Y)
 
             d.name.Visible      = Toggles.EspNames and Toggles.EspNames.Value or false
-            d.name.Text         = player.Name  -- always the actual Roblox username, never DisplayName
+            d.name.Text         = d.playerName  -- bound at createEsp; never wrong or stale
             d.name.Color        = col
             d.name.OutlineColor = nameOutlineCol
             d.name.Transparency = opacity
