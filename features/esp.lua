@@ -496,14 +496,17 @@ local function clearAllRadarBlips()
 end
 
 -- Top-down world → screen-space radar conversion
--- yaw = camera yaw in radians; radar rotates so forward = up on screen
-local function worldToRadarPos(origin, targetPos, radarCenter, halfSize, worldRange, yaw)
+-- camCF = the camera's CFrame; we project the XZ diff onto the camera's
+-- right and forward axes so the radar is pixel-perfect to first-person FOV.
+local function worldToRadarPos(origin, targetPos, radarCenter, halfSize, worldRange, camCF)
     local diff  = targetPos - origin
     local scale = halfSize / worldRange
-    -- Rotate diff.XZ by -yaw so the camera's forward direction always points up
-    local cos, sin = math.cos(-yaw), math.sin(-yaw)
-    local rx = diff.X * cos - diff.Z * sin
-    local rz = diff.X * sin + diff.Z * cos
+    -- Flatten camera axes onto the XZ plane (ignore pitch)
+    local fwd   = camCF.LookVector
+    local right = camCF.RightVector
+    -- Project diff onto the camera's horizontal right and forward
+    local rx =  (diff.X * right.X + diff.Z * right.Z)  -- positive = right of camera
+    local rz = -(diff.X * fwd.X   + diff.Z * fwd.Z)    -- positive = behind camera → down on radar
     return Vector2.new(radarCenter.X + rx * scale,
                        radarCenter.Y + rz * scale)
 end
@@ -760,17 +763,10 @@ local function startRadar(on)
         end
         local origin = origRoot.Position
 
-        -- Resolve yaw: use the live camera yaw when spectating (most accurate),
-        -- else fall back to the HRP's own look direction (handles 3rd-person local)
-        local yaw
-        if useSpec and cam2.CameraType == Enum.CameraType.Attach then
-            -- Camera is attached to the spectated player — read its actual yaw
-            local camLook = cam2.CFrame.LookVector
-            yaw = math.atan2(camLook.X, camLook.Z)
-        else
-            local look = origRoot.CFrame.LookVector
-            yaw = math.atan2(look.X, look.Z)
-        end
+        -- Always use the live camera CFrame — this is exactly what the
+        -- spectated player sees in first-person (or what you see locally).
+        -- No atan2 needed; worldToRadarPos projects directly onto camera axes.
+        local camCF = cam2.CFrame
 
         local showNames = Toggles.RadarNames and Toggles.RadarNames.Value
         local showDist  = Toggles.RadarDist  and Toggles.RadarDist.Value
@@ -787,7 +783,7 @@ local function startRadar(on)
                 continue
             end
 
-            local pos2D   = worldToRadarPos(origin, root.Position, ctr2, half, rng, yaw)
+            local pos2D   = worldToRadarPos(origin, root.Position, ctr2, half, rng, camCF)
             local inBounds = math.abs(pos2D.X - ctr2.X) <= half
                           and math.abs(pos2D.Y - ctr2.Y) <= half
 
