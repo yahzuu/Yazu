@@ -23,7 +23,7 @@ local State    = load('core/state.lua')
 local RunService       = Services.RunService
 local UserInputService = Services.UserInputService
 
-local Window = Library:CreateWindow({ Title = 'Yazu 0.0125 ', Center = true, AutoShow = true })
+local Window = Library:CreateWindow({ Title = 'Yazu 0.0126 ', Center = true, AutoShow = true })
 
 UserInputService.MouseIcon = ''
 RunService.RenderStepped:Connect(function()
@@ -104,4 +104,4 @@ SaveManager:BuildConfigSection(Tabs['UI Settings'])
 ThemeManager:ApplyToTab(Tabs['UI Settings'])
 SaveManager:LoadAutoloadConfig()
 
-print("version0.0125")
+print("version0.0126")
