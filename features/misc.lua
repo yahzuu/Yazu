@@ -914,17 +914,27 @@ end })
 SpinGrp:AddToggle('RandomSpinPart', { Text = 'Random Spin Part (1s)', Default = false })
 
 -- ── Movement ──────────────────────────────────────────────────────
-MiscGrp:AddToggle('NoClipToggle', { Text = 'No Clip', Default = false })
+MiscGrp:AddToggle('NoClipToggle',     { Text = 'No Clip',              Default = false })
+MiscGrp:AddToggle('BetterNoClip',     { Text = 'Better No Clip (anti-rubberband)', Default = false })
+MiscGrp:AddToggle('FlyToggle',        { Text = 'Fly',                  Default = false })
+MiscGrp:AddSlider('FlySpeed',         { Text = 'Fly Speed', Default = 50, Min = 1, Max = 500, Rounding = 0 })
+MiscGrp:AddToggle('FreeCamToggle',    { Text = 'Free Cam',             Default = false })
+MiscGrp:AddSlider('FreeCamSpeed',     { Text = 'FreeCam Speed', Default = 80, Min = 5, Max = 500, Rounding = 0 })
+MiscGrp:AddToggle('ClickTeleport',    { Text = 'Click to Teleport',    Default = false })
+MiscGrp:AddToggle('InfiniteJump',     { Text = 'Infinite Jump',        Default = false })
+MiscGrp:AddToggle('GhostMode',        { Text = 'Ghost Mode (noclip + transparent)', Default = false })
 MiscGrp:AddLabel('Walkspeed')
-MiscGrp:AddToggle('WalkspeedToggle', { Text = 'Enable Custom Walkspeed', Default = false })
-MiscGrp:AddSlider('WalkspeedValue',  { Text = 'Speed', Default = 16, Min = 2, Max = 500, Rounding = 0 })
+MiscGrp:AddToggle('WalkspeedToggle',  { Text = 'Enable Custom Walkspeed', Default = false })
+MiscGrp:AddSlider('WalkspeedValue',   { Text = 'Speed', Default = 16, Min = 2, Max = 500, Rounding = 0 })
 MiscGrp:AddLabel('Jump Power')
-MiscGrp:AddToggle('JumpPowerToggle', { Text = 'Enable Custom Jump Power', Default = false })
-MiscGrp:AddSlider('JumpPowerValue',  { Text = 'Power', Default = 50, Min = 10, Max = 500, Rounding = 0 })
+MiscGrp:AddToggle('JumpPowerToggle',  { Text = 'Enable Custom Jump Power', Default = false })
+MiscGrp:AddSlider('JumpPowerValue',   { Text = 'Power', Default = 50, Min = 10, Max = 500, Rounding = 0 })
 
 -- ================================================================
 --  RUNTIME LOOPS
 -- ================================================================
+
+-- ── Basic NoClip ─────────────────────────────────────────────────
 RunService.Stepped:Connect(function()
     if not (Toggles.NoClipToggle and Toggles.NoClipToggle.Value) then return end
     local char = LocalPlayer.Character; if not char then return end
@@ -933,18 +943,372 @@ RunService.Stepped:Connect(function()
     end
 end)
 
+-- ── Better NoClip ────────────────────────────────────────────────
+--
+--  Standard noclip sets CanCollide=false client-side, but the server
+--  still sees a physics body colliding — after ~0.5s it rubber-bands
+--  you back. Better noclip works by:
+--    1. Disabling CanCollide (client visual)
+--    2. Zeroing the HRP velocity every frame so Roblox's network
+--       ownership code doesn't see sudden position jumps
+--    3. Moving via CFrame directly (not physics) so the server
+--       interpolates smoothly instead of detecting a warp
+--    4. Keeping HumanoidState = GettingUp (disables physics
+--       simulation on the humanoid) so the server never tries to
+--       correct your position via its own physics solver
+-- ─────────────────────────────────────────────────────────────────
+local betterNoClipConn = nil
+local function startBetterNoClip()
+    if betterNoClipConn then betterNoClipConn:Disconnect() end
+    betterNoClipConn = RunService.Stepped:Connect(function()
+        if not (Toggles.BetterNoClip and Toggles.BetterNoClip.Value) then return end
+        local char = LocalPlayer.Character; if not char then return end
+        local hrp  = char:FindFirstChild('HumanoidRootPart'); if not hrp then return end
+        local hum  = char:FindFirstChildWhichIsA('Humanoid'); if not hum then return end
+
+        -- Kill all collision on every part
+        for _, v in next, char:GetDescendants() do
+            if v:IsA('BasePart') then
+                v.CanCollide  = false
+                v.CustomPhysicalProperties = PhysicalProperties.new(0.5, 0.3, 0.5, 0, 0)
+            end
+        end
+
+        -- Zero velocity so server-side position interpolation stays smooth
+        hrp.AssemblyLinearVelocity  = Vector3.zero
+        hrp.AssemblyAngularVelocity = Vector3.zero
+
+        -- Force humanoid into a state that suppresses physics correction
+        -- PlatformStanding: engine treats character as manually positioned
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.PlatformStanding) end)
+    end)
+end
+
+local function stopBetterNoClip()
+    if betterNoClipConn then betterNoClipConn:Disconnect(); betterNoClipConn = nil end
+    -- Restore physics on all parts
+    local char = LocalPlayer.Character
+    if char then
+        for _, v in next, char:GetDescendants() do
+            if v:IsA('BasePart') then
+                v.CanCollide = true
+                v.CustomPhysicalProperties = PhysicalProperties.new(
+                    Enum.Material.SmoothPlastic)
+            end
+        end
+        local hum = char:FindFirstChildWhichIsA('Humanoid')
+        if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end) end
+    end
+end
+
+Toggles:GetToggle('BetterNoClip'):OnChanged(function(v)
+    if v then startBetterNoClip() else stopBetterNoClip() end
+end)
+
+-- ── Infinite Jump ────────────────────────────────────────────────
+local jumpConn = nil
+UserInputService = Services.UserInputService or game:GetService('UserInputService')
+jumpConn = UserInputService.JumpRequest:Connect(function()
+    if not (Toggles.InfiniteJump and Toggles.InfiniteJump.Value) then return end
+    local hum = getLocalHum()
+    if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+
+-- ── Fly ──────────────────────────────────────────────────────────
+local flyConn      = nil
+local flyBodyVel   = nil
+local flyBodyGyro  = nil
+local UIS = Services.UserInputService or game:GetService('UserInputService')
+
+local function stopFly()
+    if flyConn then flyConn:Disconnect(); flyConn = nil end
+    if flyBodyVel  then flyBodyVel:Destroy();  flyBodyVel  = nil end
+    if flyBodyGyro then flyBodyGyro:Destroy(); flyBodyGyro = nil end
+    local hum = getLocalHum()
+    if hum then
+        hum.PlatformStand = false
+        pcall(function() hum:ChangeState(Enum.HumanoidStateType.Running) end)
+    end
+end
+
+local function startFly()
+    stopFly()
+    local hrp = getLocalHRP(); if not hrp then return end
+    local hum = getLocalHum(); if not hum then return end
+
+    hum.PlatformStand = true
+
+    flyBodyVel = Instance.new('BodyVelocity')
+    flyBodyVel.Velocity       = Vector3.zero
+    flyBodyVel.MaxForce       = Vector3.new(1e5, 1e5, 1e5)
+    flyBodyVel.Parent         = hrp
+
+    flyBodyGyro = Instance.new('BodyGyro')
+    flyBodyGyro.MaxTorque     = Vector3.new(1e5, 1e5, 1e5)
+    flyBodyGyro.D             = 100
+    flyBodyGyro.CFrame        = hrp.CFrame
+    flyBodyGyro.Parent        = hrp
+
+    flyConn = RunService.Heartbeat:Connect(function()
+        if not (Toggles.FlyToggle and Toggles.FlyToggle.Value) then stopFly(); return end
+        local cam   = workspace.CurrentCamera; if not cam then return end
+        local speed = Options.FlySpeed and Options.FlySpeed.Value or 50
+        local dir   = Vector3.zero
+
+        if UIS:IsKeyDown(Enum.KeyCode.W) then dir = dir + cam.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then dir = dir - cam.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then dir = dir - cam.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then dir = dir + cam.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.Space)       then dir = dir + Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir = dir - Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftShift)   then speed = speed * 3 end
+
+        flyBodyVel.Velocity = dir.Magnitude > 0 and dir.Unit * speed or Vector3.zero
+        flyBodyGyro.CFrame  = cam.CFrame
+    end)
+end
+
+Toggles:GetToggle('FlyToggle'):OnChanged(function(v)
+    if v then startFly() else stopFly() end
+end)
+
+-- ── Ghost Mode ───────────────────────────────────────────────────
+--  Noclip + makes local character semi-transparent to others
+local ghostConn = nil
+local ghostOrigTransparencies = {}
+
+local function stopGhost()
+    if ghostConn then ghostConn:Disconnect(); ghostConn = nil end
+    local char = LocalPlayer.Character
+    if char then
+        for _, v in next, char:GetDescendants() do
+            if v:IsA('BasePart') then
+                v.CanCollide  = true
+                v.Transparency = ghostOrigTransparencies[v] or v.Transparency
+            end
+        end
+    end
+    ghostOrigTransparencies = {}
+end
+
+local function startGhost()
+    stopGhost()
+    local char = LocalPlayer.Character; if not char then return end
+    -- Snapshot original transparencies and apply ghost look
+    for _, v in next, char:GetDescendants() do
+        if v:IsA('BasePart') then
+            ghostOrigTransparencies[v] = v.Transparency
+            v.Transparency = 0.6
+        end
+    end
+
+    ghostConn = RunService.Stepped:Connect(function()
+        if not (Toggles.GhostMode and Toggles.GhostMode.Value) then stopGhost(); return end
+        local c = LocalPlayer.Character; if not c then return end
+        for _, v in next, c:GetDescendants() do
+            if v:IsA('BasePart') then
+                v.CanCollide  = false
+                v.Transparency = 0.6
+            end
+        end
+        local hrp = c:FindFirstChild('HumanoidRootPart')
+        local hum = c:FindFirstChildWhichIsA('Humanoid')
+        if hrp then
+            hrp.AssemblyLinearVelocity  = Vector3.zero
+            hrp.AssemblyAngularVelocity = Vector3.zero
+        end
+        if hum then pcall(function() hum:ChangeState(Enum.HumanoidStateType.PlatformStanding) end) end
+    end)
+end
+
+Toggles:GetToggle('GhostMode'):OnChanged(function(v)
+    if v then startGhost() else stopGhost() end
+end)
+
+-- ── Free Cam ─────────────────────────────────────────────────────
+--
+--  Custom scriptable camera with WASD + QE flight.
+--  SHIFT = 3× speed boost.  Scroll wheel = speed adjust.
+--  While active, camera.Focus + ReplicationFocus are set to the
+--  camera position every frame, so Roblox streams in chunks
+--  wherever you fly — same technique as spectate streaming fix.
+-- ─────────────────────────────────────────────────────────────────
+local freeCamActive   = false
+local freeCamConn     = nil
+local freeCamInputConn = nil
+local freeCamWheelConn = nil
+local savedCamType    = nil
+local savedCamSubject = nil
+local freeCamCF       = CFrame.new(0, 10, 0)
+local freeCamSpeedMult = 1  -- scroll-wheel modifier
+
+local FREECAM_KEYS = {
+    forward  = Enum.KeyCode.W,
+    backward = Enum.KeyCode.S,
+    left     = Enum.KeyCode.A,
+    right    = Enum.KeyCode.D,
+    up       = Enum.KeyCode.E,
+    down     = Enum.KeyCode.Q,
+    sprint   = Enum.KeyCode.LeftShift,
+}
+
+local function stopFreeCam()
+    freeCamActive = false
+    if freeCamConn      then freeCamConn:Disconnect();      freeCamConn      = nil end
+    if freeCamInputConn then freeCamInputConn:Disconnect(); freeCamInputConn = nil end
+    if freeCamWheelConn then freeCamWheelConn:Disconnect(); freeCamWheelConn = nil end
+    local cam = workspace.CurrentCamera
+    if cam then
+        cam.CameraType    = savedCamType    or Enum.CameraType.Follow
+        cam.CameraSubject = savedCamSubject or (LocalPlayer.Character
+            and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid'))
+    end
+    -- Restore replication focus to self
+    pcall(function()
+        local hrp = getLocalHRP()
+        LocalPlayer.ReplicationFocus = hrp or workspace
+    end)
+    freeCamSpeedMult = 1
+end
+
+local function startFreeCam()
+    stopFreeCam()
+    local cam = workspace.CurrentCamera; if not cam then return end
+    savedCamType    = cam.CameraType
+    savedCamSubject = cam.CameraSubject
+
+    -- Start freecam at current camera position
+    freeCamCF = cam.CFrame
+    cam.CameraType = Enum.CameraType.Scriptable
+
+    freeCamActive = true
+    local lastTime = os.clock()
+
+    freeCamConn = RunService.RenderStepped:Connect(function()
+        if not (Toggles.FreeCamToggle and Toggles.FreeCamToggle.Value) then stopFreeCam(); return end
+        local now = os.clock()
+        local dt  = math.min(now - lastTime, 0.1)
+        lastTime  = now
+
+        local speed = (Options.FreeCamSpeed and Options.FreeCamSpeed.Value or 80)
+            * freeCamSpeedMult
+            * (UIS:IsKeyDown(FREECAM_KEYS.sprint) and 3 or 1)
+            * dt
+
+        local move = Vector3.zero
+        if UIS:IsKeyDown(FREECAM_KEYS.forward)  then move = move + freeCamCF.LookVector  end
+        if UIS:IsKeyDown(FREECAM_KEYS.backward) then move = move - freeCamCF.LookVector  end
+        if UIS:IsKeyDown(FREECAM_KEYS.right)    then move = move + freeCamCF.RightVector end
+        if UIS:IsKeyDown(FREECAM_KEYS.left)     then move = move - freeCamCF.RightVector end
+        if UIS:IsKeyDown(FREECAM_KEYS.up)       then move = move + Vector3.yAxis         end
+        if UIS:IsKeyDown(FREECAM_KEYS.down)     then move = move - Vector3.yAxis         end
+
+        if move.Magnitude > 0 then
+            freeCamCF = CFrame.new(freeCamCF.Position + move.Unit * speed) *
+                (freeCamCF - freeCamCF.Position)
+        end
+
+        -- Keep camera rotation locked to mouse look (Roblox handles mouse delta
+        -- for Scriptable cameras natively in the CoreScript CameraModule, so we
+        -- just update position — rotation is driven by RightMouseButton drag)
+        cam.CFrame = freeCamCF
+
+        -- ── Force chunk streaming to freecam position ──────────────
+        local pos = freeCamCF.Position
+        pcall(function() cam.Focus = CFrame.new(pos) end)
+        pcall(function() LocalPlayer.ReplicationFocus = workspace.Terrain end)
+        -- RequestStreamAroundAsync is the hard force — asks server for this area now
+        pcall(function()
+            if workspace.RequestStreamAroundAsync then
+                workspace:RequestStreamAroundAsync(pos, 0)
+            end
+        end)
+    end)
+
+    -- Scroll wheel adjusts speed multiplier while in freecam
+    freeCamWheelConn = UIS.InputChanged:Connect(function(input)
+        if not freeCamActive then return end
+        if input.UserInputType == Enum.UserInputType.MouseWheel then
+            freeCamSpeedMult = math.clamp(freeCamSpeedMult + input.Position.Z * 0.2, 0.1, 10)
+        end
+    end)
+end
+
+Toggles:GetToggle('FreeCamToggle'):OnChanged(function(v)
+    if v then startFreeCam() else stopFreeCam() end
+end)
+
+-- ── Click to Teleport ────────────────────────────────────────────
+--
+--  Left-click teleports your HRP to the raycast hit point.
+--  Guards: ignores character parts, adds a small Y offset so you
+--  land on top of the surface, and handles geometry by nudging
+--  the position slightly upward to avoid spawning inside a wall.
+-- ─────────────────────────────────────────────────────────────────
+local clickTpConn = nil
+
+Toggles:GetToggle('ClickTeleport'):OnChanged(function(v)
+    if clickTpConn then clickTpConn:Disconnect(); clickTpConn = nil end
+    if not v then return end
+
+    clickTpConn = UIS.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        if not (Toggles.ClickTeleport and Toggles.ClickTeleport.Value) then return end
+
+        local cam = workspace.CurrentCamera; if not cam then return end
+        local hrp = getLocalHRP(); if not hrp then return end
+        local char = LocalPlayer.Character; if not char then return end
+
+        local mousePos = UIS:GetMouseLocation()
+        local ray = cam:ViewportPointToRay(mousePos.X, mousePos.Y)
+
+        -- Build exclusion list (ignore our own character)
+        local exclude = { char }
+
+        local result = workspace:Raycast(
+            ray.Origin,
+            ray.Direction * 5000,
+            RaycastParams.new()
+        )
+        -- If basic raycast hits nothing, try with instance filter excluding self
+        if not result then
+            local params = RaycastParams.new()
+            params.FilterDescendantsInstances = exclude
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            result = workspace:Raycast(ray.Origin, ray.Direction * 5000, params)
+        end
+
+        if result then
+            -- Check the hit isn't a part of another player's character
+            local hitModel = result.Instance:FindFirstAncestorWhichIsA('Model')
+            for _, p in next, Players:GetPlayers() do
+                if p.Character == hitModel then return end  -- don't tp into a player
+            end
+
+            local targetPos = result.Position + result.Normal * 3  -- offset along surface normal
+            hrp.CFrame = CFrame.new(targetPos) * (hrp.CFrame - hrp.CFrame.Position)
+            Library:Notify(('Teleported → %.1f, %.1f, %.1f'):format(
+                targetPos.X, targetPos.Y, targetPos.Z))
+        end
+    end)
+end)
+
+-- ── Walkspeed ────────────────────────────────────────────────────
 RunService.Heartbeat:Connect(function()
     if not (Toggles.WalkspeedToggle and Toggles.WalkspeedToggle.Value) then return end
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid')
     if hum then hum.WalkSpeed = Options.WalkspeedValue and Options.WalkspeedValue.Value or 16 end
 end)
 
+-- ── Jump Power ───────────────────────────────────────────────────
 RunService.Heartbeat:Connect(function()
     if not (Toggles.JumpPowerToggle and Toggles.JumpPowerToggle.Value) then return end
     local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildWhichIsA('Humanoid')
     if hum then hum.JumpPower = Options.JumpPowerValue and Options.JumpPowerValue.Value or 50 end
 end)
 
+-- ── Random Part timers ───────────────────────────────────────────
 RunService.Heartbeat:Connect(function()
     local now = os.clock()
     if Toggles.RandomAimPart and Toggles.RandomAimPart.Value and now - State.lastRandAimTime >= 1 then
@@ -959,6 +1323,14 @@ RunService.Heartbeat:Connect(function()
             Options.SpinPart:SetValue(State.spinPartValues[math.random(1, #State.spinPartValues)])
         end
     end
+end)
+
+-- ── Clean up movement on character reset ─────────────────────────
+LocalPlayer.CharacterAdded:Connect(function()
+    if flyBodyVel   then flyBodyVel:Destroy();   flyBodyVel   = nil end
+    if flyBodyGyro  then flyBodyGyro:Destroy();  flyBodyGyro  = nil end
+    if flyConn      then flyConn:Disconnect();   flyConn      = nil end
+    ghostOrigTransparencies = {}
 end)
 
 end -- return function
