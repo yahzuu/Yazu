@@ -40,6 +40,7 @@ end
 
 local function createEsp(player)
     if player == LocalPlayer then return end
+    if espData[player] then return end  -- already exists, don't double-create
     espData[player] = {
         box    = newDraw('Square', { Visible=false, Thickness=1, Filled=false, Color=Color3.fromRGB(255,0,0) }),
         name   = newDraw('Text',   { Visible=false, Size=14, Outline=true, OutlineColor=Color3.new(0,0,0), Color=Color3.fromRGB(255,255,255), Center=true }),
@@ -55,9 +56,15 @@ local function removeEsp(player)
     espData[player] = nil
 end
 
-for _, p in next, Players:GetPlayers() do task.spawn(createEsp, p) end
-Players.PlayerAdded:Connect(createEsp)
-Players.PlayerRemoving:Connect(removeEsp)
+-- Seed existing players (CharacterAdded watcher added later in consolidated PlayerAdded block)
+for _, p in next, Players:GetPlayers() do
+    task.spawn(createEsp, p)
+    -- Also attach respawn watcher for players already in the game
+    p.CharacterAdded:Connect(function()
+        task.wait(0.2)
+        if not espData[p] then createEsp(p) end
+    end)
+end
 
 local function setAllEspHidden()
     for _, d in next, espData do for _, dr in next, d do dr.Visible = false end end
@@ -66,10 +73,7 @@ end
 local function startEsp(toggle)
     if EspConn then EspConn:Disconnect(); EspConn = nil end
     if not toggle then setAllEspHidden(); return end
-    local frame = 0
     EspConn = RunService.RenderStepped:Connect(function()
-        frame = frame + 1
-        if frame % 2 ~= 0 then return end
 
         local cam      = workspace.CurrentCamera; if not cam then return end
         local vsize    = cam.ViewportSize
@@ -97,11 +101,13 @@ local function startEsp(toggle)
                 for _, dr in next, d do dr.Visible = false end; continue
             end
 
-            local rootSP, rootVis = cam:WorldToViewportPoint(root.Position)
-            local headSP          = cam:WorldToViewportPoint(head.Position)
-            local dist3D          = lpHRP and (lpHRP.Position - root.Position).Magnitude or 0
+            local rootSP, _   = cam:WorldToViewportPoint(root.Position)
+            local headSP      = cam:WorldToViewportPoint(head.Position)
+            local dist3D      = lpHRP and (lpHRP.Position - root.Position).Magnitude or 0
 
-            if not rootVis or dist3D > maxDist then
+            -- Only skip if beyond max distance; never skip based on viewport frustum
+            -- so ESP works through walls and at any angle
+            if dist3D > maxDist then
                 for _, dr in next, d do dr.Visible = false end; continue
             end
 
@@ -844,9 +850,27 @@ end
 
 -- Keep blip table in sync with player join/leave
 Players.PlayerAdded:Connect(function(p)
-    if Toggles.RadarEnabled and Toggles.RadarEnabled.Value then ensureBlip(p) end
+    -- ESP entry (guards against duplicates internally)
+    createEsp(p)
+    -- Radar blip if radar is running
+    if Toggles.RadarEnabled and Toggles.RadarEnabled.Value then
+        ensureBlip(p)
+    end
+    -- Re-create ESP and blip on every respawn — covers the case where
+    -- the character loads after the initial createEsp call finds nothing
+    p.CharacterAdded:Connect(function()
+        -- Short wait for character to replicate fully
+        task.wait(0.2)
+        if not espData[p] then createEsp(p) end
+        if Toggles.RadarEnabled and Toggles.RadarEnabled.Value
+            and not radarBlips[p] then
+            ensureBlip(p)
+        end
+    end)
 end)
+
 Players.PlayerRemoving:Connect(function(p)
+    removeEsp(p)
     if radarBlips[p] then
         pcall(function() radarBlips[p].glow:Remove()    end)
         pcall(function() radarBlips[p].dot:Remove()     end)
