@@ -459,188 +459,38 @@ end)
 -- ================================================================
 --  RADAR / MAP
 -- ================================================================
---  Pure Drawing-based top-down minimap drawn in the lower-right
---  corner.  Size and world range are controlled by sliders so the
---  user can scale it freely at runtime.
---
---  Center origin:
---    • Spectate ON  → spectated player's HRP
---    • Spectate OFF → LocalPlayer's HRP
---
---  The spectated player's blip is drawn in cyan so it's easy to spot.
--- ================================================================
-
-local radarDrawings  = {}  -- static BG drawing objects (border, bg, crosshair, label)
-local radarBlips     = {}  -- [player] = { dot=Drawing, name=Drawing }
 local RadarConn      = nil
 local RadarDragConn1 = nil
 local RadarDragConn2 = nil
 local RadarDragConn3 = nil
 
-local RADAR_DEFAULT_SIZE  = 300   -- px
-local RADAR_DEFAULT_RANGE = 300   -- studs
+local RADAR_DEFAULT_SIZE  = 300
+local RADAR_DEFAULT_RANGE = 300
 
--- Persisted radar center so it survives size-slider changes without resetting position
-local radarCenter     = nil   -- Vector2, nil until first startRadar call
+local radarCenter     = nil
 local radarDragging   = false
-local radarDragOffset = Vector2.new(0, 0)  -- mouse pos relative to center when drag began
+local radarDragOffset = Vector2.new(0, 0)
 
-local function clearRadarStatic()
-    for _, d in next, radarDrawings do pcall(function() d:Remove() end) end
-    radarDrawings = {}
-end
+-- All drawings live in one flat pool so we can nuke everything cleanly
+local radarPool = {}
 
-local function clearAllRadarBlips()
-    for player, blip in next, radarBlips do
-        pcall(function() blip.glow:Remove()    end)
-        pcall(function() blip.dot:Remove()     end)
-        pcall(function() blip.outline:Remove() end)
-        pcall(function() blip.name:Remove()    end)
-        pcall(function() blip.dist:Remove()    end)
+local function radarRemoveAll()
+    for i = 1, #radarPool do
+        pcall(function() radarPool[i]:Remove() end)
     end
-    radarBlips = {}
+    radarPool = {}
 end
 
--- Top-down world → screen-space radar conversion
--- camCF = the camera's CFrame; we project the XZ diff onto the camera's
--- right and forward axes so the radar is pixel-perfect to first-person FOV.
-local function worldToRadarPos(origin, targetPos, radarCenter, halfSize, worldRange, camCF)
-    local diff  = targetPos - origin
-    local scale = halfSize / worldRange
-    -- Flatten camera axes onto the XZ plane (ignore pitch)
-    local fwd   = camCF.LookVector
-    local right = camCF.RightVector
-    -- Project diff onto the camera's horizontal right and forward
-    local rx =  (diff.X * right.X + diff.Z * right.Z)  -- positive = right of camera
-    local rz = -(diff.X * fwd.X   + diff.Z * fwd.Z)    -- positive = behind camera → down on radar
-    return Vector2.new(radarCenter.X + rx * scale,
-                       radarCenter.Y + rz * scale)
+-- Creates a Drawing, registers it in radarPool, returns it
+local function rd(kind, props)
+    local d = Drawing.new(kind)
+    for k, v in next, props do d[k] = v end
+    radarPool[#radarPool + 1] = d
+    return d
 end
 
--- Build (or rebuild) the static background drawing objects
-local function buildRadarBG(center, size)
-    clearRadarStatic()
-    local half = size / 2
-
-    -- Outer glow border (bright accent ring)
-    local glow = newDraw('Square', {
-        Visible      = true, Filled = true,
-        Color        = Color3.fromRGB(255, 40, 40),
-        Transparency = 0.7,                          -- subtle red glow ring
-        Size         = Vector2.new(size + 10, size + 10),
-        Position     = center - Vector2.new(half + 5, half + 5),
-    })
-    -- Hard border
-    local border = newDraw('Square', {
-        Visible      = true, Filled = false,
-        Color        = Color3.fromRGB(255, 60, 60),
-        Transparency = 0,                            -- fully visible border line
-        Thickness    = 2,
-        Size         = Vector2.new(size + 4, size + 4),
-        Position     = center - Vector2.new(half + 2, half + 2),
-    })
-    -- Background fill — nearly transparent so it barely darkens the game
-    local bg = newDraw('Square', {
-        Visible      = true, Filled = true,
-        Color        = Color3.fromRGB(5, 5, 15),
-        Transparency = 0.82,                         -- very see-through; blips pop above it
-        Size         = Vector2.new(size, size),
-        Position     = center - Vector2.new(half, half),
-    })
-    -- Crosshair horizontal
-    local ch_h = newDraw('Line', {
-        Visible      = true,
-        Color        = Color3.fromRGB(255, 80, 80),
-        Transparency = 0.45,
-        Thickness    = 1,
-        From         = Vector2.new(center.X - half, center.Y),
-        To           = Vector2.new(center.X + half, center.Y),
-    })
-    -- Crosshair vertical
-    local ch_v = newDraw('Line', {
-        Visible      = true,
-        Color        = Color3.fromRGB(255, 80, 80),
-        Transparency = 0.45,
-        Thickness    = 1,
-        From         = Vector2.new(center.X, center.Y - half),
-        To           = Vector2.new(center.X, center.Y + half),
-    })
-    -- Label
-    local lbl = newDraw('Text', {
-        Visible      = true,
-        Text         = '── RADAR ──',
-        Size         = 12,
-        Color        = Color3.fromRGB(255, 100, 100),
-        Outline      = true,
-        OutlineColor = Color3.new(0, 0, 0),
-        Center       = true,
-        Position     = Vector2.new(center.X, center.Y - half - 16),
-    })
-    -- Self arrow: triangle pointing UP (= camera forward, since radar rotates with FOV)
-    -- Three lines: left-side, right-side, base
-    local arrowL = newDraw('Line', {
-        Visible   = true,
-        Color     = Color3.fromRGB(255, 255, 255),
-        Thickness = 2,
-        Transparency = 0,
-        From = Vector2.new(center.X,     center.Y - 9),  -- tip (top)
-        To   = Vector2.new(center.X - 6, center.Y + 5),  -- bottom-left
-    })
-    local arrowR = newDraw('Line', {
-        Visible   = true,
-        Color     = Color3.fromRGB(255, 255, 255),
-        Thickness = 2,
-        Transparency = 0,
-        From = Vector2.new(center.X,     center.Y - 9),  -- tip (top)
-        To   = Vector2.new(center.X + 6, center.Y + 5),  -- bottom-right
-    })
-    local arrowB = newDraw('Line', {
-        Visible   = true,
-        Color     = Color3.fromRGB(255, 255, 255),
-        Thickness = 2,
-        Transparency = 0,
-        From = Vector2.new(center.X - 6, center.Y + 5),  -- bottom-left
-        To   = Vector2.new(center.X + 6, center.Y + 5),  -- bottom-right
-    })
-
-    -- Insert order = draw order; BG first so blips render on top
-    table.insert(radarDrawings, glow)
-    table.insert(radarDrawings, border)
-    table.insert(radarDrawings, bg)
-    table.insert(radarDrawings, ch_h)
-    table.insert(radarDrawings, ch_v)
-    table.insert(radarDrawings, lbl)
-    table.insert(radarDrawings, arrowL)
-    table.insert(radarDrawings, arrowR)
-    table.insert(radarDrawings, arrowB)
-
-    return {
-        glow=glow, border=border, bg=bg,
-        ch_h=ch_h, ch_v=ch_v, lbl=lbl,
-        arrowL=arrowL, arrowR=arrowR, arrowB=arrowB
-    }
-end
-
--- Ensure a blip exists for a player (called lazily during radar loop)
-local function ensureBlip(player)
-    if player == LocalPlayer then return end
-    if radarBlips[player] then return end
-    radarBlips[player] = {
-        -- Glow halo behind the dot (slightly larger, semi-transparent)
-        glow = newDraw('Square', { Visible=false, Filled=true,  Size=Vector2.new(18,18), Transparency=0.5 }),
-        -- Main dot
-        dot  = newDraw('Square', { Visible=false, Filled=true,  Size=Vector2.new(10,10) }),
-        -- Black outline so dot pops on any background
-        outline = newDraw('Square', { Visible=false, Filled=false, Thickness=1, Color=Color3.new(0,0,0), Size=Vector2.new(10,10) }),
-        -- Player name
-        name = newDraw('Text', { Visible=false, Size=11, Outline=true, OutlineColor=Color3.new(0,0,0), Center=true }),
-        -- Distance in studs
-        dist = newDraw('Text', { Visible=false, Size=10, Outline=true, OutlineColor=Color3.new(0,0,0), Center=true, Color=Color3.fromRGB(220,220,220) }),
-    }
-end
-
-local radarBG = nil   -- holds refs returned by buildRadarBG
-local lastRadarSize = nil
+-- Per-player blip handles (Drawing refs)
+local radarBlips = {}  -- [player] = { glow, dot, outline, name, dist }
 
 local function stopRadar()
     if RadarConn      then RadarConn:Disconnect();      RadarConn      = nil end
@@ -648,10 +498,17 @@ local function stopRadar()
     if RadarDragConn2 then RadarDragConn2:Disconnect(); RadarDragConn2 = nil end
     if RadarDragConn3 then RadarDragConn3:Disconnect(); RadarDragConn3 = nil end
     radarDragging = false
-    clearRadarStatic()
-    clearAllRadarBlips()
-    radarBG       = nil
-    lastRadarSize = nil
+    radarRemoveAll()
+    radarBlips = {}
+end
+
+-- Project a world position onto radar screen, aligned to camera FOV
+local function worldToRadar(origin, pos, center, half, range, camCF)
+    local diff  = pos - origin
+    local scale = half / range
+    local rx =  (diff.X * camCF.RightVector.X + diff.Z * camCF.RightVector.Z)
+    local rz = -(diff.X * camCF.LookVector.X  + diff.Z * camCF.LookVector.Z)
+    return Vector2.new(center.X + rx * scale, center.Y + rz * scale)
 end
 
 local function startRadar(on)
@@ -661,137 +518,119 @@ local function startRadar(on)
     local function getSize()  return Options.RadarSize  and Options.RadarSize.Value  or RADAR_DEFAULT_SIZE  end
     local function getRange() return Options.RadarRange and Options.RadarRange.Value or RADAR_DEFAULT_RANGE end
 
-    -- Initialise center only on first launch; preserve it across size changes / re-enables
     if not radarCenter then
-        local cam = workspace.CurrentCamera
-        local vs  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-        local sz  = getSize()
+        local vs = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+        local sz = getSize()
         radarCenter = Vector2.new(vs.X - sz/2 - 20, vs.Y - sz/2 - 20)
     end
 
-    local sz = getSize()
-    radarBG       = buildRadarBG(radarCenter, sz)
-    lastRadarSize = sz
+    -- ── Build all drawings in correct Z order ──────────────────────
+    -- 1. BG first (renders behind blips)
+    local bgGlow   = rd('Square', { Visible=true,  Filled=true,  Transparency=0.7,  Color=Color3.fromRGB(255,40,40) })
+    local bgBorder = rd('Square', { Visible=true,  Filled=false, Transparency=0,    Color=Color3.fromRGB(255,60,60), Thickness=2 })
+    local bgFill   = rd('Square', { Visible=true,  Filled=true,  Transparency=0.82, Color=Color3.fromRGB(5,5,15) })
+    local bgChH    = rd('Line',   { Visible=true,  Transparency=0.45, Color=Color3.fromRGB(255,80,80), Thickness=1 })
+    local bgChV    = rd('Line',   { Visible=true,  Transparency=0.45, Color=Color3.fromRGB(255,80,80), Thickness=1 })
+    local bgLbl    = rd('Text',   { Visible=true,  Text='-- RADAR --', Size=12, Center=true, Outline=true,
+                                    Color=Color3.fromRGB(255,100,100), OutlineColor=Color3.new(0,0,0) })
+    local arrowL   = rd('Line', { Visible=true, Color=Color3.fromRGB(255,255,255), Thickness=2, Transparency=0 })
+    local arrowR   = rd('Line', { Visible=true, Color=Color3.fromRGB(255,255,255), Thickness=2, Transparency=0 })
+    local arrowB   = rd('Line', { Visible=true, Color=Color3.fromRGB(255,255,255), Thickness=2, Transparency=0 })
 
-    -- Create blips AFTER BG so they render on top (Drawing API = creation order)
-    clearAllRadarBlips()
-    for _, p in next, Players:GetPlayers() do ensureBlip(p) end
+    -- 2. Blips second (renders on top of BG)
+    local function makeBlip(player)
+        if player == LocalPlayer then return end
+        if radarBlips[player] then return end
+        radarBlips[player] = {
+            glow    = rd('Square', { Visible=false, Filled=true,  Transparency=0.5, Size=Vector2.new(18,18) }),
+            dot     = rd('Square', { Visible=false, Filled=true,  Size=Vector2.new(10,10) }),
+            outline = rd('Square', { Visible=false, Filled=false, Thickness=1, Color=Color3.new(0,0,0), Size=Vector2.new(10,10) }),
+            name    = rd('Text',   { Visible=false, Size=11, Outline=true, OutlineColor=Color3.new(0,0,0), Center=true }),
+            dist    = rd('Text',   { Visible=false, Size=10, Outline=true, OutlineColor=Color3.new(0,0,0), Center=true, Color=Color3.fromRGB(220,220,220) }),
+        }
+    end
 
-    -- ── Drag handling ──────────────────────────────────────────────
-    -- InputBegan: start drag when left-clicking inside the radar square
-    RadarDragConn1 = UserInputService.InputBegan:Connect(function(input, gameProcessed)
-        if gameProcessed then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
-        local mp    = UserInputService:GetMouseLocation()
-        local half  = (Options.RadarSize and Options.RadarSize.Value or RADAR_DEFAULT_SIZE) / 2
-        local ctr   = radarCenter
-        if math.abs(mp.X - ctr.X) <= half and math.abs(mp.Y - ctr.Y) <= half then
+    for _, p in next, Players:GetPlayers() do makeBlip(p) end
+
+    -- ── Drag ────────────────────────────────────────────────────────
+    RadarDragConn1 = UserInputService.InputBegan:Connect(function(input, gp)
+        if gp or input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+        local mp   = UserInputService:GetMouseLocation()
+        local half = getSize() / 2
+        if math.abs(mp.X - radarCenter.X) <= half and math.abs(mp.Y - radarCenter.Y) <= half then
             radarDragging   = true
-            radarDragOffset = mp - ctr
+            radarDragOffset = mp - radarCenter
         end
     end)
-
-    -- InputChanged: move radar with the mouse while dragging
     RadarDragConn2 = UserInputService.InputChanged:Connect(function(input)
-        if not radarDragging then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
-        local mp = UserInputService:GetMouseLocation()
-        radarCenter = mp - radarDragOffset
+        if radarDragging and input.UserInputType == Enum.UserInputType.MouseMovement then
+            radarCenter = UserInputService:GetMouseLocation() - radarDragOffset
+        end
     end)
-
-    -- InputEnded: release drag
     RadarDragConn3 = UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 then
-            radarDragging = false
-        end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then radarDragging = false end
     end)
-    -- ──────────────────────────────────────────────────────────────
 
+    -- ── Per-frame loop ──────────────────────────────────────────────
     RadarConn = RunService.RenderStepped:Connect(function()
-        local cam2 = workspace.CurrentCamera; if not cam2 then return end
-        local sz2  = getSize()
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+
+        local sz   = getSize()
         local rng  = getRange()
-        -- Use the draggable radarCenter upvalue; clamp to viewport so it can't go off-screen
-        local vs2  = cam2.ViewportSize
-        local half = sz2 / 2
-        radarCenter = Vector2.new(
-            math.clamp(radarCenter.X, half + 4, vs2.X - half - 4),
-            math.clamp(radarCenter.Y, half + 4, vs2.Y - half - 4)
-        )
-        local ctr2 = radarCenter
+        local half = sz / 2
+        local vs   = cam.ViewportSize
+        local cx   = math.clamp(radarCenter.X, half + 4, vs.X - half - 4)
+        local cy   = math.clamp(radarCenter.Y, half + 4, vs.Y - half - 4)
+        radarCenter = Vector2.new(cx, cy)
 
-        -- Rebuild BG only if size changed (avoids per-frame allocation)
-        if sz2 ~= lastRadarSize then
-            radarBG       = buildRadarBG(ctr2, sz2)
-            lastRadarSize = sz2
-            -- Recreate all blip drawings AFTER the BG so they render on top
-            -- (Drawing API renders in creation order)
-            local players = {}
-            for p in next, radarBlips do players[#players+1] = p end
-            clearAllRadarBlips()
-            for _, p in next, players do ensureBlip(p) end
-        else
-            -- Reposition existing BG elements to current (possibly dragged) center
-            radarBG.glow.Size         = Vector2.new(sz2+10, sz2+10)
-            radarBG.glow.Position     = ctr2 - Vector2.new(half+5, half+5)
-            radarBG.border.Size       = Vector2.new(sz2+4, sz2+4)
-            radarBG.border.Position   = ctr2 - Vector2.new(half+2, half+2)
-            radarBG.bg.Size           = Vector2.new(sz2, sz2)
-            radarBG.bg.Position       = ctr2 - Vector2.new(half, half)
-            radarBG.ch_h.From         = Vector2.new(ctr2.X - half, ctr2.Y)
-            radarBG.ch_h.To           = Vector2.new(ctr2.X + half, ctr2.Y)
-            radarBG.ch_v.From         = Vector2.new(ctr2.X, ctr2.Y - half)
-            radarBG.ch_v.To           = Vector2.new(ctr2.X, ctr2.Y + half)
-            radarBG.lbl.Position      = Vector2.new(ctr2.X, ctr2.Y - half - 16)
-            -- Arrow always at center (radar rotates around origin, tip always = forward = up)
-            radarBG.arrowL.From = Vector2.new(ctr2.X,     ctr2.Y - 9)
-            radarBG.arrowL.To   = Vector2.new(ctr2.X - 6, ctr2.Y + 5)
-            radarBG.arrowR.From = Vector2.new(ctr2.X,     ctr2.Y - 9)
-            radarBG.arrowR.To   = Vector2.new(ctr2.X + 6, ctr2.Y + 5)
-            radarBG.arrowB.From = Vector2.new(ctr2.X - 6, ctr2.Y + 5)
-            radarBG.arrowB.To   = Vector2.new(ctr2.X + 6, ctr2.Y + 5)
-        end
+        -- Position BG drawings
+        bgGlow.Size         = Vector2.new(sz+10, sz+10)
+        bgGlow.Position     = Vector2.new(cx-half-5,  cy-half-5)
+        bgBorder.Size       = Vector2.new(sz+4,  sz+4)
+        bgBorder.Position   = Vector2.new(cx-half-2,  cy-half-2)
+        bgFill.Size         = Vector2.new(sz, sz)
+        bgFill.Position     = Vector2.new(cx-half, cy-half)
+        bgChH.From          = Vector2.new(cx-half, cy);  bgChH.To = Vector2.new(cx+half, cy)
+        bgChV.From          = Vector2.new(cx, cy-half);  bgChV.To = Vector2.new(cx, cy+half)
+        bgLbl.Position      = Vector2.new(cx, cy-half-16)
+        arrowL.From = Vector2.new(cx,    cy-9);  arrowL.To = Vector2.new(cx-6, cy+5)
+        arrowR.From = Vector2.new(cx,    cy-9);  arrowR.To = Vector2.new(cx+6, cy+5)
+        arrowB.From = Vector2.new(cx-6, cy+5);   arrowB.To = Vector2.new(cx+6, cy+5)
 
-        -- Resolve origin
-        local useSpec   = Toggles.SpectateEnabled and Toggles.SpectateEnabled.Value and SpectateTarget
-        local origChar  = useSpec and SpectateTarget.Character or LocalPlayer.Character
-        local origRoot  = origChar and origChar:FindFirstChild('HumanoidRootPart')
+        -- Resolve radar origin
+        local useSpec  = Toggles.SpectateEnabled and Toggles.SpectateEnabled.Value and SpectateTarget
+        local origChar = useSpec and SpectateTarget.Character or LocalPlayer.Character
+        local origRoot = origChar and origChar:FindFirstChild('HumanoidRootPart')
 
         if not origRoot then
             for _, blip in next, radarBlips do
-                blip.glow.Visible    = false
-                blip.dot.Visible     = false
-                blip.outline.Visible = false
-                blip.name.Visible    = false
-                blip.dist.Visible    = false
+                blip.glow.Visible=false; blip.dot.Visible=false
+                blip.outline.Visible=false; blip.name.Visible=false; blip.dist.Visible=false
             end
             return
         end
-        local origin = origRoot.Position
 
-        -- Always use the live camera CFrame — this is exactly what the
-        -- spectated player sees in first-person (or what you see locally).
-        -- No atan2 needed; worldToRadarPos projects directly onto camera axes.
-        local camCF = cam2.CFrame
-
+        local origin    = origRoot.Position
+        local camCF     = cam.CFrame
         local showNames = Toggles.RadarNames and Toggles.RadarNames.Value
         local showDist  = Toggles.RadarDist  and Toggles.RadarDist.Value
+
+        -- Lazily create blips for anyone who joined after startRadar
+        for _, p in next, Players:GetPlayers() do makeBlip(p) end
 
         for player, blip in next, radarBlips do
             local char = player.Character
             local root = char and char:FindFirstChild('HumanoidRootPart')
+
             if not root then
-                blip.glow.Visible    = false
-                blip.dot.Visible     = false
-                blip.outline.Visible = false
-                blip.name.Visible    = false
-                blip.dist.Visible    = false
+                blip.glow.Visible=false; blip.dot.Visible=false
+                blip.outline.Visible=false; blip.name.Visible=false; blip.dist.Visible=false
                 continue
             end
 
-            local pos2D   = worldToRadarPos(origin, root.Position, ctr2, half, rng, camCF)
-            local inBounds = math.abs(pos2D.X - ctr2.X) <= half
-                          and math.abs(pos2D.Y - ctr2.Y) <= half
+            local pos2D    = worldToRadar(origin, root.Position, radarCenter, half, rng, camCF)
+            local inBounds = math.abs(pos2D.X - cx) <= half and math.abs(pos2D.Y - cy) <= half
 
             blip.glow.Visible    = inBounds
             blip.dot.Visible     = inBounds
@@ -799,73 +638,50 @@ local function startRadar(on)
             blip.name.Visible    = inBounds and showNames
             blip.dist.Visible    = inBounds and showDist
 
-            if inBounds then
-                -- Colour logic: spectated = cyan, otherwise match ESP colours
-                local col
-                if player == SpectateTarget then
-                    col = Color3.fromRGB(0, 255, 255)
-                elseif Toggles.EspUseTeamColor and Toggles.EspUseTeamColor.Value and player.TeamColor then
-                    col = player.TeamColor.Color
-                else
-                    local isAlly = player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team
-                    col = isAlly
-                        and (Options.AllyColor  and Options.AllyColor.Value  or Color3.fromRGB(0, 255, 80))
-                        or  (Options.EnemyColor and Options.EnemyColor.Value or Color3.fromRGB(255, 40, 40))
-                end
+            if not inBounds then continue end
 
-                local DOT_SIZE = 10
-                local GLOW_SIZE = 18
+            local col
+            if player == SpectateTarget then
+                col = Color3.fromRGB(0, 255, 255)
+            elseif Toggles.EspUseTeamColor and Toggles.EspUseTeamColor.Value and player.TeamColor then
+                col = player.TeamColor.Color
+            else
+                local ally = player.Team and LocalPlayer.Team and player.Team == LocalPlayer.Team
+                col = ally
+                    and (Options.AllyColor  and Options.AllyColor.Value  or Color3.fromRGB(0,255,80))
+                    or  (Options.EnemyColor and Options.EnemyColor.Value or Color3.fromRGB(255,40,40))
+            end
 
-                -- Glow halo (behind dot, same color but transparent)
-                blip.glow.Color    = col
-                blip.glow.Size     = Vector2.new(GLOW_SIZE, GLOW_SIZE)
-                blip.glow.Position = pos2D - Vector2.new(GLOW_SIZE/2, GLOW_SIZE/2)
+            blip.glow.Color    = col
+            blip.glow.Size     = Vector2.new(18, 18)
+            blip.glow.Position = pos2D - Vector2.new(9, 9)
 
-                -- Main dot
-                blip.dot.Color    = col
-                blip.dot.Size     = Vector2.new(DOT_SIZE, DOT_SIZE)
-                blip.dot.Position = pos2D - Vector2.new(DOT_SIZE/2, DOT_SIZE/2)
+            blip.dot.Color    = col
+            blip.dot.Size     = Vector2.new(10, 10)
+            blip.dot.Position = pos2D - Vector2.new(5, 5)
 
-                -- Black outline
-                blip.outline.Size     = Vector2.new(DOT_SIZE, DOT_SIZE)
-                blip.outline.Position = pos2D - Vector2.new(DOT_SIZE/2, DOT_SIZE/2)
+            blip.outline.Size     = Vector2.new(10, 10)
+            blip.outline.Position = pos2D - Vector2.new(5, 5)
 
-                -- Label stack: name above, dist below
-                local labelOffset = DOT_SIZE/2 + 2
-                if showNames then
-                    blip.name.Text     = player.Name
-                    blip.name.Color    = col
-                    blip.name.Position = pos2D - Vector2.new(0, labelOffset + 11)
-                end
-                if showDist then
-                    local studs = math.floor((root.Position - origin).Magnitude)
-                    blip.dist.Text     = studs .. 'm'
-                    blip.dist.Color    = Color3.fromRGB(220, 220, 220)
-                    blip.dist.Position = pos2D + Vector2.new(0, labelOffset)
-                end
+            if showNames then
+                blip.name.Text     = player.Name
+                blip.name.Color    = col
+                blip.name.Position = pos2D - Vector2.new(0, 17)
+            end
+            if showDist then
+                blip.dist.Text     = math.floor((root.Position - origin).Magnitude) .. 'm'
+                blip.dist.Position = pos2D + Vector2.new(0, 7)
             end
         end
     end)
 end
 
--- Keep blip table in sync with player join/leave
+-- Player join/leave sync
 Players.PlayerAdded:Connect(function(p)
-    -- ESP entry (guards against duplicates internally)
     createEsp(p)
-    -- Radar blip if radar is running
-    if Toggles.RadarEnabled and Toggles.RadarEnabled.Value then
-        ensureBlip(p)
-    end
-    -- Re-create ESP and blip on every respawn — covers the case where
-    -- the character loads after the initial createEsp call finds nothing
     p.CharacterAdded:Connect(function()
-        -- Short wait for character to replicate fully
         task.wait(0.2)
         if not espData[p] then createEsp(p) end
-        if Toggles.RadarEnabled and Toggles.RadarEnabled.Value
-            and not radarBlips[p] then
-            ensureBlip(p)
-        end
     end)
 end)
 
@@ -884,12 +700,12 @@ end)
 -- ── Radar UI ───────────────────────────────────────────────────
 local RadarGrp = Tabs.ESP:AddRightGroupbox('Radar')
 RadarGrp:AddToggle('RadarEnabled', {
-    Text    = 'Enable Radar',
-    Default = false,
+    Text     = 'Enable Radar',
+    Default  = false,
     Callback = startRadar,
 })
-RadarGrp:AddToggle('RadarNames', { Text = 'Show Names on Radar', Default = false })
-RadarGrp:AddToggle('RadarDist',  { Text = 'Show Distance on Radar', Default = true })
+RadarGrp:AddToggle('RadarNames', { Text = 'Show Names on Radar',    Default = false })
+RadarGrp:AddToggle('RadarDist',  { Text = 'Show Distance on Radar', Default = true  })
 RadarGrp:AddSlider('RadarSize', {
     Text     = 'Radar Size (px)',
     Default  = RADAR_DEFAULT_SIZE,
@@ -905,13 +721,12 @@ RadarGrp:AddSlider('RadarRange', {
     Rounding = 0,
 })
 RadarGrp:AddButton('Reset Radar Position', function()
-    -- Snap back to default bottom-right corner
-    local cam = workspace.CurrentCamera
-    local vs  = cam and cam.ViewportSize or Vector2.new(1920, 1080)
-    local sz  = Options.RadarSize and Options.RadarSize.Value or RADAR_DEFAULT_SIZE
+    local vs = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1920, 1080)
+    local sz = Options.RadarSize and Options.RadarSize.Value or RADAR_DEFAULT_SIZE
     radarCenter   = Vector2.new(vs.X - sz/2 - 20, vs.Y - sz/2 - 20)
     radarDragging = false
 end)
+
 
 -- ================================================================
 --  ANTI-AFK
