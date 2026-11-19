@@ -81,7 +81,7 @@ local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
     [6137321701] = 'features/blair.lua',
     [6348640020] = 'features/blair.lua',
-    [10266164381] = 'features/bloodlines.lua',
+    --[10266164381] = 'features/bloodlines.lua',
 }
 
 if placeFeatures[placeId] then
