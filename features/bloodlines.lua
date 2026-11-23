@@ -1143,4 +1143,93 @@ end
 TpGrp:AddButton({ Text = 'Refresh Lists', Func = refreshLists })
 task.defer(refreshLists)
 
+-- ================================================================
+--  MOVEMENT DIAGNOSTICS
+--  Nothing in this module moves the character unless a toggle is on.
+--  SaveManager:LoadAutoloadConfig() in main.lua restores toggles from a
+--  saved config AFTER every module loads, so a stale saved toggle (Fly,
+--  Desync, Null Strike, ...) can start pulling you on execute. The audit
+--  below lists any such toggle that is on, using index names taken from
+--  features/misc.lua and this file.
+-- ================================================================
+
+local MOVEMENT_TOGGLES = {
+    -- misc.lua
+    'FlyToggle', 'NoClipToggle', 'BetterNoClip', 'GhostMode', 'FreeCamToggle', 'ClickTeleport',
+    'InfiniteJump', 'WalkspeedToggle', 'JumpPowerToggle', 'SpinBotEnabled',
+    'NullStrikeEnabled', 'DesyncEnabled', 'PassiveLagEnabled', 'StateSpoofEnabled',
+    'HitConfusionEnabled', 'BaitEnabled',
+    -- this file
+    'BL_Fly', 'BL_Noclip', 'BL_Speed', 'BL_AutoFarm', 'BL_AutoAttack', 'BL_AutoHarvest', 'BL_AutoParry',
+}
+
+local function enabledMovementToggles()
+    local on = {}
+    for _, idx in ipairs(MOVEMENT_TOGGLES) do
+        local toggle = Toggles[idx]
+        if toggle and toggle.Value == true then on[#on + 1] = idx end
+    end
+    return on
+end
+
+local MOVER_CLASSES = {
+    BodyVelocity = true, BodyGyro = true, BodyPosition = true, BodyThrust = true, BodyForce = true,
+    BodyAngularVelocity = true, RocketPropulsion = true, LinearVelocity = true, VectorForce = true,
+    AlignPosition = true, AlignOrientation = true,
+}
+
+local function movementReport()
+    local lines = { 'Bloodlines movement report, os.time ' .. tostring(os.time()) }
+    local on = enabledMovementToggles()
+    lines[#lines + 1] = 'Toggles on: ' .. (#on > 0 and table.concat(on, ', ') or '(none)')
+    lines[#lines + 1] = 'Block BanMe hook installed: ' .. tostring(hook.installed) .. ', BanMe reports blocked so far: ' .. tostring(hook.blockedBans)
+    local char, hum, root = getCharacter()
+    if not char then
+        lines[#lines + 1] = 'No living character.'
+        return lines
+    end
+    local okState, state = pcall(function() return hum:GetState() end)
+    lines[#lines + 1] = string.format('Humanoid: state=%s WalkSpeed=%s JumpPower=%s PlatformStand=%s Sit=%s',
+        okState and tostring(state) or '?', tostring(hum.WalkSpeed), tostring(hum.JumpPower), tostring(hum.PlatformStand), tostring(hum.Sit))
+    local v = root.AssemblyLinearVelocity
+    lines[#lines + 1] = string.format('Root: Anchored=%s position=(%.1f, %.1f, %.1f) velocity=(%.1f, %.1f, %.1f)',
+        tostring(root.Anchored), root.Position.X, root.Position.Y, root.Position.Z, v.X, v.Y, v.Z)
+    lines[#lines + 1] = 'Workspace.Gravity: ' .. tostring(workspace.Gravity)
+    local movers = 0
+    for _, inst in ipairs(char:GetDescendants()) do
+        if MOVER_CLASSES[inst.ClassName] then
+            movers = movers + 1
+            lines[#lines + 1] = 'Mover on character: ' .. inst:GetFullName() .. ' (' .. inst.ClassName .. ')'
+        end
+    end
+    if movers == 0 then lines[#lines + 1] = 'Movers on character: none' end
+    return lines
+end
+
+SafeGrp:AddButton({ Text = 'Save Movement Report', Func = function()
+    local lines = movementReport()
+    for _, line in ipairs(lines) do print('[Bloodlines] ' .. line) end
+    if type(writefile) ~= 'function' or type(makefolder) ~= 'function' then
+        Library:Notify('Report printed to the console (writefile missing)')
+        return
+    end
+    local folder = 'YazuDumper'
+    pcall(function() if type(isfolder) ~= 'function' or not isfolder(folder) then makefolder(folder) end end)
+    local path = folder .. '/BL_MoveReport_' .. tostring(os.time()) .. '.txt'
+    local ok, err = pcall(writefile, path, table.concat(lines, '\n'))
+    Library:Notify(ok and ('Saved ' .. path) or ('Write error: ' .. tostring(err)))
+end })
+SafeGrp:AddButton({ Text = 'Turn Off Movement Toggles', Func = function()
+    local on = enabledMovementToggles()
+    for _, idx in ipairs(on) do Toggles[idx]:SetValue(false) end
+    Library:Notify(#on > 0 and ('Turned off: ' .. table.concat(on, ', ')) or 'No movement toggle was on')
+end })
+
+task.delay(3, function()
+    local on = enabledMovementToggles()
+    if #on > 0 then
+        Library:Notify('Saved config has movement toggles ON: ' .. table.concat(on, ', ') .. ' (Bloodlines > Safety > Turn Off Movement Toggles)', 12)
+    end
+end)
+
 end
