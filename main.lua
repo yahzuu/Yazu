@@ -53,7 +53,7 @@ if placeId == 6348640020 then
     Tabs.blair = Window:AddTab('blair')
 end
 
-if placeId == 10266164381 then
+--if placeId == 10266164381 then
     Tabs.bloodlines = Window:AddTab('bloodlines')
 end
 -- UI Settings must always be last
