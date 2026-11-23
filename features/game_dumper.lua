@@ -31,6 +31,12 @@ local LIMITS = {
     MaxCallSiteLines   = 4000,
     RequireTimeout     = 3,
     YieldEvery         = 200,
+    MaxTreeLinesPerRoot  = 1200,
+    MaxLinesPerModule    = 300,
+    WindowBefore         = 8,
+    WindowAfter          = 25,
+    MaxWindowsPerKeyword = 6,
+    MaxSourceScripts     = 4,
     TreeDepth = {
         Workspace         = 4,
         ReplicatedStorage = 7,
@@ -177,6 +183,28 @@ local function describe(inst)
         text = text .. ' = ' .. fmtValue(prop(inst, 'Value'))
     end
     return text .. attrString(inst)
+end
+
+-- Wraps line() with its own budget so one huge subtree cannot starve the rest.
+local function budgeted(line, limit)
+    local used, cut = 0, false
+    local function limited(text)
+        if used >= limit then
+            cut = true
+            return
+        end
+        used = used + 1
+        line(text)
+    end
+    return limited, function() return cut end
+end
+
+local function optionValue(name, fallback)
+    local opt = Options and Options[name]
+    if opt and type(opt.Value) == 'string' and opt.Value ~= '' then
+        return opt.Value
+    end
+    return fallback
 end
 
 local function getService(name)
@@ -635,15 +663,22 @@ local function sectionTags(line)
         return
     end
     table.sort(tags)
-    line('tag count: ' .. #tags)
+    local emptyCount, guidCount = 0, 0
     for _, tag in ipairs(tags) do
         local tagged = CollectionService:GetTagged(tag)
-        local samples = {}
-        for i = 1, math.min(#tagged, 3) do
-            samples[#samples + 1] = tagged[i]:GetFullName()
+        if #tagged == 0 then
+            emptyCount = emptyCount + 1
+        elseif tag:match('^%x+%-%x+%-%x+%-%x+%-%x+$') then
+            guidCount = guidCount + 1
+        else
+            local samples = {}
+            for i = 1, math.min(#tagged, 3) do
+                samples[#samples + 1] = tagged[i]:GetFullName()
+            end
+            line(string.format('%-32s count=%d  e.g. %s', tag, #tagged, table.concat(samples, ' | ')))
         end
-        line(string.format('%-32s count=%d  e.g. %s', tag, #tagged, table.concat(samples, ' | ')))
     end
+    line('-- total tags: ' .. #tags .. ', hidden: ' .. emptyCount .. ' with no tagged instance, ' .. guidCount .. ' GUID-named (tween ids)')
 end
 
 -- ================================================================
@@ -657,7 +692,11 @@ local function sectionTree(line)
             local depth = LIMITS.TreeDepth[name]
             line('')
             line('### ' .. name .. ' (depth ' .. depth .. ')')
-            dumpTree(line, svc, 1, depth, '  ')
+            local rootLine, wasCut = budgeted(line, LIMITS.MaxTreeLinesPerRoot)
+            dumpTree(rootLine, svc, 1, depth, '  ')
+            if wasCut() then
+                line('  !! ' .. name .. ' tree cut at ' .. LIMITS.MaxTreeLinesPerRoot .. ' lines')
+            end
         end
     end
 end
@@ -832,11 +871,90 @@ local function sectionModules(line)
         if not ok then
             line('  require failed: ' .. oneLine(result, 200))
         else
-            shapeEntry(line, '<return>', result, '  ', 1, {})
+            local modLine, modCut = budgeted(line, LIMITS.MaxLinesPerModule)
+            shapeEntry(modLine, '<return>', result, '  ', 1, {})
+            if modCut() then
+                line('  !! module output cut at ' .. LIMITS.MaxLinesPerModule .. ' lines')
+            end
         end
         line('')
     end
     noteSkipped(line, skipped, firstErr)
+end
+
+-- ================================================================
+--  SECTION: source windows (decompiled code around keywords)
+-- ================================================================
+
+local DEFAULT_SCRIPT_MATCH = 'ClientGui.LocalScript'
+local DEFAULT_KEYWORDS     = 'CheckMeleeHit,startSkill,GetQuestProgress,StartQuest'
+
+local function splitKeywords(text)
+    local list = {}
+    for word in tostring(text):gmatch('[^,]+') do
+        word = word:match('^%s*(.-)%s*$')
+        if word ~= '' then list[#list + 1] = word end
+    end
+    return list
+end
+
+local function sectionSource(line)
+    if type(decompile) ~= 'function' then
+        line('decompile() is not available on this executor.')
+        return
+    end
+    local needle   = optionValue('GD_ScriptMatch', DEFAULT_SCRIPT_MATCH)
+    local keywords = splitKeywords(optionValue('GD_Keywords', DEFAULT_KEYWORDS))
+    line('script path contains : ' .. needle)
+    line('keywords             : ' .. table.concat(keywords, ', '))
+    line('window               : ' .. LIMITS.WindowBefore .. ' lines before, ' .. LIMITS.WindowAfter .. ' after, up to ' .. LIMITS.MaxWindowsPerKeyword .. ' windows per keyword')
+    line('')
+
+    local matched = {}
+    for _, inst in ipairs(collectScripts()) do
+        if inst:GetFullName():find(needle, 1, true) then
+            matched[#matched + 1] = inst
+            if #matched >= LIMITS.MaxSourceScripts then break end
+        end
+    end
+    if #matched == 0 then
+        line('no script path contains "' .. needle .. '"')
+        return
+    end
+
+    for _, inst in ipairs(matched) do
+        local ok, src = pcall(decompile, inst)
+        if not ok or type(src) ~= 'string' or #src == 0 then
+            line('######## ' .. inst:GetFullName() .. ': no decompiled source')
+        else
+            local lines = {}
+            for text in (src .. '\n'):gmatch('(.-)\n') do lines[#lines + 1] = text end
+            line('######## ' .. inst:GetFullName() .. ' (' .. #lines .. ' lines)')
+            for _, kw in ipairs(keywords) do
+                line('-- keyword: ' .. kw)
+                local shown, lastEnd = 0, 0
+                for n = 1, #lines do
+                    if lines[n]:find(kw, 1, true) and n > lastEnd then
+                        if shown >= LIMITS.MaxWindowsPerKeyword then
+                            line('  ... more hits not shown')
+                            break
+                        end
+                        local from = math.max(1, n - LIMITS.WindowBefore)
+                        local to   = math.min(#lines, n + LIMITS.WindowAfter)
+                        if from <= lastEnd then from = lastEnd + 1 end
+                        line('  ---- lines ' .. from .. '-' .. to)
+                        for i = from, to do
+                            line(string.format('%6d  %s', i, lines[i]:sub(1, 240)))
+                        end
+                        lastEnd = to
+                        shown = shown + 1
+                    end
+                end
+                RunService.Heartbeat:Wait()
+            end
+            line('')
+        end
+    end
 end
 
 -- ================================================================
@@ -854,6 +972,7 @@ local SECTIONS = {
     tree     = { title = 'INSTANCE TREE',                                                  run = sectionTree },
     calls    = { title = 'REMOTE CALL SITES (decompiled LocalScripts and ModuleScripts)',  run = sectionCallSites },
     modules  = { title = 'MODULESCRIPT RETURN SHAPES (runs require)',                      run = sectionModules },
+    source   = { title = 'DECOMPILED SOURCE WINDOWS AROUND KEYWORDS',                      run = sectionSource },
 }
 
 local FULL_ORDER = { 'session', 'oldrefs', 'remotes', 'mobs', 'player', 'interact', 'tags', 'tree', 'calls' }
@@ -936,6 +1055,17 @@ Grp:AddButton({ Text = 'Remote Call Sites (decompile)', Func = function()
 end })
 Grp:AddButton({ Text = 'Module Shapes (runs require)', Func = function()
     runDump({ 'modules' }, 'Dump_Modules.txt')
+end })
+Grp:AddInput('GD_ScriptMatch', {
+    Default = DEFAULT_SCRIPT_MATCH, Text = 'Script path contains',
+    Placeholder = 'e.g. ClientGui.LocalScript', Finished = true,
+})
+Grp:AddInput('GD_Keywords', {
+    Default = DEFAULT_KEYWORDS, Text = 'Keywords (comma separated)',
+    Placeholder = 'e.g. CheckMeleeHit,StartQuest', Finished = true,
+})
+Grp:AddButton({ Text = 'Source Windows (uses the two inputs above)', Func = function()
+    runDump({ 'source' }, 'Dump_Source.txt')
 end })
 
 end -- return function
