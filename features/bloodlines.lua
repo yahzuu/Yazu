@@ -89,6 +89,22 @@ local BUILD = {
     MeleeAction = 'CheckMeleeHit',
     MeleeType   = 'NormalAttack',
     MeleeTrailing = 4,
+
+    -- Block remotes, call sites L9275 and L1643/L11002 (dump 2). UNVERIFIED: the meaning of the 3,
+    -- the timing of the perfect-block window, and what the server needs besides this call.
+    DataFunction   = 'DataFunction',   -- RemoteFunction (dump remotes section)
+    BlockAction    = 'Block',          -- DataFunction:InvokeServer("Block", 3) == true when a block starts
+    BlockArg       = 3,
+    EndBlockAction = 'EndBlock',       -- DataFunction:InvokeServer("EndBlock")
+
+    -- Replicated per-NPC state (dump 2 tree): Workspace NPC model -> Settings folder.
+    SettingsFolder        = 'Settings',
+    SettingsMeleeCooldown = 'MeleeCooldown',   -- BoolValue
+    SettingsCurrentSkill  = 'CurrentSkill',    -- StringValue
+    SettingsStatusFlags   = { 'Stunned', 'Blocking', 'Knocked', 'Invincible', 'HyperArmour', 'canPerfectBlock', 'ParryStun' }, -- BoolValues
+
+    ItemDetectorName = 'ItemDetector', -- ClickDetector on Workspace.Gloweed (x1) and Workspace.Seaweed (x4), MaxActivationDistance 12 (dump 2 interactables)
+    MissionModelName = 'Mission',      -- Mission Boards.<board>.Mission, attributes Mission and Village (dump 2 tree)
 }
 
 local MAX_SPEED = BUILD.WalkSpeedBanThreshold - 10
@@ -119,6 +135,18 @@ end
 local DataEvent = resolveDataEvent()
 if not DataEvent then
     Library:Notify('Bloodlines: ReplicatedStorage.Events.DataEvent not found; remote features are disabled', 8)
+end
+
+local function resolveDataFunction()
+    local folder = ReplicatedStorage:FindFirstChild(BUILD.EventsFolder)
+    local remote = folder and folder:FindFirstChild(BUILD.DataFunction)
+    if remote and remote:IsA('RemoteFunction') then return remote end
+    return nil
+end
+
+local DataFunction = resolveDataFunction()
+if not DataFunction then
+    Library:Notify('Bloodlines: ReplicatedStorage.Events.DataFunction not found; Auto Parry is disabled', 8)
 end
 
 -- ================================================================
@@ -270,7 +298,9 @@ end
 local FarmGrp   = Tab:AddLeftGroupbox('Combat & Farm')
 local LocalGrp  = Tab:AddLeftGroupbox('Local Cheats')
 local VisualGrp = Tab:AddLeftGroupbox('Visual Cheats')
-local EspGrp    = Tab:AddRightGroupbox('NPC ESP')
+local ParryGrp  = Tab:AddLeftGroupbox('Auto Parry')
+local EspGrp    = Tab:AddRightGroupbox('ESP')
+local UtilGrp   = Tab:AddRightGroupbox('Harvest & Utility')
 local TpGrp     = Tab:AddRightGroupbox('Teleport Cheats')
 local SafeGrp   = Tab:AddRightGroupbox('Safety')
 
@@ -525,6 +555,158 @@ onCleanup(function()
 end)
 
 -- ================================================================
+--  AUTO PARRY
+--  Trigger: an enemy Combat NPC within range flips Settings.MeleeCooldown
+--  to true or sets a non-empty Settings.CurrentSkill. Whether either marks
+--  the start of a hit is UNVERIFIED; the log toggle records both against my
+--  own Block calls so the delay can be calibrated from a real fight.
+-- ================================================================
+
+ParryGrp:AddLabel('Needs Combat NPC Settings values; players are not detected.')
+ParryGrp:AddToggle('BL_AutoParry', { Text = 'Auto Parry', Default = false,
+    Tooltip = 'Calls Block when a nearby Combat NPC signals an attack, then EndBlock. Untested in game.' })
+ParryGrp:AddToggle('BL_ParryOnMelee', { Text = 'Trigger: enemy MeleeCooldown on', Default = true })
+ParryGrp:AddToggle('BL_ParryOnSkill', { Text = 'Trigger: enemy CurrentSkill set', Default = true })
+ParryGrp:AddSlider('BL_ParryRange', { Text = 'Trigger Range (studs)', Default = 18, Min = 5, Max = 60, Rounding = 0 })
+ParryGrp:AddSlider('BL_ParryDelay', { Text = 'Delay After Trigger (s) - uncalibrated', Default = 0, Min = 0, Max = 1, Rounding = 2 })
+ParryGrp:AddSlider('BL_ParryHold', { Text = 'Hold Block (s) - uncalibrated', Default = 0.35, Min = 0.1, Max = 1.5, Rounding = 2 })
+ParryGrp:AddToggle('BL_ParryLog', { Text = 'Log enemy events and my blocks', Default = false })
+
+local parry = { blocking = false, watched = {}, log = {} }
+
+local function logParry(text)
+    if not Toggles.BL_ParryLog.Value then return end
+    local log = parry.log
+    log[#log + 1] = string.format('%.3f %s', os.clock(), text)
+    if #log > 5000 then table.remove(log, 1) end
+end
+
+local function endBlock()
+    parry.blocking = false
+    if not DataFunction then return end
+    local ok, result = pcall(function() return DataFunction:InvokeServer(BUILD.EndBlockAction) end)
+    logParry('EndBlock -> ' .. tostring(ok) .. ' ' .. tostring(result))
+end
+
+local function startBlock(holdTime)
+    if parry.blocking or not DataFunction or not getCharacter() then return end
+    parry.blocking = true
+    task.spawn(function()
+        local ok, result = pcall(function() return DataFunction:InvokeServer(BUILD.BlockAction, BUILD.BlockArg) end)
+        logParry('Block -> ' .. tostring(ok) .. ' ' .. tostring(result))
+        if ok and result == true then
+            task.wait(holdTime)
+            endBlock()
+        else
+            parry.blocking = false
+        end
+    end)
+end
+
+local function onEnemyEvent(model, what, actionable)
+    local _, _, myRoot = getCharacter()
+    local root = model:FindFirstChild('HumanoidRootPart')
+    if not myRoot or not root then return end
+    local distance = (root.Position - myRoot.Position).Magnitude
+    logParry(string.format('enemy %s: %s (%dm)%s', model.Name, what, math.floor(distance), actionable and '' or ' [trigger off]'))
+    if not actionable or not Toggles.BL_AutoParry.Value then return end
+    if distance > Options.BL_ParryRange.Value then return end
+    task.delay(Options.BL_ParryDelay.Value, function()
+        if Toggles.BL_AutoParry.Value then startBlock(Options.BL_ParryHold.Value) end
+    end)
+end
+
+local function unwatchNpc(model)
+    local entry = parry.watched[model]
+    if not entry then return end
+    for _, conn in ipairs(entry) do conn:Disconnect() end
+    parry.watched[model] = nil
+end
+
+local function watchNpc(model)
+    if parry.watched[model] then return end
+    local entry = {}
+    parry.watched[model] = entry
+    entry[#entry + 1] = model.AncestryChanged:Connect(function(_, parent)
+        if not parent then unwatchNpc(model) end
+    end)
+    task.spawn(function()
+        local settings = model:WaitForChild(BUILD.SettingsFolder, 10)
+        if not settings or parry.watched[model] ~= entry then return end
+        local melee = settings:FindFirstChild(BUILD.SettingsMeleeCooldown)
+        local skill = settings:FindFirstChild(BUILD.SettingsCurrentSkill)
+        if melee and melee:IsA('BoolValue') then
+            entry[#entry + 1] = melee:GetPropertyChangedSignal('Value'):Connect(function()
+                if melee.Value == true then onEnemyEvent(model, 'MeleeCooldown=true', Toggles.BL_ParryOnMelee.Value) end
+            end)
+        end
+        if skill and skill:IsA('StringValue') then
+            entry[#entry + 1] = skill:GetPropertyChangedSignal('Value'):Connect(function()
+                if skill.Value ~= '' then onEnemyEvent(model, 'CurrentSkill=' .. skill.Value, Toggles.BL_ParryOnSkill.Value) end
+            end)
+        end
+        local hum = model:FindFirstChildOfClass('Humanoid')
+        local animator = hum and hum:FindFirstChildOfClass('Animator')
+        if animator then
+            entry[#entry + 1] = animator.AnimationPlayed:Connect(function(track)
+                if Toggles.BL_ParryLog.Value then
+                    local anim = track.Animation
+                    logParry(string.format('enemy %s: anim %s id=%s length=%s', model.Name, tostring(track.Name),
+                        tostring(anim and anim.AnimationId), tostring(track.Length)))
+                end
+            end)
+        end
+    end)
+end
+
+local function watchIfCombat(model)
+    if not model:IsA('Model') then return end
+    task.spawn(function()
+        local value = model:WaitForChild(BUILD.NPCValueName, 5)
+        if value and value:IsA('StringValue') and value.Value == BUILD.NPCCombat then watchNpc(model) end
+    end)
+end
+
+local function refreshParryWatch()
+    if Toggles.BL_AutoParry.Value or Toggles.BL_ParryLog.Value then
+        for _, child in ipairs(workspace:GetChildren()) do watchIfCombat(child) end
+    else
+        for model in pairs(parry.watched) do unwatchNpc(model) end
+    end
+end
+
+connect(workspace.ChildAdded, function(child)
+    if Toggles.BL_AutoParry.Value or Toggles.BL_ParryLog.Value then watchIfCombat(child) end
+end)
+Toggles.BL_AutoParry:OnChanged(function()
+    if Toggles.BL_AutoParry.Value and not DataFunction then
+        Library:Notify('Auto Parry unavailable: DataFunction missing')
+        Toggles.BL_AutoParry:SetValue(false)
+        return
+    end
+    refreshParryWatch()
+end)
+Toggles.BL_ParryLog:OnChanged(refreshParryWatch)
+
+ParryGrp:AddButton({ Text = 'Save Parry Log', Func = function()
+    if type(writefile) ~= 'function' or type(makefolder) ~= 'function' then
+        Library:Notify('writefile/makefolder missing on this executor')
+        return
+    end
+    local folder = 'YazuDumper'
+    pcall(function() if type(isfolder) ~= 'function' or not isfolder(folder) then makefolder(folder) end end)
+    local path = folder .. '/BL_ParryLog_' .. tostring(os.time()) .. '.txt'
+    local ok, err = pcall(writefile, path, table.concat(parry.log, '\n'))
+    Library:Notify(ok and ('Saved ' .. path .. ' (' .. #parry.log .. ' lines)') or ('Write error: ' .. tostring(err)))
+end })
+ParryGrp:AddButton({ Text = 'Force End Block', Func = function() task.spawn(endBlock) end })
+
+onCleanup(function()
+    for model in pairs(parry.watched) do unwatchNpc(model) end
+    if parry.blocking then task.spawn(endBlock) end
+end)
+
+-- ================================================================
 --  VISUALS
 -- ================================================================
 
@@ -592,14 +774,129 @@ onCleanup(function()
 end)
 
 -- ================================================================
---  NPC ESP
+--  ESP: players, NPCs (with status), harvest items, mission boards,
+--  chakra points. One reconcile loop at 10 Hz; Highlights only on
+--  players and Combat NPCs (the engine renders a limited number).
 -- ================================================================
 
-EspGrp:AddToggle('BL_EspCombat', { Text = 'Combat NPCs', Default = false })
-EspGrp:AddLabel('Combat Color'):AddColorPicker('BL_EspCombatColor', { Default = Color3.fromRGB(255, 70, 70) })
-EspGrp:AddToggle('BL_EspDialog', { Text = 'Dialog NPCs', Default = false })
-EspGrp:AddLabel('Dialog Color'):AddColorPicker('BL_EspDialogColor', { Default = Color3.fromRGB(90, 255, 140) })
+local ESP_CATEGORIES = {
+    { toggle = 'BL_EspPlayers',  color = 'BL_EspPlayersColor',  label = 'Players',        default = Color3.fromRGB(255, 255, 255) },
+    { toggle = 'BL_EspCombat',   color = 'BL_EspCombatColor',   label = 'Combat NPCs',    default = Color3.fromRGB(255, 70, 70) },
+    { toggle = 'BL_EspDialog',   color = 'BL_EspDialogColor',   label = 'Dialog NPCs',    default = Color3.fromRGB(90, 255, 140) },
+    { toggle = 'BL_EspItems',    color = 'BL_EspItemsColor',    label = 'Harvest Items',  default = Color3.fromRGB(255, 220, 80) },
+    { toggle = 'BL_EspMissions', color = 'BL_EspMissionsColor', label = 'Mission Boards', default = Color3.fromRGB(80, 200, 255) },
+    { toggle = 'BL_EspChakra',   color = 'BL_EspChakraColor',   label = 'Chakra Points',  default = Color3.fromRGB(190, 120, 255) },
+}
+for _, cat in ipairs(ESP_CATEGORIES) do
+    EspGrp:AddToggle(cat.toggle, { Text = cat.label, Default = false })
+    EspGrp:AddLabel(cat.label .. ' Color'):AddColorPicker(cat.color, { Default = cat.default })
+end
+EspGrp:AddToggle('BL_EspStatus', { Text = 'NPC Status (stun, block, skill)', Default = true })
 EspGrp:AddSlider('BL_EspDistance', { Text = 'Max Distance', Default = 1000, Min = 100, Max = 5000, Rounding = 0 })
+
+local function adorneeOf(inst)
+    if not inst then return nil end
+    if inst:IsA('BasePart') then return inst end
+    return inst:FindFirstChildWhichIsA('BasePart', true)
+end
+
+-- Registry of ItemDetector ClickDetectors; the scan only starts when first needed.
+local itemDetectors = {}
+local itemScanStarted = false
+local function registerItem(inst)
+    if inst.Name == BUILD.ItemDetectorName and inst:IsA('ClickDetector') then itemDetectors[inst] = true end
+end
+local function ensureItemScan()
+    if itemScanStarted then return end
+    itemScanStarted = true
+    connect(workspace.DescendantAdded, registerItem)
+    connect(workspace.DescendantRemoving, function(inst) itemDetectors[inst] = nil end)
+    task.spawn(function()
+        local count = 0
+        for _, inst in ipairs(workspace:GetDescendants()) do
+            registerItem(inst)
+            count = count + 1
+            if count % 500 == 0 then RunService.Heartbeat:Wait() end
+        end
+    end)
+end
+
+local function npcStatusText(model)
+    local settings = model:FindFirstChild(BUILD.SettingsFolder)
+    if not settings then return '' end
+    local parts = {}
+    for _, flag in ipairs(BUILD.SettingsStatusFlags) do
+        local v = settings:FindFirstChild(flag)
+        if v and v:IsA('BoolValue') and v.Value then parts[#parts + 1] = flag end
+    end
+    local skill = settings:FindFirstChild(BUILD.SettingsCurrentSkill)
+    if skill and skill:IsA('StringValue') and skill.Value ~= '' then parts[#parts + 1] = 'skill: ' .. skill.Value end
+    if #parts == 0 then return '' end
+    return '\n[' .. table.concat(parts, ', ') .. ']'
+end
+
+local function healthText(hum)
+    if not hum then return '' end
+    return string.format('  %d/%d', math.floor(hum.Health), math.floor(hum.MaxHealth))
+end
+
+-- add(key, adornee, highlightTarget or nil, text, colorOptionName)
+local function collectMarkers(add)
+    if Toggles.BL_EspPlayers.Value then
+        for _, player in ipairs(Players:GetPlayers()) do
+            local char = player ~= LocalPlayer and player.Character
+            local root = char and char:FindFirstChild('HumanoidRootPart')
+            if root then
+                add(char, root, char, player.Name .. healthText(char:FindFirstChildOfClass('Humanoid')), 'BL_EspPlayersColor')
+            end
+        end
+    end
+    if Toggles.BL_EspCombat.Value or Toggles.BL_EspDialog.Value then
+        eachNpc(function(model, kind)
+            local combat = kind == BUILD.NPCCombat
+            if not ((combat and Toggles.BL_EspCombat.Value) or (kind == BUILD.NPCDialog and Toggles.BL_EspDialog.Value)) then return end
+            local root = model:FindFirstChild('HumanoidRootPart')
+            if not root then return end
+            local text = model.Name .. healthText(model:FindFirstChildOfClass('Humanoid'))
+            if combat and Toggles.BL_EspStatus.Value then text = text .. npcStatusText(model) end
+            add(model, root, combat and model or nil, text, combat and 'BL_EspCombatColor' or 'BL_EspDialogColor')
+        end)
+    end
+    if Toggles.BL_EspItems.Value then
+        ensureItemScan()
+        for detector in pairs(itemDetectors) do
+            local owner = detector.Parent
+            local part = adorneeOf(owner)
+            if part then add(detector, part, nil, owner.Name, 'BL_EspItemsColor') end
+        end
+    end
+    if Toggles.BL_EspMissions.Value then
+        local boards = workspace:FindFirstChild(BUILD.MissionBoards)
+        if boards then
+            for _, board in ipairs(boards:GetChildren()) do
+                local mission = board:FindFirstChild(BUILD.MissionModelName)
+                local part = adorneeOf(board)
+                if part then
+                    local name = mission and mission:GetAttribute('Mission') or 'Mission'
+                    local village = (mission and mission:GetAttribute('Village')) or board:GetAttribute('Village') or '?'
+                    add(board, part, nil, tostring(name) .. ' (' .. tostring(village) .. ')', 'BL_EspMissionsColor')
+                end
+            end
+        end
+    end
+    if Toggles.BL_EspChakra.Value then
+        local points = workspace:FindFirstChild(BUILD.ChakraPoints)
+        if points then
+            for _, point in ipairs(points:GetChildren()) do
+                local part = adorneeOf(point)
+                if part then
+                    local label = point:FindFirstChild('PointName')
+                    add(point, part, nil, (label and label:IsA('StringValue') and label.Value ~= '' and label.Value) or point.Name, 'BL_EspChakraColor')
+                end
+            end
+        end
+    end
+end
 
 do
     local folder = Instance.new('Folder')
@@ -608,23 +905,26 @@ do
     onCleanup(function() folder:Destroy() end)
 
     local entries = {}
-    local function removeEntry(model)
-        local e = entries[model]
+    local function removeEntry(key)
+        local e = entries[key]
         if not e then return end
-        e.highlight:Destroy()
+        if e.highlight then e.highlight:Destroy() end
         e.billboard:Destroy()
-        entries[model] = nil
+        entries[key] = nil
     end
 
-    local function makeEntry(model, root)
-        local highlight = Instance.new('Highlight')
-        highlight.Adornee = model
-        highlight.FillTransparency = 0.7
-        highlight.Parent = folder
+    local function makeEntry(key, adornee, target)
+        local highlight
+        if target then
+            highlight = Instance.new('Highlight')
+            highlight.Adornee = target
+            highlight.FillTransparency = 0.7
+            highlight.Parent = folder
+        end
         local billboard = Instance.new('BillboardGui')
-        billboard.Adornee = root
+        billboard.Adornee = adornee
         billboard.AlwaysOnTop = true
-        billboard.Size = UDim2.new(0, 200, 0, 40)
+        billboard.Size = UDim2.new(0, 220, 0, 56)
         billboard.StudsOffset = Vector3.new(0, 3, 0)
         billboard.Parent = folder
         local label = Instance.new('TextLabel')
@@ -633,8 +933,8 @@ do
         label.TextSize = 14
         label.TextStrokeTransparency = 0.5
         label.Parent = billboard
-        entries[model] = { highlight = highlight, billboard = billboard, label = label }
-        return entries[model]
+        entries[key] = { highlight = highlight, billboard = billboard, label = label, adornee = adornee }
+        return entries[key]
     end
 
     local accumulator = 0
@@ -644,28 +944,108 @@ do
         accumulator = 0
         local _, _, myRoot = getCharacter()
         local seen = {}
-        if myRoot and (Toggles.BL_EspCombat.Value or Toggles.BL_EspDialog.Value) then
-            eachNpc(function(model, kind)
-                local wanted = (kind == BUILD.NPCCombat and Toggles.BL_EspCombat.Value)
-                    or (kind == BUILD.NPCDialog and Toggles.BL_EspDialog.Value)
-                if not wanted then return end
-                local root = model:FindFirstChild('HumanoidRootPart')
-                if not root then return end
-                local distance = (root.Position - myRoot.Position).Magnitude
-                if distance > Options.BL_EspDistance.Value then return end
-                seen[model] = true
-                local e = entries[model] or makeEntry(model, root)
-                local color = kind == BUILD.NPCCombat and Options.BL_EspCombatColor.Value or Options.BL_EspDialogColor.Value
-                e.highlight.FillColor, e.highlight.OutlineColor, e.label.TextColor3 = color, color, color
-                local hum = model:FindFirstChildOfClass('Humanoid')
-                local hp = hum and string.format('%d/%d  ', math.floor(hum.Health), math.floor(hum.MaxHealth)) or ''
-                e.label.Text = string.format('%s\n%s%dm', model.Name, hp, math.floor(distance))
+        if myRoot then
+            local maxDistance = Options.BL_EspDistance.Value
+            collectMarkers(function(key, adornee, target, text, colorName)
+                if not adornee.Parent then return end
+                local distance = (adornee.Position - myRoot.Position).Magnitude
+                if distance > maxDistance then return end
+                seen[key] = true
+                local e = entries[key]
+                if e and e.adornee ~= adornee then removeEntry(key) e = nil end
+                e = e or makeEntry(key, adornee, target)
+                local color = Options[colorName].Value
+                if e.highlight then e.highlight.FillColor, e.highlight.OutlineColor = color, color end
+                e.label.TextColor3 = color
+                e.label.Text = text .. '\n' .. math.floor(distance) .. 'm'
             end)
         end
-        for model in pairs(entries) do
-            if not seen[model] then removeEntry(model) end
+        for key in pairs(entries) do
+            if not seen[key] then removeEntry(key) end
         end
     end)
+end
+
+-- ================================================================
+--  HARVEST AND UTILITY
+--  Harvest = teleport next to the nearest ItemDetector and fire its
+--  ClickDetector. UNVERIFIED: whether the server accepts a synthetic
+--  click, and how fast items respawn (cooldown below is a guess).
+-- ================================================================
+
+UtilGrp:AddSlider('BL_HarvestInterval', { Text = 'Harvest Interval (s) - uncalibrated', Default = 1.5, Min = 0.5, Max = 5, Rounding = 1 })
+UtilGrp:AddSlider('BL_HarvestSkip', { Text = 'Skip Clicked Item For (s) - uncalibrated', Default = 30, Min = 0, Max = 300, Rounding = 0 })
+
+local harvestedAt = setmetatable({}, { __mode = 'k' })
+
+local function nearestHarvestable(skipSeconds)
+    ensureItemScan()
+    local _, _, root = getCharacter()
+    if not root then return nil end
+    local candidates, now = {}, os.clock()
+    for detector in pairs(itemDetectors) do
+        local part = adorneeOf(detector.Parent)
+        local last = harvestedAt[detector]
+        if part and not (last and now - last < skipSeconds) then
+            local p = part.Position
+            candidates[#candidates + 1] = { detector = detector, part = part, x = p.X, y = p.Y, z = p.Z }
+        end
+    end
+    local origin = root.Position
+    return (Pure.pickNearest(candidates, origin.X, origin.Y, origin.Z))
+end
+
+local function harvestOnce()
+    if type(fireclickdetector) ~= 'function' then
+        Library:Notify('fireclickdetector missing on this executor')
+        return false
+    end
+    local pick = nearestHarvestable(Options.BL_HarvestSkip.Value)
+    if not pick then return false end
+    if not teleportTo(pick.part.CFrame) then return false end
+    harvestedAt[pick.detector] = os.clock()
+    fireclickdetector(pick.detector)
+    return true
+end
+
+UtilGrp:AddButton({ Text = 'Harvest Nearest Item', Func = function()
+    if not harvestOnce() then Library:Notify('No harvestable item loaded (StreamingEnabled hides far ones)') end
+end })
+UtilGrp:AddToggle('BL_AutoHarvest', { Text = 'Auto Harvest', Default = false,
+    Tooltip = 'Repeats Harvest Nearest Item. Untested in game.' })
+
+local harvestRun = 0
+Toggles.BL_AutoHarvest:OnChanged(function()
+    harvestRun = harvestRun + 1
+    local mine = harvestRun
+    if not Toggles.BL_AutoHarvest.Value then return end
+    task.spawn(function()
+        local warned = false
+        while harvestRun == mine and Toggles.BL_AutoHarvest.Value do
+            if getCharacter() then
+                if harvestOnce() then
+                    warned = false
+                elseif not warned then
+                    warned = true
+                    Library:Notify('Auto Harvest: nothing harvestable loaded; move toward resources')
+                end
+            end
+            task.wait(Options.BL_HarvestInterval.Value)
+        end
+    end)
+end)
+onCleanup(function() harvestRun = harvestRun + 1 end)
+
+UtilGrp:AddToggle('BL_AntiAfk', { Text = 'Anti AFK', Default = false })
+do
+    local ok, virtualUser = pcall(game.GetService, game, 'VirtualUser')
+    if ok and virtualUser then
+        connect(LocalPlayer.Idled, function()
+            if not Toggles.BL_AntiAfk.Value then return end
+            virtualUser:CaptureController()
+            virtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+    end
 end
 
 -- ================================================================
