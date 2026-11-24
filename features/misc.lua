@@ -1,7 +1,7 @@
 -- ================================================================
 --  features/misc.lua
 -- ================================================================
---[[
+
 return function(State, Tabs, Services, Library)
 
 local RunService  = Services.RunService
@@ -988,7 +988,12 @@ local function startBetterNoClip()
 end
 
 local function stopBetterNoClip()
+    -- Linoria runs an OnChanged handler once at load with the saved value, so this is
+    -- called while the feature was never on. Touching the live character then (CanCollide,
+    -- physical properties, state) corrupts games that manage those themselves.
+    local wasActive = betterNoClipConn ~= nil
     if betterNoClipConn then betterNoClipConn:Disconnect(); betterNoClipConn = nil end
+    if not wasActive then return end
     -- Restore physics on all parts
     local char = LocalPlayer.Character
     if char then
@@ -1022,9 +1027,12 @@ local flyBodyVel   = nil
 local flyBodyGyro  = nil
 
 local function stopFly()
+    -- No-op unless Fly was actually started (see stopBetterNoClip for why).
+    local wasActive = flyConn ~= nil or flyBodyVel ~= nil or flyBodyGyro ~= nil
     if flyConn then flyConn:Disconnect(); flyConn = nil end
     if flyBodyVel  then flyBodyVel:Destroy();  flyBodyVel  = nil end
     if flyBodyGyro then flyBodyGyro:Destroy(); flyBodyGyro = nil end
+    if not wasActive then return end
     local hum = getLocalHum()
     if hum then
         hum.PlatformStand = false
@@ -1079,7 +1087,10 @@ local ghostConn = nil
 local ghostOrigTransparencies = {}
 
 local function stopGhost()
+    -- No-op unless Ghost Mode was actually started (see stopBetterNoClip for why).
+    local wasActive = ghostConn ~= nil
     if ghostConn then ghostConn:Disconnect(); ghostConn = nil end
+    if not wasActive then return end
     local char = LocalPlayer.Character
     if char then
         for _, v in next, char:GetDescendants() do
@@ -1445,6 +1456,3 @@ LocalPlayer.CharacterAdded:Connect(function()
 end)
 
 end -- return function
-
-
-]]
