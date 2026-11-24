@@ -5,7 +5,7 @@
 --  lives in BUILD below with its source; anything marked UNVERIFIED was
 --  copied from decompiled client code and has not been run in game.
 -- ================================================================
---[[
+
 local Pure = {}
 
 function Pure.isFinite(n)
@@ -1359,5 +1359,3 @@ end)
 end
 
 
-
-]]
