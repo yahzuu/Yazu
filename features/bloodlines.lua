@@ -44,6 +44,35 @@ function Pure.standPosition(tx, ty, tz, ox, oz, distance, height)
     return tx + dx / len * distance, ty + height, tz + dz / len * distance
 end
 
+-- samples: array of { t, x, y, z, vx, vy, vz } in time order (seconds, studs, studs/second).
+-- A "snap" is a frame whose position differs from where the previous frame's velocity
+-- predicts it should be by more than snapThreshold studs: something other than
+-- ordinary physics moved the character (server correction, teleport, direct CFrame write).
+function Pure.analyzeTrack(samples, snapThreshold)
+    local result = { frames = #samples, maxSpeed = 0, maxStep = 0, snaps = {} }
+    for i = 1, #samples do
+        local s = samples[i]
+        local speed = math.sqrt(s.vx * s.vx + s.vy * s.vy + s.vz * s.vz)
+        if Pure.isFinite(speed) and speed > result.maxSpeed then result.maxSpeed = speed end
+        if i > 1 then
+            local p = samples[i - 1]
+            local dt = s.t - p.t
+            if dt > 0 and dt < 0.5 then
+                local step = math.sqrt((s.x - p.x) ^ 2 + (s.y - p.y) ^ 2 + (s.z - p.z) ^ 2)
+                if Pure.isFinite(step) and step > result.maxStep then result.maxStep = step end
+                local dx = s.x - (p.x + p.vx * dt)
+                local dy = s.y - (p.y + p.vy * dt)
+                local dz = s.z - (p.z + p.vz * dt)
+                local err = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if Pure.isFinite(err) and err > snapThreshold then
+                    result.snaps[#result.snaps + 1] = { t = s.t, err = err, dx = dx, dy = dy, dz = dz }
+                end
+            end
+        end
+    end
+    return result
+end
+
 return function(State, Tabs, Services, Library)
 
 State.BloodlinesPure = Pure
@@ -181,6 +210,8 @@ if not hook then
     genv.__YazuBloodlinesHook = hook
 end
 hook.remote = DataEvent
+hook.reasons = hook.reasons or {}      -- BanMe reason string -> times dropped (at most 20 distinct reasons kept)
+hook.reasonKinds = hook.reasonKinds or 0
 
 local function installHook()
     if hook.installed then return true end
@@ -198,6 +229,13 @@ local function installHook()
                 local lowered = string.lower(action)
                 if lowered == BUILD.BanMeAction and hook.blockBan then
                     hook.blockedBans = hook.blockedBans + 1
+                    local reason = select(2, ...)
+                    local key = type(reason) == 'string' and reason or '(no reason)'
+                    if hook.reasons[key] == nil and hook.reasonKinds < 20 then
+                        hook.reasons[key] = 0
+                        hook.reasonKinds = hook.reasonKinds + 1
+                    end
+                    if hook.reasons[key] then hook.reasons[key] = hook.reasons[key] + 1 end
                     return nil
                 end
                 if lowered == BUILD.FallDamageAction and hook.blockFall then
@@ -339,8 +377,17 @@ SafeGrp:AddToggle('BL_NoFall', {
         hook.blockFall = state
     end,
 })
+local function banReasonsText()
+    local keys = {}
+    for key in pairs(hook.reasons) do keys[#keys + 1] = key end
+    table.sort(keys)
+    local parts = {}
+    for _, key in ipairs(keys) do parts[#parts + 1] = key .. ' x' .. tostring(hook.reasons[key]) end
+    return #parts > 0 and table.concat(parts, ', ') or '(none)'
+end
+
 SafeGrp:AddButton({ Text = 'Print Blocked BanMe Count', Func = function()
-    Library:Notify('Blocked BanMe reports: ' .. tostring(hook.blockedBans))
+    Library:Notify('Blocked BanMe reports: ' .. tostring(hook.blockedBans) .. ' | ' .. banReasonsText(), 10)
 end })
 SafeGrp:AddButton({ Text = 'Reset Character', Func = function()
     LocalPlayer:Kick('')
@@ -1183,6 +1230,7 @@ local function movementReport()
     local on = enabledMovementToggles()
     lines[#lines + 1] = 'Toggles on: ' .. (#on > 0 and table.concat(on, ', ') or '(none)')
     lines[#lines + 1] = 'Block BanMe hook installed: ' .. tostring(hook.installed) .. ', BanMe reports blocked so far: ' .. tostring(hook.blockedBans)
+    lines[#lines + 1] = 'BanMe reasons: ' .. banReasonsText()
     local char, hum, root = getCharacter()
     if not char then
         lines[#lines + 1] = 'No living character.'
@@ -1224,6 +1272,82 @@ SafeGrp:AddButton({ Text = 'Turn Off Movement Toggles', Func = function()
     for _, idx in ipairs(on) do Toggles[idx]:SetValue(false) end
     Library:Notify(#on > 0 and ('Turned off: ' .. table.concat(on, ', ')) or 'No movement toggle was on')
 end })
+
+-- Records position, velocity and humanoid state every frame, so a pull that lasts only a moment
+-- is still captured. Velocity-consistent drift looks like a physics force; a frame that jumps
+-- away from the previous frame's prediction is a snap (server correction or a direct CFrame write).
+SafeGrp:AddSlider('BL_RecordSeconds', { Text = 'Record Length (s)', Default = 15, Min = 5, Max = 60, Rounding = 0 })
+SafeGrp:AddSlider('BL_SnapThreshold', { Text = 'Snap Threshold (studs)', Default = 8, Min = 2, Max = 50, Rounding = 0 })
+
+local recorder = { conn = nil }
+local function finishRecording(samples, seconds, bansBefore, reasonsBefore)
+    if recorder.conn then recorder.conn:Disconnect() recorder.conn = nil end
+    local analysis = Pure.analyzeTrack(samples, Options.BL_SnapThreshold.Value)
+    local lines = {
+        'Bloodlines movement recording, os.time ' .. tostring(os.time()),
+        string.format('Length %.1fs, frames %d, max speed %.1f studs/s, max single-frame step %.1f studs',
+            seconds, analysis.frames, analysis.maxSpeed, analysis.maxStep),
+        'BanMe reports dropped during recording: ' .. tostring(hook.blockedBans - bansBefore),
+    }
+    local reasonParts = {}
+    for key, count in pairs(hook.reasons) do
+        local gained = count - (reasonsBefore[key] or 0)
+        if gained > 0 then reasonParts[#reasonParts + 1] = key .. ' x' .. gained end
+    end
+    table.sort(reasonParts)
+    lines[#lines + 1] = 'BanMe reasons during recording: ' .. (#reasonParts > 0 and table.concat(reasonParts, ', ') or '(none)')
+    local on = enabledMovementToggles()
+    lines[#lines + 1] = 'Toggles on: ' .. (#on > 0 and table.concat(on, ', ') or '(none)')
+    lines[#lines + 1] = string.format('Snaps (frame position differs from velocity prediction by more than %d studs): %d',
+        Options.BL_SnapThreshold.Value, #analysis.snaps)
+    for i = 1, math.min(#analysis.snaps, 40) do
+        local snap = analysis.snaps[i]
+        lines[#lines + 1] = string.format('  snap t=%.2f err=%.1f delta=(%.1f, %.1f, %.1f)', snap.t, snap.err, snap.dx, snap.dy, snap.dz)
+    end
+    lines[#lines + 1] = 'Samples every 0.1s: t x y z vx vy vz state'
+    local nextAt = 0
+    for _, s in ipairs(samples) do
+        if s.t >= nextAt then
+            nextAt = s.t + 0.1
+            lines[#lines + 1] = string.format('%.2f %.1f %.1f %.1f %.1f %.1f %.1f %s', s.t, s.x, s.y, s.z, s.vx, s.vy, s.vz, s.state)
+        end
+    end
+    for _, line in ipairs(lines) do print('[Bloodlines] ' .. line) end
+    if type(writefile) ~= 'function' or type(makefolder) ~= 'function' then
+        Library:Notify('Recording printed to the console (writefile missing)')
+        return
+    end
+    local folder = 'YazuDumper'
+    pcall(function() if type(isfolder) ~= 'function' or not isfolder(folder) then makefolder(folder) end end)
+    local path = folder .. '/BL_MoveRecord_' .. tostring(os.time()) .. '.txt'
+    local ok, err = pcall(writefile, path, table.concat(lines, '\n'))
+    Library:Notify(ok and ('Saved ' .. path .. ' (' .. #analysis.snaps .. ' snaps)') or ('Write error: ' .. tostring(err)), 8)
+end
+
+SafeGrp:AddButton({ Text = 'Record Movement', Func = function()
+    if recorder.conn then Library:Notify('Already recording') return end
+    local seconds = Options.BL_RecordSeconds.Value
+    local samples, elapsed = {}, 0
+    local bansBefore = hook.blockedBans
+    local reasonsBefore = {}
+    for key, count in pairs(hook.reasons) do reasonsBefore[key] = count end
+    Library:Notify('Recording movement for ' .. seconds .. 's')
+    recorder.conn = RunService.Heartbeat:Connect(function(dt)
+        elapsed = elapsed + dt
+        local _, hum, root = getCharacter()
+        if root and #samples < 20000 then
+            local v = root.AssemblyLinearVelocity
+            local p = root.Position
+            local okState, state = pcall(function() return hum:GetState() end)
+            samples[#samples + 1] = { t = elapsed, x = p.X, y = p.Y, z = p.Z, vx = v.X, vy = v.Y, vz = v.Z,
+                state = okState and string.gsub(tostring(state), 'Enum.HumanoidStateType.', '') or '?' }
+        end
+        if elapsed >= seconds then finishRecording(samples, elapsed, bansBefore, reasonsBefore) end
+    end)
+end })
+onCleanup(function()
+    if recorder.conn then recorder.conn:Disconnect() recorder.conn = nil end
+end)
 
 task.delay(3, function()
     local on = enabledMovementToggles()
