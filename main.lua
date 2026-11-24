@@ -74,7 +74,18 @@ end
 
 safeLoad('features/aimbot.lua')
 safeLoad('features/esp.lua')
+-- >>> misc toggle capture
+local togglesBeforeMisc = {}
+for idx in pairs(Toggles) do togglesBeforeMisc[idx] = true end
 safeLoad('features/misc.lua')
+-- Every toggle misc.lua just created that starts off. Toggles that start on by design
+-- (for example DesyncAutoOff, a safety option) are left alone.
+local MiscToggleIds = {}
+for idx, toggle in pairs(Toggles) do
+    if not togglesBeforeMisc[idx] and toggle.Value == false then MiscToggleIds[#MiscToggleIds + 1] = idx end
+end
+table.sort(MiscToggleIds)
+-- <<< misc toggle capture
 safeLoad('features/dumper.lua')
 safeLoad('features/game_dumper.lua')
 
@@ -99,10 +110,35 @@ ThemeManager:SetLibrary(Library)
 SaveManager:SetLibrary(Library)
 SaveManager:IgnoreThemeSettings()
 SaveManager:SetIgnoreIndexes({ 'MenuKeybind' })
+SaveManager:SetIgnoreIndexes(MiscToggleIds)
 ThemeManager:SetFolder('Yazu')
 SaveManager:SetFolder('Yazu/configs')
 SaveManager:BuildConfigSection(Tabs['UI Settings'])
 ThemeManager:ApplyToTab(Tabs['UI Settings'])
+-- >>> autoload gate
+-- A saved config must never switch a Misc feature on (Fly, Desync, Null Strike, ...).
+-- During the autoload, SetValue(true) is ignored for those toggles; saved sliders and
+-- dropdowns still load. A short follow-up pass turns off anything that slipped through.
+local gatedSetValue = {}
+for _, idx in ipairs(MiscToggleIds) do
+    local toggle = Toggles[idx]
+    if toggle and type(toggle.SetValue) == 'function' then
+        local original = toggle.SetValue
+        gatedSetValue[idx] = original
+        toggle.SetValue = function(self, value)
+            if value then return end
+            return original(self, value)
+        end
+    end
+end
 SaveManager:LoadAutoloadConfig()
+for idx, original in pairs(gatedSetValue) do Toggles[idx].SetValue = original end
+task.delay(1.5, function()
+    for _, idx in ipairs(MiscToggleIds) do
+        local toggle = Toggles[idx]
+        if toggle and toggle.Value then toggle:SetValue(false) end
+    end
+end)
+-- <<< autoload gate
 
 print("version0.0126")
