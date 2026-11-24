@@ -88,6 +88,7 @@ table.sort(MiscToggleIds)
 -- <<< misc toggle capture
 safeLoad('features/dumper.lua')
 safeLoad('features/game_dumper.lua')
+safeLoad('features/universal_dumper.lua')
 
 local placeFeatures = {
     [185655149] = 'features/bloxburg.lua',
