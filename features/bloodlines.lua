@@ -1052,7 +1052,7 @@ end
 --  TELEPORTS
 -- ================================================================
 
-TpGrp:AddDropdown('BL_ChakraPoint', { Text = 'Chakra Point', Values = {} })
+TpGrp:AddDropdown('BL_ChakraPoint', { Text = 'Chakra Point', Values = {}, AllowNull = true })
 TpGrp:AddButton({ Text = 'Teleport To Chakra Point', Func = function()
     local key = Options.BL_ChakraPoint.Value
     local point = key and State.BL_ChakraMap and State.BL_ChakraMap[key]
@@ -1060,14 +1060,14 @@ TpGrp:AddButton({ Text = 'Teleport To Chakra Point', Func = function()
         Library:Notify('Chakra point not available (press Refresh Lists)')
     end
 end })
-TpGrp:AddDropdown('BL_Npc', { Text = 'Dialog NPC', Values = {} })
+TpGrp:AddDropdown('BL_Npc', { Text = 'Dialog NPC', Values = {}, AllowNull = true })
 TpGrp:AddButton({ Text = 'Teleport To NPC', Func = function()
     local model = State.BL_NpcMap and State.BL_NpcMap[Options.BL_Npc.Value]
     if not (model and model.Parent and teleportTo(pivotOf(model))) then
         Library:Notify('NPC not loaded (press Refresh Lists; StreamingEnabled hides far NPCs)')
     end
 end })
-TpGrp:AddDropdown('BL_Player', { Text = 'Player', Values = {} })
+TpGrp:AddDropdown('BL_Player', { Text = 'Player', Values = {}, AllowNull = true })
 TpGrp:AddButton({ Text = 'Teleport To Player', Func = function()
     local player = Players:FindFirstChild(Options.BL_Player.Value or '')
     local char = player and player.Character
