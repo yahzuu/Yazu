@@ -276,6 +276,20 @@ function Pure.linearFit(pts)
     return (sp - b * st) / n, b
 end
 
+-- Flat distance between shooter and defender after `t` seconds if both
+-- keep their current velocity (closing speed matters as much as distance).
+function Pure.predictDist(mx, mz, mvx, mvz, dx, dz, dvx, dvz, t)
+    local px, pz = (dx + dvx * t) - (mx + mvx * t), (dz + dvz * t) - (mz + mvz * t)
+    return math.sqrt(px * px + pz * pz)
+end
+
+-- Moving / fade jumpers (animation names seen in your save file:
+-- FadeAway1R, CloseFade1L, StepPostFade1R, MovingShotLeft1R).
+function Pure.isMovingShot(name)
+    local b = tostring(name or ''):lower()
+    return b:find('fade', 1, true) ~= nil or b:find('moving', 1, true) ~= nil
+end
+
 -- Exponential smoothing factor for a time step: 0 = no change, 1 = jump.
 function Pure.smoothAlpha(dt, tau)
     if tau <= 0 then return 1 end
@@ -480,6 +494,12 @@ local function shotKey(model)
 end
 
 local function aimFor(key)
+    -- Moving/fade shots adjust themselves from every graded auto shot
+    -- (misses included), no training needed.
+    if on('BB_AutoMoving') and Pure.isMovingShot(key) then
+        local st = learn[key]
+        return st and st.target or GAME.DefaultAim
+    end
     if not on('BB_AutoTiming') then return GAME.DefaultAim end
     local st = learn[key]
     if on('BB_PerfectOnly') then return st and st.targetPerf or GAME.DefaultAim end
@@ -668,7 +688,7 @@ if FeedbackRemote then
             releasedAt = shot.releasedAt, auto = shot.autoFired,
         }
         local learnX = (shot.autoFired and shot.firedAt) or (on('BB_LearnManual') and shot.manualAt) or nil
-        if on('BB_AutoTiming') and gi and learnX then
+        if gi and learnX and (on('BB_AutoTiming') or (on('BB_AutoMoving') and Pure.isMovingShot(key))) then
             -- Learn from where the server's meter was when the release arrived:
             -- ours (auto) or yours (the moment you let go of the shoot key).
             local st = learn[key] or { hist = {} }
@@ -1051,8 +1071,19 @@ readContest = function(myModel)
                 local look = root.CFrame.LookVector
                 local lx, lz = Pure.unit(look.X, look.Z)
                 local between = hoop and Pure.betweenFactor(my.X, my.Z, hoop.X, hoop.Z, d.X, d.Z, 4) or nil
-                local s = Pure.contestScore(dist, range, lx * ux + lz * uz, between)
-                if s > best then best, bestPlayer, bestDist = s, p, dist end
+                -- Where they will be by the time the shot goes up, from both
+                -- players' current velocities (a defender sprinting at you
+                -- contests from farther away; fading away adds space).
+                local useDist = dist
+                if on('BB_ContestPredict') then
+                    local mv, dv = myRoot.AssemblyLinearVelocity, root.AssemblyLinearVelocity
+                    local t = opt('BB_ContestLookMs', 350) / 1000
+                    if typeof(mv) == 'Vector3' and typeof(dv) == 'Vector3' then
+                        useDist = math.min(dist, Pure.predictDist(my.X, my.Z, mv.X, mv.Z, d.X, d.Z, dv.X, dv.Z, t))
+                    end
+                end
+                local s = Pure.contestScore(useDist, range, lx * ux + lz * uz, between)
+                if s > best then best, bestPlayer, bestDist = s, p, useDist end
             end
         end
     end
@@ -1145,10 +1176,19 @@ local function installMoveHook()
             ox, oz = Pure.unit(assist.outX + (ox - assist.outX) * a, assist.outZ + (oz - assist.outZ) * a)
         end
         assist.outX, assist.outZ = ox, oz
-        -- keep your own stick length: no assist movement while you stand still
         local len = math.sqrt(wx * wx + wz * wz)
-        if len < 1e-3 then return v end
-        ox, oz = ox * math.min(len, 1), oz * math.min(len, 1)
+        if len < 1e-3 then
+            -- Standing still: drift toward the spot at a reduced pace, and only
+            -- when you are outside the loose zone.
+            local ux, uz = Pure.unit(d.gx - d.hx, d.gz - d.hz)
+            local px, pz = d.hx + ux * d.dist - d.mx, d.hz + uz * d.dist - d.mz
+            local off = math.sqrt(px * px + pz * pz)
+            local mag = math.clamp((off - d.deadzone) / 4, 0, 1) * d.idle
+            if mag <= 0.05 then return v end
+            ox, oz = ox * mag, oz * mag
+        else
+            ox, oz = ox * math.min(len, 1), oz * math.min(len, 1)
+        end
         local mx, mz = Pure.moveFromRaw(c, s, ox, oz)
         return Vector3.new(mx, 0, mz)
     end
@@ -1234,13 +1274,13 @@ local function stepAssist(myModel)
     if assist.seenTarget ~= target or not assist.hx then
         assist.seenTarget, assist.hx, assist.hz = target, h.X, h.Z
     else
-        local a = Pure.smoothAlpha(dt, opt('BB_AssistReactionMs', 220) / 1000)
+        local a = Pure.smoothAlpha(dt, opt('BB_AssistReactionMs', 130) / 1000)
         assist.hx = assist.hx + (h.X - assist.hx) * a
         assist.hz = assist.hz + (h.Z - assist.hz) * a
     end
     assist.dir = { mx = my.X, mz = my.Z, hx = assist.hx, hz = assist.hz, gx = goal.X, gz = goal.Z,
-        dist = opt('BB_GuardDistance', GAME.AssistDistance), strength = opt('BB_AssistStrength', 0.22),
-        deadzone = opt('BB_AssistDeadzone', 1.5), smooth = opt('BB_AssistSmooth', 0.15) }
+        dist = opt('BB_GuardDistance', GAME.AssistDistance), strength = opt('BB_AssistStrength', 0.32),
+        deadzone = opt('BB_AssistDeadzone', 1.0), smooth = opt('BB_AssistSmooth', 0.1), idle = opt('BB_AssistIdle', 0.6) }
     assist.active = true
 end
 
@@ -1378,6 +1418,65 @@ local function runDribbleMacro()
     end)
 end
 
+-- One-key dribble moves. Combos are the letters the game groups inside its
+-- dribble window (Input.Keyboard AddToCombo L39-L66 -> InputService.Dribble
+-- (combo, sprinting, moveDirection)). Key sequences from the tutorial clips
+-- you sent: Spin "cxz/zxc", Snatchback "shift+xx", Combo "vv",
+-- Crossover "shift z/c", Double Stepback "shift+vv+s+e", Halo spin
+-- "spin, switch hands, switch hands + tap shoot while holding post".
+local HoldGRemote = resolve({ 'ReplicatedStorage', 'Aero', 'AeroRemoteServices', 'InputService', 'HoldG' })
+local function awayFromHoopDir(myModel)
+    local root, goal = rootOfModel(myModel), goalPos(myModel)
+    if not root or not goal then return currentMoveDir() end
+    local ux, uz = Pure.unit(root.Position.X - goal.X, root.Position.Z - goal.Z)
+    return Vector3.new(ux, 0, uz)
+end
+local MOVES = {
+    { key = 'BB_MoveSpin',       name = 'Spin',            steps = { { 'ZXC', false } } },
+    { key = 'BB_MoveSnatch',     name = 'Snatchback',      steps = { { 'XX', true } } },
+    { key = 'BB_MoveCombo',      name = 'Combo (VV)',      steps = { { 'VV', false } } },
+    { key = 'BB_MoveCrossL',     name = 'Crossover Left',  steps = { { 'Z', true } } },
+    { key = 'BB_MoveCrossR',     name = 'Crossover Right', steps = { { 'C', true } } },
+    { key = 'BB_MoveSwitch',     name = 'Switch Hands',    steps = { { 'H', false } } },
+    { key = 'BB_MoveDStep',      name = 'Double Stepback', steps = { { 'VV', true, 'back' }, { 'shoot' } } },
+    { key = 'BB_MoveHalo',       name = 'Halo Spin',       steps = { { 'ZXC', false }, { 'H', false }, { 'H', false, nil, 'post' } } },
+}
+local function runMove(move, myModel)
+    if auto.dribbleBusy or not DribbleRemote then return end
+    auto.dribbleBusy = true
+    task.spawn(function()
+        for i, st in ipairs(move.steps) do
+            if not windowFocused then break end
+            if st[1] == 'shoot' then
+                if ShootRemote then
+                    pcall(function() ShootRemote:FireServer({ Shoot = true, Input = 'E' }) end)
+                    -- Auto Release times it; without it, let go after a normal hold.
+                    if not on('BB_AutoRelease') then
+                        task.delay(0.45, function() pcall(function() ShootRemote:FireServer({ Shoot = false }) end) end)
+                    end
+                end
+            else
+                local dir = st[3] == 'back' and awayFromHoopDir(myModel) or currentMoveDir()
+                if st[4] == 'post' and HoldGRemote then pcall(function() HoldGRemote:FireServer({ HoldingG = true }) end) end
+                pcall(function() DribbleRemote:FireServer(st[1], st[2], dir) end)
+                if st[4] == 'post' then
+                    if ShootRemote then
+                        pcall(function() ShootRemote:FireServer({ Shoot = true, Input = 'E' }) end)
+                        task.wait(0.06)
+                        pcall(function() ShootRemote:FireServer({ Shoot = false }) end)
+                    end
+                    if HoldGRemote then
+                        task.wait(0.15)
+                        pcall(function() HoldGRemote:FireServer({ HoldingG = false }) end)
+                    end
+                end
+            end
+            if i < #move.steps then task.wait(opt('BB_DribbleDelay', 0.35)) end
+        end
+        auto.dribbleBusy = false
+    end)
+end
+
 local function stepAuto(myModel)
     local myRoot = rootOfModel(myModel)
     if not myRoot then return end
@@ -1388,6 +1487,12 @@ local function stepAuto(myModel)
     local held = keyHeld('BB_DribbleKey')
     if held and not auto.dribbleKeyWas then runDribbleMacro() end
     auto.dribbleKeyWas = held
+    auto.moveWas = auto.moveWas or {}
+    for _, mv in ipairs(MOVES) do
+        local h = keyHeld(mv.key)
+        if h and not auto.moveWas[mv.key] and attr(myModel, 'Basketball') then runMove(mv, myModel) end
+        auto.moveWas[mv.key] = h
+    end
 end
 
 -- ================================================================
@@ -1519,6 +1624,7 @@ Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = true }
 Shoot:AddToggle('BB_DropDupe', { Text = 'Drop My Extra Release (stops auto-layup jellies)', Default = true })
 Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies (double-tap shoot)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
+Shoot:AddToggle('BB_AutoMoving', { Text = 'Auto-Adjust Fade/Moving Shots', Default = true })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
 Shoot:AddToggle('BB_Smooth', { Text = 'Between-Frame Timing', Default = true })
 Shoot:AddToggle('BB_FpsUnlock', { Text = 'Unlock FPS (240) for timing', Default = true })
@@ -1556,15 +1662,18 @@ local Defense = Tab:AddRightGroupbox('Defense')
 Defense:AddToggle('BB_GuardAssist', { Text = 'Guard Assist', Default = false })
 Defense:AddLabel('Assist Key'):AddKeyPicker('BB_GuardKey', { Default = 'None', Text = 'Guard Assist Key', Mode = 'Hold' })
 Defense:AddToggle('BB_AssistOnGameGuard', { Text = 'Also while holding game guard (G)', Default = true })
-Defense:AddSlider('BB_AssistStrength', { Text = 'Assist Strength', Default = 0.22, Min = 0.05, Max = 1, Rounding = 3 })
-Defense:AddSlider('BB_AssistReactionMs', { Text = 'Reaction Delay (ms)', Default = 220, Min = 0, Max = 500, Rounding = 0 })
-Defense:AddSlider('BB_AssistSmooth', { Text = 'Turn Smoothing (s)', Default = 0.15, Min = 0, Max = 0.5, Rounding = 2 })
-Defense:AddSlider('BB_AssistDeadzone', { Text = 'Loose Zone (studs)', Default = 1.5, Min = 0, Max = 4, Rounding = 1 })
+Defense:AddSlider('BB_AssistStrength', { Text = 'Assist Strength', Default = 0.32, Min = 0.05, Max = 1, Rounding = 3 })
+Defense:AddSlider('BB_AssistReactionMs', { Text = 'Reaction Delay (ms)', Default = 130, Min = 0, Max = 500, Rounding = 0 })
+Defense:AddSlider('BB_AssistSmooth', { Text = 'Turn Smoothing (s)', Default = 0.1, Min = 0, Max = 0.5, Rounding = 2 })
+Defense:AddSlider('BB_AssistDeadzone', { Text = 'Loose Zone (studs)', Default = 1.0, Min = 0, Max = 4, Rounding = 1 })
+Defense:AddSlider('BB_AssistIdle', { Text = 'Pull While Standing Still', Default = 0.6, Min = 0, Max = 1, Rounding = 2 })
 Defense:AddSlider('BB_GuardDistance', { Text = 'Guard Distance (studs)', Default = GAME.AssistDistance, Min = 1.5, Max = 8, Rounding = 2 })
 Defense:AddSlider('BB_AssistRange', { Text = 'Target Range (studs)', Default = 25, Min = 5, Max = 80, Rounding = 0 })
 
 local Info = Tab:AddRightGroupbox('Contest')
 Info:AddToggle('BB_ContestMeter', { Text = 'Contest Meter', Default = false })
+Info:AddToggle('BB_ContestPredict', { Text = 'Predict Defender Closeout (speed)', Default = true })
+Info:AddSlider('BB_ContestLookMs', { Text = 'Closeout Lookahead (ms)', Default = 350, Min = 0, Max = 800, Rounding = 0 })
 Info:AddSlider('BB_ContestRange', { Text = 'Estimate Range (studs)', Default = GAME.GuardReactRange, Min = 4, Max = 30, Rounding = 0 })
 Info:AddLabel('Top line is an estimate; "last shot" is the game\'s real contest % and grade.', true)
 
@@ -1587,5 +1696,10 @@ Ball:AddInput('BB_DribbleCombo', { Default = 'Z,X', Text = 'Dribble Macro (combo
 Ball:AddSlider('BB_DribbleDelay', { Text = 'Delay Between Moves (s)', Default = 0.35, Min = 0.05, Max = 1.5, Rounding = 2 })
 Ball:AddToggle('BB_DribbleSprint', { Text = 'Send as Sprinting', Default = false })
 Ball:AddLabel('Dribble Macro Key'):AddKeyPicker('BB_DribbleKey', { Default = 'None', Text = 'Dribble Macro', Mode = 'Hold' })
+Ball:AddDivider()
+Ball:AddLabel('One-key moves (set a key for each):', true)
+for _, mv in ipairs(MOVES) do
+    Ball:AddLabel(mv.name):AddKeyPicker(mv.key, { Default = 'None', Text = mv.name, Mode = 'Hold' })
+end
 
 end -- return function
