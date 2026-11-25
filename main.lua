@@ -57,6 +57,13 @@ end
 if placeId == 10266164381 then
     Tabs.bloodlines = Window:AddTab('bloodlines')
 end
+
+-- Basketball: matches either the place id or the universe (game) id.
+local BASKETBALL_ID = 80681221431821
+local isBasketball = placeId == BASKETBALL_ID or game.GameId == BASKETBALL_ID
+if isBasketball then
+    Tabs.Basketball = Window:AddTab('Basketball')
+end
 -- UI Settings must always be last
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
@@ -101,6 +108,10 @@ if placeFeatures[placeId] then
     safeLoad(placeFeatures[placeId])
 end
 
+if isBasketball then
+    safeLoad('features/basketball.lua')
+end
+
 -- ── 6. UI Settings tab ────────────────────────────────────────
 local UIGrp = Tabs['UI Settings']:AddRightGroupbox('Menu')
 UIGrp:AddButton({ Text = 'Unload', Func = function() Library:Unload() end })
@@ -142,4 +153,4 @@ task.delay(1.5, function()
 end)
 -- <<< autoload gate
 
-print("version0.0127")
+print("version0.0126")
