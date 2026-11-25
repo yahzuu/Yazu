@@ -4,7 +4,13 @@
 --  decompiled scripts and a manifest, built to be handed back for
 --  tool building.
 --
---  Output: workspace/YazuDumper/Universal_<PlaceId>_<time>/
+--  Output (toggle "Single file", default on):
+--    workspace/YazuDumper/Universal_<PlaceId>_<time>.txt  every part below
+--    concatenated, each wrapped in "#### FILE: <name>" / "#### END FILE".
+--  With the toggle off, the same parts as separate files in
+--    workspace/YazuDumper/Universal_<PlaceId>_<time>/
+--  While running, a solid full-screen overlay shows section, item,
+--  progress and ETA; Delete or the Cancel button stops it early.
 --    manifest.json    place, executor, capabilities, per-section status
 --    tree.json        instance tree (grouped siblings, attributes, values, tags)
 --    remotes.json     remotes + bindables, client handlers, call sites
@@ -203,6 +209,48 @@ function Pure.groupKey(className, name)
     return className .. '|' .. name
 end
 
+-- Paths of Roblox's own client code (not the game's).
+local CORE_PREFIXES = { 'CoreGui.', 'CorePackages.', '<nil>.CoreGui.', '<nil>.CorePackages.' }
+function Pure.isCorePath(path)
+    for _, prefix in ipairs(CORE_PREFIXES) do
+        if path:sub(1, #prefix) == prefix then return true end
+    end
+    return false
+end
+
+-- 75 -> "1:15", 3725 -> "1:02:05"
+function Pure.formatDuration(seconds)
+    if seconds ~= seconds or seconds < 0 or seconds == math.huge then return '--:--' end
+    seconds = math.floor(seconds + 0.5)
+    local h, m, sec = math.floor(seconds / 3600), math.floor(seconds % 3600 / 60), seconds % 60
+    if h > 0 then return string.format('%d:%02d:%02d', h, m, sec) end
+    return string.format('%d:%02d', m, sec)
+end
+
+-- Overall fraction 0..1: sections before idx are done, section idx is
+-- frac done. weights[key] defaults to 1.
+function Pure.overallProgress(weights, keys, idx, frac)
+    local total, done = 0, 0
+    for i, key in ipairs(keys) do
+        local w = weights[key] or 1
+        total = total + w
+        if i < idx then
+            done = done + w
+        elseif i == idx then
+            done = done + w * math.clamp(frac or 0, 0, 1)
+        end
+    end
+    if total <= 0 then return 0 end
+    return done / total
+end
+
+-- Remaining seconds from elapsed time and progress; nil until enough
+-- progress exists for a stable estimate.
+function Pure.eta(elapsed, progress)
+    if progress < 0.02 or elapsed < 1 then return nil end
+    return elapsed * (1 - progress) / progress
+end
+
 -- <<< PURE
 
 return function(State, Tabs, Services, Library)
@@ -341,9 +389,13 @@ local debugInfo = type(debug) == 'table' and debug.info or nil
 local FOLDER_ROOT = 'YazuDumper'
 local session = nil -- { folder, scriptsReady, written = {} }
 
-local function newSession()
+local function newSession(single)
+    local stamp = tostring(game.PlaceId) .. '_' .. tostring(os.time())
     session = {
-        folder  = FOLDER_ROOT .. '/Universal_' .. tostring(game.PlaceId) .. '_' .. tostring(os.time()),
+        folder  = FOLDER_ROOT .. '/Universal_' .. stamp,
+        bundle  = FOLDER_ROOT .. '/Universal_' .. stamp .. '.txt',
+        single  = single,
+        parts   = {},
         ready   = false,
         scripts = false,
         written = {},
@@ -363,6 +415,12 @@ end
 local function writeOut(relName, text)
     if type(X.writefile) ~= 'function' or type(X.makefolder) ~= 'function' then
         return nil, 'writefile/makefolder not supported on this executor'
+    end
+    if session.single then
+        -- Single-file mode: keep in memory, flushBundle writes one file.
+        session.parts[#session.parts + 1] = { name = relName, text = text }
+        session.written[#session.written + 1] = relName
+        return session.bundle .. '#' .. relName
     end
     if not session.ready then
         local ok, err = ensureFolder(FOLDER_ROOT)
@@ -703,8 +761,9 @@ end
 local function sectionTree(ctx)
     local budget = { n = 0 }
     local roots = {}
-    for _, name in ipairs(ROOT_NAMES) do
-        local svc = getService(name)
+    for ti, name in ipairs(ROOT_NAMES) do
+        ctx.progress(ti - 1, #ROOT_NAMES, name)
+        local svc = not ctx.cancelled() and getService(name)
         if svc then
             local depth = LIMITS.TreeDepth[name] or 3
             local ok, node = pcall(treeNode, svc, 0, depth, budget)
@@ -771,9 +830,13 @@ local function collectScripts()
         local ok, scripts = pcall(X.getscripts)
         if ok and type(scripts) == 'table' then for _, s in ipairs(scripts) do add(s, 'getscripts') end end
     end
-    for _, e in ipairs(list) do e.path = pathOf(e.inst) end
-    table.sort(list, function(a, b) return a.path < b.path end)
-    return list
+    local kept = {}
+    for _, e in ipairs(list) do
+        e.path = pathOf(e.inst)
+        if includeCore or not Pure.isCorePath(e.path) then kept[#kept + 1] = e end
+    end
+    table.sort(kept, function(a, b) return a.path < b.path end)
+    return kept, #list - #kept
 end
 
 local function remoteNames()
@@ -792,7 +855,9 @@ local function remoteNames()
 end
 
 local function sectionScripts(ctx)
-    local list = collectScripts()
+    ctx.progress(0, 1, 'collecting scripts')
+    local list, coreSkipped = collectScripts()
+    ctx.coreSkipped = coreSkipped
     local names = remoteNames()
     ctx.mentions = {}
     local canDecompile = type(X.decompile) == 'function'
@@ -801,11 +866,14 @@ local function sectionScripts(ctx)
     end
     local taken, index = {}, {}
     local decompiled, failed = 0, 0
+    local total = math.min(#list, LIMITS.MaxScripts)
     for i, e in ipairs(list) do
         if i > LIMITS.MaxScripts then
             ctx.truncated = true
             break
         end
+        if ctx.cancelled() then break end
+        ctx.progress(i - 1, total, e.path)
         local rec = { path = e.path, class = e.inst.ClassName, origin = e.origin }
         if isA(e.inst, 'LocalScript') then rec.enabled = prop(e.inst, 'Enabled') end
         if type(X.getscripthash) == 'function' then
@@ -846,13 +914,14 @@ local function sectionScripts(ctx)
             end
         end
         index[#index + 1] = rec
-        RunService.Heartbeat:Wait()
+        if i % 4 == 0 then RunService.Heartbeat:Wait() end
     end
     ctx.count = #index
     return 'scripts.json', {
         note = 'callSites line numbers refer to the decompiled source; add headerLines to get the line in scripts/*.lua',
         decompiler = canDecompile,
         found = #list, decompiled = decompiled, failed = failed,
+        coreScriptsSkipped = coreSkipped,
         scripts = array(index),
     }
 end
@@ -900,7 +969,9 @@ local function sectionRemotes(ctx, shared)
 
     local mentions = shared.mentions or {}
     local out = {}
-    for _, inst in ipairs(found) do
+    for ri, inst in ipairs(found) do
+        if ctx.cancelled() then break end
+        ctx.progress(ri - 1, #found, inst.Name)
         local rec = {
             path = pathOf(inst), class = inst.ClassName, name = inst.Name,
             attributes = attributesOf(inst, 32),
@@ -954,7 +1025,13 @@ local function sectionGc(ctx)
     end
     local deep = type(X.getconstants) == 'function' or type(X.getupvalues) == 'function'
     local byScript, scriptOrder, total, executorSkipped = {}, {}, 0, 0
-    for _, f in ipairs(objects) do
+    local includeCore = toggleOn('UD_IncludeCore')
+    local coreSkipped = 0
+    for gi, f in ipairs(objects) do
+        if gi % 500 == 0 then
+            if ctx.cancelled() then break end
+            ctx.progress(gi, #objects, 'closure ' .. gi .. ' / ' .. #objects)
+        end
         if type(f) == 'function' and isLuaFn(f) then
             if isExecutorFn(f) then
                 executorSkipped = executorSkipped + 1
@@ -970,6 +1047,10 @@ local function sectionGc(ctx)
                 if not key then
                     local s = scriptOfFn(f)
                     if s then key = pathOf(s) end
+                end
+                if key and not includeCore and Pure.isCorePath(key) then
+                    coreSkipped = coreSkipped + 1
+                    key = nil
                 end
                 if key then
                     total = total + 1
@@ -1005,6 +1086,7 @@ local function sectionGc(ctx)
         note = 'Lua closures alive at dump time, grouped by chunk name (the owning script full name at load time). Only functions the game created; executor closures are skipped when isexecutorclosure exists. Constants and upvalues are values at dump time.',
         deepInspection = deep,
         executorClosuresSkipped = executorSkipped,
+        coreClosuresSkipped = coreSkipped,
         isexecutorclosure = type(X.isexecutorclosure) == 'function',
         scripts = array(scripts),
     }
@@ -1063,7 +1145,7 @@ local function sectionModules(ctx)
     local function add(m)
         if typeof(m) == 'Instance' and not seen[m] and isA(m, 'ModuleScript') then
             if requireAll or loaded[m] then
-                if toggleOn('UD_IncludeCore') or not hasCoreAncestor(m) then
+                if toggleOn('UD_IncludeCore') or not (hasCoreAncestor(m) or Pure.isCorePath(pathOf(m))) then
                     seen[m] = true
                     targets[#targets + 1] = m
                 end
@@ -1080,7 +1162,9 @@ local function sectionModules(ctx)
         return nil
     end
     local entries = {}
-    for _, m in ipairs(targets) do
+    for mi, m in ipairs(targets) do
+        if ctx.cancelled() then break end
+        ctx.progress(mi - 1, #targets, pathOf(m))
         local rec = { path = pathOf(m), alreadyLoaded = loaded[m] == true }
         local ok, result = runWithTimeout(LIMITS.RequireTimeout, require, m)
         if ok then
@@ -1090,7 +1174,7 @@ local function sectionModules(ctx)
             rec.error = tostring(result)
         end
         entries[#entries + 1] = rec
-        RunService.Heartbeat:Wait()
+        if mi % 4 == 0 then RunService.Heartbeat:Wait() end
     end
     table.sort(entries, function(a, b) return a.path < b.path end)
     ctx.count = #entries
@@ -1349,7 +1433,7 @@ local function sectionEnv(ctx)
 end
 
 -- ================================================================
---  RUNNER
+--  SECTION TABLE
 -- ================================================================
 
 local SECTIONS = {
@@ -1380,7 +1464,193 @@ local function executorInfo()
     return { name = name, version = ver, present = array(present), missing = array(missing) }
 end
 
+-- Writes every buffered part into one text file. manifest.json goes
+-- first so the reader sees section status before the bulk.
+local function flushBundle()
+    local ok, err = ensureFolder(FOLDER_ROOT)
+    if not ok then return nil, 'folder creation failed: ' .. tostring(err) end
+    local parts = session.parts
+    table.sort(parts, function(a, b)
+        local am, bm = a.name == 'manifest.json', b.name == 'manifest.json'
+        if am ~= bm then return am end
+        local as, bs = a.name:sub(1, 8) == 'scripts/', b.name:sub(1, 8) == 'scripts/'
+        if as ~= bs then return bs end
+        return a.name < b.name
+    end)
+    local out = {
+        '#### YAZU UNIVERSAL DUMP (single file)',
+        '#### Each part starts with a line "#### FILE: <name> (<bytes> bytes)" and ends with "#### END FILE: <name>".',
+        '#### Parts: ' .. #parts,
+        '',
+    }
+    for _, part in ipairs(parts) do
+        out[#out + 1] = '#### FILE: ' .. part.name .. ' (' .. #part.text .. ' bytes)'
+        out[#out + 1] = part.text
+        out[#out + 1] = '#### END FILE: ' .. part.name
+        out[#out + 1] = ''
+    end
+    local text = table.concat(out, '\n')
+    local wok, werr = pcall(X.writefile, session.bundle, text)
+    if not wok then return nil, 'write error: ' .. tostring(werr) end
+    return session.bundle, #text
+end
+
+-- ================================================================
+--  OVERLAY (solid screen + progress + ETA while dumping)
+-- ================================================================
+
+local UserInputService = Services.UserInputService or game:GetService('UserInputService')
+
+local OVERLAY = {
+    Background = Color3.fromRGB(12, 12, 16),
+    Panel      = Color3.fromRGB(24, 24, 32),
+    Accent     = Color3.fromRGB(255, 120, 190),
+    Text       = Color3.fromRGB(235, 235, 245),
+    SubText    = Color3.fromRGB(150, 150, 170),
+}
+
+local SECTION_WEIGHTS = { scripts = 50, gc = 15, modules = 10, tree = 10, remotes = 6, world = 3, player = 2, animations = 2, env = 1 }
+
+local function overlayParent()
+    local gethui = cap('gethui', 'get_hidden_gui')
+    if type(gethui) == 'function' then
+        local ok, h = pcall(gethui)
+        if ok and typeof(h) == 'Instance' then return h end
+    end
+    local core = getService('CoreGui')
+    if core then
+        local ok = pcall(function() local probe = Instance.new('Folder'); probe.Parent = core; probe:Destroy() end)
+        if ok then return core end
+    end
+    return LocalPlayer and LocalPlayer:FindFirstChildOfClass('PlayerGui') or nil
+end
+
+local function label(parent, props)
+    local l = Instance.new('TextLabel')
+    l.BackgroundTransparency = 1
+    l.Font = Enum.Font.GothamMedium
+    l.TextColor3 = OVERLAY.Text
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    for k, v in pairs(props) do l[k] = v end
+    l.Parent = parent
+    return l
+end
+
+-- Returns { set(fields), destroy() }. If the GUI cannot be created the
+-- methods are no-ops and the dump still runs (Notify is used instead).
+local function createOverlay(onCancel)
+    local ok, ui = pcall(function()
+        local parent = overlayParent()
+        if not parent then error('no GUI parent') end
+        local gui = Instance.new('ScreenGui')
+        gui.Name = 'YazuUniversalDump'
+        gui.IgnoreGuiInset = true
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 2147483647
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+        local bg = Instance.new('Frame')
+        bg.Size = UDim2.fromScale(1, 1)
+        bg.BackgroundColor3 = OVERLAY.Background
+        bg.BorderSizePixel = 0
+        bg.Active = true
+        bg.Parent = gui
+
+        local panel = Instance.new('Frame')
+        panel.AnchorPoint = Vector2.new(0.5, 0.5)
+        panel.Position = UDim2.fromScale(0.5, 0.5)
+        panel.Size = UDim2.fromOffset(560, 230)
+        panel.BackgroundColor3 = OVERLAY.Panel
+        panel.BorderSizePixel = 0
+        panel.Parent = bg
+        local corner = Instance.new('UICorner'); corner.CornerRadius = UDim.new(0, 10); corner.Parent = panel
+
+        local title   = label(panel, { Text = 'Yazu Universal Dump', TextSize = 22, Position = UDim2.fromOffset(24, 18), Size = UDim2.new(1, -48, 0, 28) })
+        local section = label(panel, { Text = 'starting...', TextSize = 16, Position = UDim2.fromOffset(24, 56), Size = UDim2.new(1, -48, 0, 22) })
+        local item    = label(panel, { Text = '', TextSize = 13, TextColor3 = OVERLAY.SubText, Position = UDim2.fromOffset(24, 82), Size = UDim2.new(1, -48, 0, 18) })
+
+        local barBg = Instance.new('Frame')
+        barBg.Position = UDim2.fromOffset(24, 114)
+        barBg.Size = UDim2.new(1, -48, 0, 14)
+        barBg.BackgroundColor3 = OVERLAY.Background
+        barBg.BorderSizePixel = 0
+        barBg.Parent = panel
+        local c2 = Instance.new('UICorner'); c2.CornerRadius = UDim.new(0, 7); c2.Parent = barBg
+        local fill = Instance.new('Frame')
+        fill.Size = UDim2.fromScale(0, 1)
+        fill.BackgroundColor3 = OVERLAY.Accent
+        fill.BorderSizePixel = 0
+        fill.Parent = barBg
+        local c3 = Instance.new('UICorner'); c3.CornerRadius = UDim.new(0, 7); c3.Parent = fill
+
+        local timing = label(panel, { Text = '', TextSize = 15, Position = UDim2.fromOffset(24, 138), Size = UDim2.new(1, -48, 0, 20) })
+        label(panel, { Text = 'Delete = cancel (files written so far are kept)', TextSize = 12, TextColor3 = OVERLAY.SubText, Position = UDim2.fromOffset(24, 196), Size = UDim2.new(1, -200, 0, 16) })
+
+        local cancel = Instance.new('TextButton')
+        cancel.AnchorPoint = Vector2.new(1, 1)
+        cancel.Position = UDim2.new(1, -20, 1, -16)
+        cancel.Size = UDim2.fromOffset(110, 30)
+        cancel.BackgroundColor3 = OVERLAY.Background
+        cancel.TextColor3 = OVERLAY.Text
+        cancel.Font = Enum.Font.GothamMedium
+        cancel.TextSize = 14
+        cancel.Text = 'Cancel'
+        cancel.AutoButtonColor = true
+        cancel.Parent = panel
+        local c4 = Instance.new('UICorner'); c4.CornerRadius = UDim.new(0, 6); c4.Parent = cancel
+
+        gui.Parent = parent
+        return { gui = gui, title = title, section = section, item = item, fill = fill, timing = timing, cancel = cancel }
+    end)
+
+    local conns = {}
+    if ok then
+        conns[#conns + 1] = ui.cancel.MouseButton1Click:Connect(onCancel)
+    end
+    if UserInputService then
+        conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
+            if input.KeyCode == Enum.KeyCode.Delete then onCancel() end
+        end)
+    end
+
+    local overlay = { ok = ok }
+    function overlay.set(f)
+        if not ok then return end
+        pcall(function()
+            if f.title then ui.title.Text = f.title end
+            if f.section then ui.section.Text = f.section end
+            if f.item then ui.item.Text = f.item end
+            if f.frac then ui.fill.Size = UDim2.fromScale(math.clamp(f.frac, 0, 1), 1) end
+            if f.timing then ui.timing.Text = f.timing end
+        end)
+    end
+    function overlay.destroy()
+        for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+        conns = {}
+        if ok then pcall(function() ui.gui:Destroy() end) end
+    end
+    return overlay
+end
+
+-- ================================================================
+--  RUNNER
+-- ================================================================
+
 local busy = false
+local cancelRequested = false
+local activeCleanup = nil -- restores rendering and removes the overlay
+
+local function setRendering(enabled)
+    pcall(function() RunService:Set3dRenderingEnabled(enabled) end)
+end
+
+if type(Library.OnUnload) == 'function' then
+    Library:OnUnload(function()
+        cancelRequested = true
+        if activeCleanup then activeCleanup() end
+    end)
+end
 
 local function runDump(keys)
     if busy then
@@ -1388,45 +1658,111 @@ local function runDump(keys)
         return
     end
     busy = true
-    newSession()
+    cancelRequested = false
+    newSession(toggleOn('UD_SingleFile'))
+
+    local overlay = createOverlay(function() cancelRequested = true end)
+    local paused3d = toggleOn('UD_Pause3D')
+    if paused3d then setRendering(false) end
+    local cleaned = false
+    activeCleanup = function()
+        if cleaned then return end
+        cleaned = true
+        if paused3d then setRendering(true) end
+        overlay.destroy()
+        activeCleanup = nil
+    end
+
     task.spawn(function()
+        local t0 = os.clock()
+        local lastDraw = 0
+        local function draw(force, idx, key, frac, item, done, total)
+            local now = os.clock()
+            if not force and now - lastDraw < 0.1 then return end
+            lastDraw = now
+            local p = Pure.overallProgress(SECTION_WEIGHTS, keys, idx, frac)
+            local elapsed = now - t0
+            local eta = Pure.eta(elapsed, p)
+            local counts = (done and total and total > 1) and ('  (' .. done .. ' / ' .. total .. ')') or ''
+            overlay.set({
+                section = string.format('Section %d/%d: %s%s', idx, #keys, key, counts),
+                item = item and tostring(item) or '',
+                frac = p,
+                timing = string.format('%d%%    elapsed %s    ETA %s', math.floor(p * 100),
+                    Pure.formatDuration(elapsed), eta and Pure.formatDuration(eta) or 'estimating...'),
+            })
+        end
+
         local manifest = {
-            tool = 'Yazu universal_dumper', schemaVersion = 1,
+            tool = 'Yazu universal_dumper', schemaVersion = 2,
             generated = os.date('!%Y-%m-%dT%H:%M:%SZ'),
             placeId = game.PlaceId, gameId = game.GameId, placeVersion = game.PlaceVersion,
             jobId = game.JobId, playerCount = #Players:GetPlayers(),
             executor = executorInfo(), limits = LIMITS,
+            includeCoreScripts = toggleOn('UD_IncludeCore'),
             requestedSections = array(keys), sections = {},
         }
-        local shared = {}
-        for i, key in ipairs(keys) do
-            Library:Notify(string.format('[Universal] %d/%d %s...', i, #keys, key), 2)
-            local ctx = { status = 'ok' }
-            local started = os.clock()
-            local ok, file, data = pcall(SECTIONS[key], ctx, shared)
-            if not ok then
-                ctx.status, ctx.reason = 'failed', tostring(file)
-            elseif file and data ~= nil then
-                local written, err = writeJson(file, data)
-                if written then ctx.file = file else ctx.status, ctx.reason = 'failed', err end
+        local runOk, runErr = pcall(function()
+            local shared = {}
+            for i, key in ipairs(keys) do
+                if cancelRequested then
+                    manifest.sections[key] = { status = 'cancelled', reason = 'cancelled before start' }
+                else
+                    if not overlay.ok then
+                        Library:Notify(string.format('[Universal] %d/%d %s...', i, #keys, key), 2)
+                    end
+                    draw(true, i, key, 0, '')
+                    local ctx = { status = 'ok' }
+                    ctx.progress = function(done, total, item)
+                        draw(false, i, key, (total and total > 0) and done / total or 0, item, done, total)
+                    end
+                    ctx.cancelled = function() return cancelRequested end
+                    local started = os.clock()
+                    local ok, file, data = pcall(SECTIONS[key], ctx, shared)
+                    if not ok then
+                        ctx.status, ctx.reason = 'failed', tostring(file)
+                    else
+                        if cancelRequested and ctx.status == 'ok' then
+                            ctx.status, ctx.reason = 'partial', 'cancelled mid-section; file holds what was gathered'
+                        end
+                        if file and data ~= nil then
+                            draw(true, i, key, 1, 'writing ' .. file)
+                            local written, err = writeJson(file, data)
+                            if written then ctx.file = file else ctx.status, ctx.reason = 'failed', err end
+                        end
+                    end
+                    if key == 'scripts' then
+                        shared.mentions = ctx.mentions
+                        ctx.mentions = nil
+                    end
+                    manifest.sections[key] = {
+                        status = ctx.status, reason = ctx.reason, note = ctx.note, file = ctx.file,
+                        count = ctx.count, truncated = ctx.truncated or nil, coreSkipped = ctx.coreSkipped,
+                        seconds = math.floor((os.clock() - started) * 10) / 10,
+                    }
+                end
             end
-            if key == 'scripts' then
-                shared.mentions = ctx.mentions
-                ctx.mentions = nil
-            end
-            manifest.sections[key] = {
-                status = ctx.status, reason = ctx.reason, note = ctx.note, file = ctx.file,
-                count = ctx.count, truncated = ctx.truncated or nil,
-                seconds = math.floor((os.clock() - started) * 10) / 10,
-            }
-        end
+        end)
+        if not runOk then manifest.runnerError = tostring(runErr) end
+        manifest.cancelled = cancelRequested or nil
+        manifest.totalSeconds = math.floor((os.clock() - t0) * 10) / 10
+
         local scriptFiles = 0
         for _, f in ipairs(session.written) do if f:sub(1, 8) == 'scripts/' then scriptFiles = scriptFiles + 1 end end
         manifest.scriptFilesWritten = scriptFiles
+        manifest.singleFile = session.single or nil
         local path, err = writeJson('manifest.json', manifest)
+        if path and session.single then
+            overlay.set({ item = 'writing single file...' })
+            path, err = flushBundle()
+            session.parts = {}
+        end
+        if activeCleanup then activeCleanup() end
         busy = false
+        local took = Pure.formatDuration(manifest.totalSeconds)
         if path then
-            Library:Notify('Universal dump saved: workspace/' .. session.folder, 8)
+            Library:Notify((cancelRequested and 'Universal dump cancelled, partial saved: ' or 'Universal dump saved (' .. took .. '): ')
+                .. 'workspace/' .. (session.single and session.bundle or session.folder), 8)
         else
             Library:Notify('Universal dump: manifest write failed: ' .. tostring(err), 8)
         end
@@ -1439,7 +1775,7 @@ end
 
 local Grp = Tabs.Dumper:AddRightGroupbox('Universal Dump')
 
-Grp:AddLabel('Output: workspace/' .. FOLDER_ROOT .. '/Universal_<place>_<time>', true)
+Grp:AddLabel('Output: workspace/' .. FOLDER_ROOT .. '/Universal_<place>_<time>(.txt)', true)
 
 Grp:AddButton({ Text = 'Universal Dump (everything)', Func = function() runDump(FULL_ORDER) end })
 Grp:AddButton({ Text = 'Scripts + Remotes', Func = function() runDump({ 'scripts', 'remotes' }) end })
@@ -1450,6 +1786,8 @@ Grp:AddButton({ Text = 'Instance Tree (JSON)', Func = function() runDump({ 'tree
 
 Grp:AddToggle('UD_IncludeCore', { Text = 'Include Roblox core scripts', Default = false })
 Grp:AddToggle('UD_RequireAll', { Text = 'Require unloaded modules (runs their code)', Default = false })
+Grp:AddToggle('UD_SingleFile', { Text = 'Single file (one .txt to send)', Default = true })
+Grp:AddToggle('UD_Pause3D', { Text = 'Pause 3D rendering while dumping', Default = true })
 
 Grp:AddButton({ Text = 'Copy last output path', Func = function()
     if not session then
@@ -1457,10 +1795,11 @@ Grp:AddButton({ Text = 'Copy last output path', Func = function()
         return
     end
     local setclip = cap('setclipboard', 'toclipboard')
-    if type(setclip) == 'function' and pcall(setclip, session.folder) then
-        Library:Notify('Copied: ' .. session.folder)
+    local target = session.single and session.bundle or session.folder
+    if type(setclip) == 'function' and pcall(setclip, target) then
+        Library:Notify('Copied: ' .. target)
     else
-        Library:Notify('workspace/' .. session.folder)
+        Library:Notify('workspace/' .. target)
     end
 end })
 
