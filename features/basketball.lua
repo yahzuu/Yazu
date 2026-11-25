@@ -37,6 +37,15 @@ function Pure.shouldRelease(progress, rate, lead, target)
     return ahead >= target
 end
 
+-- The meter is a ping-pong: meterOffset rises to a peak and falls back
+-- (shot traces from PlaceVersion 484: ~0.25 -> ~1.48 in ~0.39 s, then
+-- back down). Effective progress keeps counting up past the peak by
+-- mirroring the falling side, so "later" is always a bigger number.
+function Pure.effectiveProgress(progress, peakValue, peaked)
+    if peaked then return 2 * peakValue - progress end
+    return progress
+end
+
 -- Smoothed rate of change; dt <= 0 keeps the old rate.
 function Pure.updateRate(oldRate, prevValue, value, dt, smoothing)
     if dt <= 0 or prevValue == nil then return oldRate end
@@ -271,7 +280,8 @@ local shot = {
     progress = 0, prevProgress = nil, prevAt = nil, rate = nil,
     releasedAt = nil, autoFired = false,
 }
-local targets = {}      -- [BaseAnimation] = progress to release at
+local targets = {}      -- [BaseAnimation] = effective progress to release at
+local peaks = {}        -- [BaseAnimation] = meterOffset magnitude at the top of the meter
 local lastFeedback = nil -- { grade, contest, key, releasedAt, auto }
 local contestScale = 1   -- learned: real contest / estimate at release
 local meterInfo = { meterType = nil, green = nil }
@@ -289,7 +299,7 @@ local function saveTargets()
             makefolder('YazuDumper')
         end
         writefile(TARGETS_FILE, HttpService:JSONEncode({
-            placeVersion = game.PlaceVersion, contestScale = contestScale, targets = targets,
+            placeVersion = game.PlaceVersion, contestScale = contestScale, targets = targets, peaks = peaks,
         }))
     end)
 end
@@ -304,6 +314,11 @@ local function loadTargets()
     if type(data.targets) == 'table' then
         for k, v in pairs(data.targets) do
             if type(k) == 'string' and type(v) == 'number' and v == v and v >= 0 and v < 100 then targets[k] = v end
+        end
+    end
+    if type(data.peaks) == 'table' then
+        for k, v in pairs(data.peaks) do
+            if type(k) == 'string' and type(v) == 'number' and v == v and v > 0 and v < 100 then peaks[k] = v end
         end
     end
     if type(data.contestScale) == 'number' and data.contestScale == data.contestScale
@@ -372,6 +387,7 @@ local function resetShot()
     shot.active, shot.released, shot.key = false, false, nil
     shot.progress, shot.prevProgress, shot.prevAt, shot.rate = 0, nil, nil, nil
     shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt = nil, false, nil, nil
+    shot.maxProgress, shot.peaked = 0, false
 end
 
 local function fireRelease()
@@ -475,6 +491,14 @@ local function stepShot(myModel)
             shot.prevProgress, shot.prevAt = p, now
         end
         shot.progress = p
+        if p > shot.maxProgress then
+            shot.maxProgress = p
+        elseif not shot.peaked and shot.maxProgress - p > 0.02 then
+            shot.peaked = true
+            local old = peaks[shot.key]
+            peaks[shot.key] = old and (old * 0.7 + shot.maxProgress * 0.3) or shot.maxProgress
+            traceEvent('peak', { value = shot.maxProgress, learnedPeak = peaks[shot.key] })
+        end
     end
 
     local t = trace.current
@@ -489,24 +513,35 @@ local function stepShot(myModel)
 
     if attr(myModel, 'ReleasedShot') == true and not shot.released then
         shot.released = true
-        shot.releasedAt = shot.progress
+        shot.releasedAt = Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked)
         local okC, est = pcall(function() return (readContest(myModel)) end)
         shot.estAtRelease = okC and est or nil
-        traceEvent('serverReleased', { progress = shot.progress, rate = shot.rate, estimate = shot.estAtRelease })
+        traceEvent('serverReleased', { progress = shot.progress, effective = shot.releasedAt, peaked = shot.peaked,
+            rate = shot.rate, estimate = shot.estAtRelease })
         return
     end
 
     if shot.released or shot.autoFired or not on('BB_AutoRelease') then return end
-    local target = targets[shot.key]
+    -- Goal: the learned target; before any learning, the top of the meter
+    -- (learned peak, or the moment the meter turns if no peak is known yet).
+    local target = targets[shot.key] or peaks[shot.key]
     local lead = on('BB_PingComp') and oneWayPing() / 2 or 0
     lead = lead + opt('BB_ExtraLeadMs', 0) / 1000
-    if Pure.shouldRelease(shot.progress, shot.rate or 0, lead, target) then
+    local eff = Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked)
+    local fire
+    if target then
+        fire = Pure.shouldRelease(eff, math.abs(shot.rate or 0), lead, target)
+    else
+        fire = shot.peaked
+    end
+    if fire then
         local ok = fireRelease()
         shot.autoFired = ok
-        shot.firedAt = target
+        shot.firedAt = target or eff
         diag.fired = diag.fired + 1
-        diag.lastFire = string.format('%s at %.3f (target %.3f, lead %dms)', ok and 'sent' or 'FAILED', shot.progress, target, math.floor(lead * 1000))
-        traceEvent('autoRelease', { ok = ok, progress = shot.progress, rate = shot.rate, lead = lead, target = target })
+        diag.lastFire = string.format('%s at %.3f (goal %s, lead %dms)', ok and 'sent' or 'FAILED', eff,
+            target and string.format('%.3f', target) or 'peak', math.floor(lead * 1000))
+        traceEvent('autoRelease', { ok = ok, progress = shot.progress, effective = eff, rate = shot.rate, lead = lead, goal = target or 'peak' })
     end
 end
 
@@ -628,8 +663,8 @@ local function drawMeter(myModel)
         meter.live.Text = 'OPEN'
     end
     local base = attr(myModel, 'BaseAnimation')
-    if on('BB_AutoRelease') and base and targets[tostring(base)] == nil then
-        meter.last.Text = 'auto release: learning ' .. tostring(base) .. ', shoot normally'
+    if on('BB_AutoRelease') and base and targets[tostring(base)] == nil and peaks[tostring(base)] == nil then
+        meter.last.Text = 'auto release: first shot fires at the top of the meter'
     elseif lastFeedback then
         meter.last.Text = string.format('last shot: %s%% contested, %s%s', lastFeedback.contest and tostring(math.floor(lastFeedback.contest + 0.5)) or '?',
             tostring(lastFeedback.grade), lastFeedback.auto and ' (auto)' or '')
@@ -852,7 +887,7 @@ local function drawDebug()
         add('BaseAnimation   : %s', tostring(attr(m, 'BaseAnimation')))
     end
     add('shot active     : %s  progress %.4f  rate %.3f/s', tostring(shot.active), shot.progress or 0, shot.rate or 0)
-    add('target          : %s', shot.key and tostring(targets[shot.key]) or '(no shot yet)')
+    add('target / peak   : %s / %s   peaked %s', shot.key and tostring(targets[shot.key]) or '-', shot.key and tostring(peaks[shot.key]) or '-', tostring(shot.peaked))
     add('meter (server)  : type %s  green %s', tostring(meterInfo.meterType), tostring(meterInfo.green))
     add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
     add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
@@ -888,6 +923,7 @@ Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
 end })
 Shoot:AddButton({ Text = 'Reset Learned Targets', Func = function()
     targets = {}
+    peaks = {}
     saveTargets()
     Library:Notify('Learned targets cleared')
 end })
@@ -898,7 +934,7 @@ Shoot:AddButton({ Text = 'Save Last Shot Trace', Func = function()
     local path, err = saveTrace(trace.last or trace.current)
     Library:Notify(path and ('Saved workspace/' .. path) or ('Trace: ' .. tostring(err)), 6)
 end })
-Shoot:AddLabel('Auto Release needs a learned target: shoot normally a few times with Auto Timing on, then enable it.', true)
+Shoot:AddLabel('Auto Release starts at the top of the meter, then Auto Timing moves it from the game\'s release grades.', true)
 if not ShootRemote then Shoot:AddLabel('!! InputService.Shoot remote not found; Auto Release is off', true) end
 if not FeedbackRemote then Shoot:AddLabel('!! InterfaceService.ShowFeedback not found; Auto Timing cannot learn', true) end
 
