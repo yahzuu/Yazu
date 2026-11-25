@@ -210,7 +210,7 @@ end
 -- side, Early-type grades x < c - w, Late-type x > c + w. Every candidate c
 -- is scored by how far each shot is from agreeing with it (recent shots
 -- weigh more); returns the middle of the best-scoring candidates.
-function Pure.fitCenter(history, w, W, lo, hi)
+function Pure.fitCenter(history, w, W, lo, hi, prior)
     if #history == 0 then return nil end
     lo, hi = lo or 0.8, hi or 1.3
     local best, bestCs = math.huge, {}
@@ -241,7 +241,22 @@ function Pure.fitCenter(history, w, W, lo, hi)
         end
         c = c + 0.002
     end
-    return (bestCs[1] + bestCs[#bestCs]) / 2
+    -- Equal scores can form separate ranges (a lone "Good" fits either side):
+    -- take the range nearest the prior aim, the earlier one on a tie, and the
+    -- next grade settles which side was right.
+    local ranges, startC = {}, bestCs[1]
+    for i = 2, #bestCs + 1 do
+        if i > #bestCs or bestCs[i] - bestCs[i - 1] > 0.003 then
+            ranges[#ranges + 1] = (startC + bestCs[i - 1]) / 2
+            startC = bestCs[i]
+        end
+    end
+    local pick, pickD = ranges[1], math.huge
+    for _, mid in ipairs(ranges) do
+        local d = math.abs(mid - (prior or mid))
+        if d < pickD - 0.004 then pick, pickD = mid, d end
+    end
+    return pick
 end
 
 -- Exponential smoothing factor for a time step: 0 = no change, 1 = jump.
@@ -437,6 +452,7 @@ local trace = { current = nil, last = nil }
 -- Timing is learned per jumpshot/layup animation (BaseAnimation): the
 -- animation decides when the release lands; the meter type only changes
 -- the meter's scale, which peakFor() removes.
+local serverProgressNow -- defined next to stepShot
 local function shotKey(model)
     local base = model and attr(model, 'BaseAnimation')
     return base and tostring(base) or '?'
@@ -495,7 +511,7 @@ local function loadTargets()
                         end
                     end
                 end
-                clean.target = Pure.fitCenter(clean.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth)
+                clean.target = Pure.fitCenter(clean.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth, nil, nil, GAME.DefaultAim)
                 if clean.target then learn[k] = clean end
             end
         end
@@ -568,6 +584,7 @@ local function resetShot()
     shot.active, shot.released, shot.key = false, false, nil
     shot.progress, shot.prevProgress, shot.prevAt, shot.rate = 0, nil, nil, nil
     shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt, shot.fireMode = nil, false, nil, nil, nil
+    shot.manualAt = nil
     shot.maxProgress, shot.peaked = 0, false
 end
 
@@ -594,14 +611,15 @@ if FeedbackRemote then
             contest = tonumber(contest), key = key,
             releasedAt = shot.releasedAt, auto = shot.autoFired,
         }
-        if on('BB_AutoTiming') and gi and shot.autoFired and shot.firedAt then
-            -- Learn from where the server's meter was when our release arrived.
-            -- Manual shots are not learned from: we can't tell when you pressed.
+        local learnX = (shot.autoFired and shot.firedAt) or (on('BB_LearnManual') and shot.manualAt) or nil
+        if on('BB_AutoTiming') and gi and learnX then
+            -- Learn from where the server's meter was when the release arrived:
+            -- ours (auto) or yours (the moment you let go of the shoot key).
             local st = learn[key] or { hist = {} }
             st.hist = st.hist or {}
-            st.hist[#st.hist + 1] = { x = shot.firedAt, g = gi }
+            st.hist[#st.hist + 1] = { x = learnX, g = gi }
             while #st.hist > 15 do table.remove(st.hist, 1) end
-            st.target = Pure.fitCenter(st.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth)
+            st.target = Pure.fitCenter(st.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth, nil, nil, GAME.DefaultAim)
             st.perfects = 0
             for _, h in ipairs(st.hist) do if h.g == 5 then st.perfects = st.perfects + 1 end end
             learn[key] = st
@@ -613,7 +631,7 @@ if FeedbackRemote then
         end
         local st = learn[key]
         traceEvent('feedback', { grade = lastFeedback.grade, contest = real, estimateAtRelease = shot.estAtRelease,
-            mode = shot.fireMode, firedAt = shot.firedAt,
+            mode = shot.fireMode or (shot.manualAt and 'manual'), firedAt = shot.firedAt, manualAt = shot.manualAt,
             newTarget = st and st.target, learnedShots = st and st.hist and #st.hist, perfects = st and st.perfects,
             ping = oneWayPing() * 2, contestScale = contestScale })
         saveTargets()
@@ -656,6 +674,14 @@ end
 local readContest -- defined in the contest section
 
 local meterWatch = { last = nil }
+-- Where the server's meter is (in "of the top" units) if a release left now.
+serverProgressNow = function(peak)
+    local rateU = math.abs(shot.rate or 0) / peak
+    if rateU < GAME.RateMin or rateU > GAME.RateMax then rateU = GAME.RateFallback end
+    local lead = (on('BB_PingComp') and oneWayPing() or 0) + opt('BB_ExtraLeadMs', 0) / 1000
+    local u = Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked) / peak
+    return Pure.serverProgress(u, rateU, lead), u, rateU, lead
+end
 -- Layup-type shot: a layup action, or a "Shooting" action whose animation
 -- is a layup/floater (animation names from the dump: Layup1R, ReverseLayup1L,
 -- ClutchLayup1Front, Floater...).
@@ -742,11 +768,8 @@ local function stepShot(myModel)
     if peak and peak > 0 then
         -- Prefire: release when the server's meter (ours + one-way ping of travel)
         -- will be at the aim, on whichever frame lands closest to it.
-        local rateU = math.abs(shot.rate or 0) / peak
-        if rateU < GAME.RateMin or rateU > GAME.RateMax then rateU = GAME.RateFallback end
-        lead = (on('BB_PingComp') and oneWayPing() or 0) + opt('BB_ExtraLeadMs', 0) / 1000
-        local u = shot.progress / peak
-        su = Pure.serverProgress(u, rateU, lead)
+        local u, rateU
+        su, u, rateU, lead = serverProgressNow(peak)
         local nearest = Pure.serverProgress(u, rateU, lead + diag.dt / 2)
         mode = 'prefire'
         -- past the top and still not fired: it only gets later, go now
@@ -787,6 +810,19 @@ local function hookMeter(myModel)
     end
 end
 onCleanup(function() if meterHook.conn then meterHook.conn:Disconnect() end end)
+
+-- Your own releases: the game sends Shoot{Shoot=false} the moment the shoot
+-- or jump key goes up (Input.Keyboard KeyUp handler, L306-L318), so that
+-- instant is when your release left. Remembered for learning.
+local MANUAL_KEYS = { E = true, Space = true, ButtonX = true, ButtonA = true }
+connect(UserInputService.InputEnded, function(input)
+    local name = input and input.KeyCode and input.KeyCode.Name
+    if not MANUAL_KEYS[name] or not shot.active or shot.released or shot.autoFired or shot.manualAt then return end
+    local peak = peakFor(meterInfo.meterType)
+    if not peak or peak <= 0 then return end
+    shot.manualAt = (serverProgressNow(peak))
+    traceEvent('manualRelease', { key = name, progress = shot.progress, serverProgress = shot.manualAt })
+end)
 
 local function recalibrate(all)
     if all then
@@ -1348,6 +1384,7 @@ end)
 local Shoot = Tab:AddLeftGroupbox('Shooting')
 Shoot:AddToggle('BB_AutoRelease', { Text = 'Auto Release', Default = false })
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Auto Timing (learn from release grades)', Default = true })
+Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = true })
 Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups (makes jellies)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
