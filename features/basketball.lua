@@ -81,6 +81,28 @@ function Pure.learn(st, x, gi, step)
     return { target = math.max(0, target), early = early, late = late, perfects = perfects }
 end
 
+-- Where the server's meter is when our release arrives, as a fraction of
+-- the meter's top (1.0 = top). Measured from 25 user shot traces
+-- (PlaceVersion 484): the grade follows the server's meter, which runs
+-- ahead of ours by about one-way ping. Perfect releases landed at
+-- 1.000 .. 1.039, the closest Good on the early side at 0.999, Goods on
+-- the late side at 1.06+ (so "Good" means close, either side).
+--   u      : our visible meter / meter top
+--   rateU  : meter speed in tops per second
+--   lead   : seconds until the server gets the release (one-way ping)
+function Pure.serverProgress(u, rateU, lead)
+    return u + math.max(rateU, 0) * math.max(lead, 0)
+end
+
+-- "Good" (grade 4) has no direction: decide from where we released
+-- relative to the current aim. Returns a directional grade for learning
+-- (3 = slightly early, 6 = slightly late) and a step factor.
+function Pure.directionalGrade(gi, x, aim)
+    if gi ~= 4 then return gi, 1 end
+    if aim and x >= aim then return 6, 0.5 end
+    return 3, 0.5
+end
+
 -- The meter is a ping-pong: meterOffset rises to a peak and falls back
 -- (shot traces from PlaceVersion 484: ~0.25 -> ~1.48 in ~0.39 s, then
 -- back down). Effective progress keeps counting up past the peak by
@@ -144,12 +166,14 @@ end
 -- stand `dist` studs from the handler toward the handler's goal, and
 -- blend that direction into the input with weight
 -- clamp(offset / 5, 0, 1) * strength. Returns a unit {x, z}.
-function Pure.guardAssistDir(ix, iz, mx, mz, hx, hz, gx, gz, dist, strength)
+-- deadzone (studs, optional): no pull while you are this close to the spot,
+-- so you are not glued perfectly in front of the handler.
+function Pure.guardAssistDir(ix, iz, mx, mz, hx, hz, gx, gz, dist, strength, deadzone)
     local ux, uz = Pure.unit(gx - hx, gz - hz)
     local px, pz = hx + ux * dist - mx, hz + uz * dist - mz
     local off = math.sqrt(px * px + pz * pz)
     if off < 1e-6 then return Pure.unit(ix, iz) end
-    local w = math.clamp(off / 5, 0, 1) * strength
+    local w = math.clamp((off - (deadzone or 0)) / 5, 0, 1) * strength
     return Pure.unit(ix * (1 - w) + px / off * w, iz * (1 - w) + pz / off * w)
 end
 
@@ -178,6 +202,52 @@ function Pure.splitCombos(text)
         if combo ~= '' and #out < 8 then out[#out + 1] = combo end
     end
     return out
+end
+
+-- Best release point from recent graded shots (history = { {x=, g=}, ... },
+-- oldest first, x in server-progress units). Assumed grade bands around the
+-- best point c, from the trace spread: Perfect |x-c| <= w, Good w..W either
+-- side, Early-type grades x < c - w, Late-type x > c + w. Every candidate c
+-- is scored by how far each shot is from agreeing with it (recent shots
+-- weigh more); returns the middle of the best-scoring candidates.
+function Pure.fitCenter(history, w, W, lo, hi)
+    if #history == 0 then return nil end
+    lo, hi = lo or 0.8, hi or 1.3
+    local best, bestCs = math.huge, {}
+    local c = lo
+    while c <= hi + 1e-9 do
+        local pen, wt = 0, 1
+        for i = #history, 1, -1 do
+            local h = history[i]
+            local d = h.x - c
+            local ad = math.abs(d)
+            local v = 0
+            if h.g == 5 then
+                v = math.max(ad - w, 0)
+            elseif h.g == 4 then
+                v = (ad < w and (w - ad) or 0) + math.max(ad - W, 0)
+            elseif h.g >= 1 and h.g <= 3 then
+                v = math.max(d + w, 0)
+            elseif h.g >= 6 and h.g <= 8 then
+                v = math.max(w - d, 0)
+            end
+            pen = pen + v * wt
+            wt = wt * 0.9
+        end
+        if pen < best - 1e-9 then
+            best, bestCs = pen, { c }
+        elseif math.abs(pen - best) <= 1e-9 then
+            bestCs[#bestCs + 1] = c
+        end
+        c = c + 0.002
+    end
+    return (bestCs[1] + bestCs[#bestCs]) / 2
+end
+
+-- Exponential smoothing factor for a time step: 0 = no change, 1 = jump.
+function Pure.smoothAlpha(dt, tau)
+    if tau <= 0 then return 1 end
+    return 1 - math.exp(-math.max(dt, 0) / tau)
 end
 
 -- <<< PURE
@@ -211,6 +281,27 @@ local GAME = {
     --   Team (number), Basketball (truthy when holding), HoldingG (game's guard key),
     --   Goal (ObjectValue -> Workspace.Hoops._HoopN.Goal, the hoop that player attacks)
     ShootingAction = 'Shooting',
+    -- Highest meterOffset magnitude seen per meter type in the user's shot
+    -- traces (PlaceVersion 484, Jumpshot1 + Jumpshot5). Used to turn the
+    -- meter into 0..1 "of the top" so every meter shares one timing.
+    MeterPeaks = { Funnel = 0.982, Funnel2 = 0.982, Pill = 0.982, Bat = 0.982, Hoop = 0.982,
+        Arrow = 0.953, None = 0.943, Tube = 0.913, Diamond = 0.913, Roblox = 0.913, Rocket = 0.914,
+        Vertical = 1.467 },
+    -- Starting aim in server-progress units before anything is learned
+    -- (middle of the Perfect spread 1.000 .. 1.039 above). Each jumpshot
+    -- animation then learns its own.
+    DefaultAim = 1.02,
+    -- Grade bands around the best point, in server-progress units, from the
+    -- same traces: Perfects spread over ~0.04, Goods reached ~0.06 out.
+    PerfectHalfWidth = 0.02, GoodHalfWidth = 0.06,
+    -- Normalised meter speed was 2.15 .. 2.7 tops/s in every trace; outside
+    -- this a frame hitch spoiled the measurement and 2.5 is used.
+    RateMin = 1.5, RateMax = 4, RateFallback = 2.5,
+    -- Actions that can carry a release meter. 'ContactLayup' / 'ClutchLayup'
+    -- come from Camera.Types.FirstPerson L23 and Character.Movement L174.
+    -- Whether each one shows a meter is NOT confirmed: any other action is
+    -- picked up by the moving-meter fallback (BB_AnyMeter).
+    ShotActions = { Shooting = true, ContactLayup = true, ClutchLayup = true },
     -- Animations.Types.Guard reacts to a shooter within 12 studs; used only as
     -- the default contest range of the estimate.
     GuardReactRange = 12,
@@ -335,22 +426,34 @@ local shot = {
     progress = 0, prevProgress = nil, prevAt = nil, rate = nil,
     releasedAt = nil, autoFired = false,
 }
-local learn = {}        -- [anim|meter] = { target, early, late, perfects = {...} }
-local peaks = {}        -- [anim|meter] = meterOffset magnitude at the top of the meter
+local learn = {}        -- [jumpshot animation] = { target, hist = last 15 graded {x, g}, perfects } (server-progress units)
+local peaks = {}        -- [meter type] = meterOffset magnitude at the top of the meter
 local lastFeedback = nil
 local contestScale = 1   -- learned: real contest / estimate at release
 local meterInfo = { meterType = nil, green = nil }
 local diag = { fired = 0, lastFire = 'none', lastError = nil, shots = 0, dt = 1 / 60 }
 local trace = { current = nil, last = nil }
 
+-- Timing is learned per jumpshot/layup animation (BaseAnimation): the
+-- animation decides when the release lands; the meter type only changes
+-- the meter's scale, which peakFor() removes.
 local function shotKey(model)
     local base = model and attr(model, 'BaseAnimation')
-    return (base and tostring(base) or '?') .. '|' .. tostring(meterInfo.meterType or '?')
+    return base and tostring(base) or '?'
 end
 
 local function targetFor(key)
     local st = learn[key]
     return st and st.target or nil
+end
+
+local function aimFor(key)
+    return targetFor(key) or GAME.DefaultAim
+end
+
+local function peakFor(meterType)
+    if meterType == nil then return nil end
+    return peaks[meterType] or GAME.MeterPeaks[meterType]
 end
 
 -- ---------------- learned state survives rejoins ----------------
@@ -364,7 +467,7 @@ local function saveTargets()
             makefolder('YazuDumper')
         end
         writefile(TARGETS_FILE, HttpService:JSONEncode({
-            version = 2, placeVersion = game.PlaceVersion, contestScale = contestScale, learn = learn, peaks = peaks,
+            version = 3, placeVersion = game.PlaceVersion, contestScale = contestScale, learn = learn, peaks = peaks,
         }))
     end)
 end
@@ -379,20 +482,21 @@ local function loadTargets()
         if not isfile(TARGETS_FILE) then return nil end
         return HttpService:JSONDecode(readfile(TARGETS_FILE))
     end)
-    if not ok or type(data) ~= 'table' or data.version ~= 2 then return end
+    if not ok or type(data) ~= 'table' or data.version ~= 3 then return end
     if type(data.learn) == 'table' then
         for k, st in pairs(data.learn) do
             if type(k) == 'string' and type(st) == 'table' then
-                local clean = { perfects = {} }
-                if finiteNum(st.target, 0, 100) then clean.target = st.target end
-                if finiteNum(st.early, 0, 100) then clean.early = st.early end
-                if finiteNum(st.late, 0, 100) then clean.late = st.late end
-                if type(st.perfects) == 'table' then
-                    for _, p in ipairs(st.perfects) do
-                        if finiteNum(p, 0, 100) and #clean.perfects < 5 then clean.perfects[#clean.perfects + 1] = p end
+                local clean = { hist = {}, perfects = 0 }
+                if type(st.hist) == 'table' then
+                    for _, h in ipairs(st.hist) do
+                        if type(h) == 'table' and finiteNum(h.x, 0, 3) and finiteNum(h.g, 1, 8) and #clean.hist < 15 then
+                            clean.hist[#clean.hist + 1] = { x = h.x, g = math.floor(h.g) }
+                            if h.g == 5 then clean.perfects = clean.perfects + 1 end
+                        end
                     end
                 end
-                learn[k] = clean
+                clean.target = Pure.fitCenter(clean.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth)
+                if clean.target then learn[k] = clean end
             end
         end
     end
@@ -421,7 +525,7 @@ local function traceText(t)
         'placeId=' .. tostring(game.PlaceId) .. ' placeVersion=' .. tostring(game.PlaceVersion),
         'key=' .. tostring(t.key) .. ' target=' .. tostring(t.target)
             .. ' meterType=' .. tostring(t.meterType) .. ' green=' .. tostring(t.green),
-        'autoRelease=' .. tostring(t.auto) .. ' ping=' .. string.format('%.3f', t.ping or 0),
+        'action=' .. tostring(t.action) .. ' autoRelease=' .. tostring(t.auto) .. ' ping=' .. string.format('%.3f', t.ping or 0),
         '',
         '-- samples: t(s) action progress meterOffset released',
     }
@@ -463,7 +567,7 @@ end
 local function resetShot()
     shot.active, shot.released, shot.key = false, false, nil
     shot.progress, shot.prevProgress, shot.prevAt, shot.rate = 0, nil, nil, nil
-    shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt = nil, false, nil, nil
+    shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt, shot.fireMode = nil, false, nil, nil, nil
     shot.maxProgress, shot.peaked = 0, false
 end
 
@@ -490,14 +594,17 @@ if FeedbackRemote then
             contest = tonumber(contest), key = key,
             releasedAt = shot.releasedAt, auto = shot.autoFired,
         }
-        if on('BB_AutoTiming') and gi then
-            -- After an auto release, learn from the point we aimed at (the server's
-            -- released value includes network delay). After a manual shot, from
-            -- where the server saw the release.
-            local x = shot.autoFired and shot.firedAt or shot.releasedAt
-            if x then
-                learn[key] = Pure.learn(learn[key], x, gi, opt('BB_CalStep', 0.03))
-            end
+        if on('BB_AutoTiming') and gi and shot.autoFired and shot.firedAt then
+            -- Learn from where the server's meter was when our release arrived.
+            -- Manual shots are not learned from: we can't tell when you pressed.
+            local st = learn[key] or { hist = {} }
+            st.hist = st.hist or {}
+            st.hist[#st.hist + 1] = { x = shot.firedAt, g = gi }
+            while #st.hist > 15 do table.remove(st.hist, 1) end
+            st.target = Pure.fitCenter(st.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth)
+            st.perfects = 0
+            for _, h in ipairs(st.hist) do if h.g == 5 then st.perfects = st.perfects + 1 end end
+            learn[key] = st
         end
         local real = tonumber(contest)
         if real and shot.estAtRelease and shot.estAtRelease > 0.05 then
@@ -506,8 +613,9 @@ if FeedbackRemote then
         end
         local st = learn[key]
         traceEvent('feedback', { grade = lastFeedback.grade, contest = real, estimateAtRelease = shot.estAtRelease,
-            newTarget = st and st.target, early = st and st.early, late = st and st.late,
-            perfects = st and #st.perfects, contestScale = contestScale })
+            mode = shot.fireMode, firedAt = shot.firedAt,
+            newTarget = st and st.target, learnedShots = st and st.hist and #st.hist, perfects = st and st.perfects,
+            ping = oneWayPing() * 2, contestScale = contestScale })
         saveTargets()
         if on('BB_AutoSaveTrace') then
             local path = saveTrace(trace.current or trace.last)
@@ -547,17 +655,28 @@ end
 
 local readContest -- defined in the contest section
 
+local meterWatch = { last = nil }
 local function stepShot(myModel)
     local action = attr(myModel, 'Action')
-    local shooting = action == GAME.ShootingAction
+    local p0 = progressOf(myModel)
+    local rising = p0 ~= nil and meterWatch.last ~= nil and p0 > meterWatch.last
+    if p0 then meterWatch.last = p0 end
+    local shooting
+    if shot.active then
+        shooting = action == shot.action
+    else
+        shooting = GAME.ShotActions[action] == true
+            or (on('BB_AnyMeter') and type(action) == 'string' and action ~= '' and rising and p0 < 0.2)
+    end
     if shooting and not shot.active then
         resetShot()
         shot.active = true
+        shot.action = action
         diag.shots = diag.shots + 1
         shot.key = shotKey(myModel)
         trace.current = {
-            startedAt = os.clock(), key = shot.key, target = targetFor(shot.key),
-            meterType = meterInfo.meterType, green = meterInfo.green,
+            startedAt = os.clock(), key = shot.key, target = aimFor(shot.key),
+            meterType = meterInfo.meterType, green = meterInfo.green, action = action,
             auto = on('BB_AutoRelease'), ping = oneWayPing() * 2, samples = {}, events = {},
         }
     elseif not shooting and shot.active then
@@ -578,9 +697,12 @@ local function stepShot(myModel)
             shot.maxProgress = p
         elseif not shot.peaked and shot.maxProgress - p > 0.02 then
             shot.peaked = true
-            local old = peaks[shot.key]
-            peaks[shot.key] = old and (old * 0.7 + shot.maxProgress * 0.3) or shot.maxProgress
-            traceEvent('peak', { value = shot.maxProgress, learnedPeak = peaks[shot.key] })
+            local mt = meterInfo.meterType
+            if mt then
+                local old = peakFor(mt)
+                peaks[mt] = old and (old * 0.8 + shot.maxProgress * 0.2) or shot.maxProgress
+            end
+            traceEvent('peak', { value = shot.maxProgress, meterType = mt, learnedPeak = mt and peaks[mt] })
         end
     end
 
@@ -605,28 +727,36 @@ local function stepShot(myModel)
     end
 
     if shot.released or shot.autoFired or not on('BB_AutoRelease') then return end
-    -- Goal: the learned target; before any learning, the top of the meter
-    -- (learned peak, or the moment the meter turns if no peak is known yet).
-    local target = targetFor(shot.key) or peaks[shot.key]
-    local lead = on('BB_PingComp') and oneWayPing() / 2 or 0
-    lead = lead + opt('BB_ExtraLeadMs', 0) / 1000
-    local eff = Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked)
-    local rate = math.abs(shot.rate or 0)
-    local fire
-    if target then
-        -- Fire on whichever frame lands closest to the target, not the first frame past it.
-        fire = Pure.shouldRelease(eff, rate, lead, target, diag.dt / 2)
+    local peak = peakFor(meterInfo.meterType)
+    local fire, mode, aim, su, lead = false, nil, aimFor(shot.key), nil, 0
+    if peak and peak > 0 then
+        -- Prefire: release when the server's meter (ours + one-way ping of travel)
+        -- will be at the aim, on whichever frame lands closest to it.
+        local rateU = math.abs(shot.rate or 0) / peak
+        if rateU < GAME.RateMin or rateU > GAME.RateMax then rateU = GAME.RateFallback end
+        lead = (on('BB_PingComp') and oneWayPing() or 0) + opt('BB_ExtraLeadMs', 0) / 1000
+        local u = shot.progress / peak
+        su = Pure.serverProgress(u, rateU, lead)
+        local nearest = Pure.serverProgress(u, rateU, lead + diag.dt / 2)
+        mode = 'prefire'
+        -- past the top and still not fired: it only gets later, go now
+        fire = nearest >= aim or shot.peaked
     else
+        -- Meter type the script has never seen: release at the top once, which
+        -- teaches it this meter's size; the next shot prefires.
+        mode = 'peak'
         fire = shot.peaked
     end
     if fire then
         local ok = fireRelease()
         shot.autoFired = ok
-        shot.firedAt = target or eff
+        shot.firedAt = su
+        shot.fireMode = mode
         diag.fired = diag.fired + 1
-        diag.lastFire = string.format('%s at %.3f (goal %s, lead %dms)', ok and 'sent' or 'FAILED', eff,
-            target and string.format('%.3f', target) or 'peak', math.floor(lead * 1000))
-        traceEvent('autoRelease', { ok = ok, progress = shot.progress, effective = eff, rate = shot.rate, lead = lead, goal = target or 'peak' })
+        diag.lastFire = string.format('%s at %s (aim %.3f, %s, lead %dms)', ok and 'sent' or 'FAILED',
+            su and string.format('%.3f', su) or 'top', aim, mode, math.floor(lead * 1000))
+        traceEvent('autoRelease', { ok = ok, mode = mode, progress = shot.progress, peak = peak, serverProgress = su,
+            aim = aim, rate = shot.rate, lead = lead })
     end
 end
 
@@ -657,7 +787,7 @@ local function recalibrate(all)
             local m = modelOf(LocalPlayer)
             key = m and shotKey(m)
         end
-        if key then learn[key], peaks[key] = nil, nil end
+        if key then learn[key] = nil end
     end
     saveTargets()
 end
@@ -779,9 +909,8 @@ local function drawMeter(myModel)
     else
         meter.live.Text = 'OPEN'
     end
-    local key = shotKey(myModel)
-    if on('BB_AutoRelease') and targetFor(key) == nil and peaks[key] == nil then
-        meter.last.Text = 'auto release: first shot fires at the top of the meter'
+    if on('BB_AutoRelease') and peakFor(meterInfo.meterType) == nil and meterInfo.meterType ~= nil then
+        meter.last.Text = 'auto release: new meter type, first shot fires at the top'
     elseif lastFeedback then
         meter.last.Text = string.format('last shot: %s%% contested, %s%s', lastFeedback.contest and tostring(math.floor(lastFeedback.contest + 0.5)) or '?',
             tostring(lastFeedback.grade), lastFeedback.auto and ' (auto)' or '')
@@ -839,8 +968,20 @@ local function installMoveHook()
         local c, s = cameraBasis()
         if not c then return v end
         local wx, wz = Pure.rawFromMove(c, s, v.X, v.Z)
-        local ox, oz = Pure.guardAssistDir(wx, wz, d.mx, d.mz, d.hx, d.hz, d.gx, d.gz, d.dist, d.strength)
+        local ox, oz = Pure.guardAssistDir(wx, wz, d.mx, d.mz, d.hx, d.hz, d.gx, d.gz, d.dist, d.strength, d.deadzone)
         if ox == 0 and oz == 0 then return v end
+        -- Turn toward the new direction over a moment instead of snapping.
+        local now = os.clock()
+        local a = Pure.smoothAlpha(assist.outAt and math.min(now - assist.outAt, 0.1) or 1, d.smooth)
+        assist.outAt = now
+        if assist.outX then
+            ox, oz = Pure.unit(assist.outX + (ox - assist.outX) * a, assist.outZ + (oz - assist.outZ) * a)
+        end
+        assist.outX, assist.outZ = ox, oz
+        -- keep your own stick length: no assist movement while you stand still
+        local len = math.sqrt(wx * wx + wz * wz)
+        if len < 1e-3 then return v end
+        ox, oz = ox * math.min(len, 1), oz * math.min(len, 1)
         local mx, mz = Pure.moveFromRaw(c, s, ox, oz)
         return Vector3.new(mx, 0, mz)
     end
@@ -918,8 +1059,21 @@ local function stepAssist(myModel)
         return
     end
     local h = tRoot.Position
-    assist.dir = { mx = my.X, mz = my.Z, hx = h.X, hz = h.Z, gx = goal.X, gz = goal.Z,
-        dist = opt('BB_GuardDistance', GAME.AssistDistance), strength = opt('BB_AssistStrength', GAME.AssistStrength) }
+    -- Reaction time: follow where the handler WAS a moment ago (smoothed),
+    -- so you react to moves late like a person instead of mirroring them.
+    local now = os.clock()
+    local dt = assist.seenAt and math.min(now - assist.seenAt, 0.25) or 0
+    assist.seenAt = now
+    if assist.seenTarget ~= target or not assist.hx then
+        assist.seenTarget, assist.hx, assist.hz = target, h.X, h.Z
+    else
+        local a = Pure.smoothAlpha(dt, opt('BB_AssistReactionMs', 220) / 1000)
+        assist.hx = assist.hx + (h.X - assist.hx) * a
+        assist.hz = assist.hz + (h.Z - assist.hz) * a
+    end
+    assist.dir = { mx = my.X, mz = my.Z, hx = assist.hx, hz = assist.hz, gx = goal.X, gz = goal.Z,
+        dist = opt('BB_GuardDistance', GAME.AssistDistance), strength = opt('BB_AssistStrength', 0.22),
+        deadzone = opt('BB_AssistDeadzone', 1.5), smooth = opt('BB_AssistSmooth', 0.15) }
     assist.active = true
 end
 
@@ -979,7 +1133,7 @@ local function stepBlock(myModel, myRoot, now)
     for _, p in ipairs(Players:GetPlayers()) do
         local opp, model = isOpponent(p, myModel)
         local root = opp and rootOfModel(model)
-        if root and attr(model, 'Action') == GAME.ShootingAction then
+        if root and GAME.ShotActions[attr(model, 'Action')] then
             local id = tostring(attr(model, 'ShotStartTime') or model.Name)
             local d = Pure.flatDist(my.X, my.Z, root.Position.X, root.Position.Z)
             if d <= range and not auto.blockedShots[model] then
@@ -1157,8 +1311,9 @@ local function drawDebug()
     local k = shot.key or (m and shotKey(m))
     local st = k and learn[k]
     add('key             : %s', tostring(k))
-    add('target / peak   : %s / %s   peaked %s', st and string.format('%.3f', st.target) or '-', k and peaks[k] and string.format('%.3f', peaks[k]) or '-', tostring(shot.peaked))
-    add('bounds          : early %s  late %s  perfects %d', st and st.early and string.format('%.3f', st.early) or '-', st and st.late and string.format('%.3f', st.late) or '-', st and #st.perfects or 0)
+    add('aim / meter top : %.3f%s / %s   peaked %s', k and aimFor(k) or GAME.DefaultAim, st and '' or ' (default)',
+        peakFor(meterInfo.meterType) and string.format('%.3f', peakFor(meterInfo.meterType)) or '-', tostring(shot.peaked))
+    add('learned shots   : %d (%d perfect) for this animation', st and st.hist and #st.hist or 0, st and st.perfects or 0)
     add('meter (server)  : type %s  green %s', tostring(meterInfo.meterType), tostring(meterInfo.green))
     add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
     add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
@@ -1183,20 +1338,20 @@ end)
 local Shoot = Tab:AddLeftGroupbox('Shooting')
 Shoot:AddToggle('BB_AutoRelease', { Text = 'Auto Release', Default = false })
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Auto Timing (learn from release grades)', Default = true })
-Shoot:AddToggle('BB_PingComp', { Text = 'Ping Compensation', Default = true })
+Shoot:AddToggle('BB_AnyMeter', { Text = 'Any Meter (layups, space shots)', Default = true })
+Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
 Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min = -100, Max = 150, Rounding = 0 })
-Shoot:AddSlider('BB_CalStep', { Text = 'Learning Step (uncalibrated)', Default = 0.03, Min = 0.005, Max = 0.2, Rounding = 3 })
 Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
     local parts = {}
     for k, st in pairs(learn) do
-        parts[#parts + 1] = string.format('%s=%.3f (%d perfect)', k, st.target or -1, st.perfects and #st.perfects or 0)
+        parts[#parts + 1] = string.format('%s=%.3f (%d perfect)', k, st.target or -1, st.perfects or 0)
     end
     table.sort(parts)
     Library:Notify(#parts > 0 and table.concat(parts, '  ') or 'No targets yet: take a few shots with Auto Timing on', 8)
 end })
-Shoot:AddButton({ Text = 'Recalibrate (current shot + meter)', Func = function()
+Shoot:AddButton({ Text = 'Recalibrate (current animation)', Func = function()
     recalibrate(false)
-    Library:Notify('Recalibrating this jumpshot/meter: next shot fires at the top, then it re-learns', 6)
+    Library:Notify('Recalibrating this jumpshot animation: back to the default prefire, then it re-learns', 6)
 end })
 Shoot:AddButton({ Text = 'Recalibrate All', Func = function()
     recalibrate(true)
@@ -1209,7 +1364,7 @@ Shoot:AddButton({ Text = 'Save Last Shot Trace', Func = function()
     local path, err = saveTrace(trace.last or trace.current)
     Library:Notify(path and ('Saved workspace/' .. path) or ('Trace: ' .. tostring(err)), 6)
 end })
-Shoot:AddLabel('Auto Release starts at the top of the meter, then Auto Timing moves it from the game\'s release grades.', true)
+Shoot:AddLabel('Prefires by your ping like a manual player. Works on every meter type; timing is learned per jumpshot/layup animation and saved to YazuDumper/basketball_targets.json, so it carries over between executes.', true)
 if not ShootRemote then Shoot:AddLabel('!! InputService.Shoot remote not found; Auto Release is off', true) end
 if not FeedbackRemote then Shoot:AddLabel('!! InterfaceService.ShowFeedback not found; Auto Timing cannot learn', true) end
 
@@ -1217,7 +1372,10 @@ local Defense = Tab:AddRightGroupbox('Defense')
 Defense:AddToggle('BB_GuardAssist', { Text = 'Guard Assist', Default = false })
 Defense:AddLabel('Assist Key'):AddKeyPicker('BB_GuardKey', { Default = 'None', Text = 'Guard Assist Key', Mode = 'Hold' })
 Defense:AddToggle('BB_AssistOnGameGuard', { Text = 'Also while holding game guard (G)', Default = true })
-Defense:AddSlider('BB_AssistStrength', { Text = 'Assist Strength', Default = GAME.AssistStrength, Min = 0.1, Max = 1, Rounding = 3 })
+Defense:AddSlider('BB_AssistStrength', { Text = 'Assist Strength', Default = 0.22, Min = 0.05, Max = 1, Rounding = 3 })
+Defense:AddSlider('BB_AssistReactionMs', { Text = 'Reaction Delay (ms)', Default = 220, Min = 0, Max = 500, Rounding = 0 })
+Defense:AddSlider('BB_AssistSmooth', { Text = 'Turn Smoothing (s)', Default = 0.15, Min = 0, Max = 0.5, Rounding = 2 })
+Defense:AddSlider('BB_AssistDeadzone', { Text = 'Loose Zone (studs)', Default = 1.5, Min = 0, Max = 4, Rounding = 1 })
 Defense:AddSlider('BB_GuardDistance', { Text = 'Guard Distance (studs)', Default = GAME.AssistDistance, Min = 1.5, Max = 8, Rounding = 2 })
 Defense:AddSlider('BB_AssistRange', { Text = 'Target Range (studs)', Default = 25, Min = 5, Max = 80, Rounding = 0 })
 
