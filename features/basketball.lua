@@ -31,10 +31,54 @@ end
 
 -- Fire the release when progress plus the distance the meter will
 -- travel during `lead` seconds reaches the target.
-function Pure.shouldRelease(progress, rate, lead, target)
+-- halfFrame (seconds, optional): also fire when the target is less than
+-- half a frame away, so the release lands on the nearest frame.
+function Pure.shouldRelease(progress, rate, lead, target, halfFrame)
     if target == nil or progress ~= progress then return false end
-    local ahead = progress + math.max(rate, 0) * math.max(lead, 0)
+    local ahead = progress + math.max(rate, 0) * (math.max(lead, 0) + math.max(halfFrame or 0, 0))
     return ahead >= target
+end
+
+-- Learning per shot key from one graded release at effective progress x.
+--   perfects: last 5 Perfect releases -> target is their mean
+--   early / late: tightest bounds seen on each side -> midpoint
+--   otherwise: step from x by the grade's correction
+-- A new bound drops perfects and bounds that contradict it (network
+-- jitter can grade the same point differently).
+function Pure.learn(st, x, gi, step)
+    st = st or {}
+    local perfects = st.perfects or {}
+    local early, late = st.early, st.late
+    local corr = Pure.gradeCorrection(gi)
+    if gi == 5 then
+        perfects[#perfects + 1] = x
+        while #perfects > 5 do table.remove(perfects, 1) end
+        if early and early >= x then early = nil end
+        if late and late <= x then late = nil end
+    elseif corr ~= 0 then
+        local kept = {}
+        if corr > 0 then
+            early = math.max(early or -math.huge, x)
+            if late and late <= early then late = nil end
+            for _, p in ipairs(perfects) do if p > x then kept[#kept + 1] = p end end
+        else
+            late = math.min(late or math.huge, x)
+            if early and early >= late then early = nil end
+            for _, p in ipairs(perfects) do if p < x then kept[#kept + 1] = p end end
+        end
+        perfects = kept
+    end
+    local target
+    if #perfects > 0 then
+        local sum = 0
+        for _, p in ipairs(perfects) do sum = sum + p end
+        target = sum / #perfects
+    elseif early and late then
+        target = (early + late) / 2
+    else
+        target = x + corr * step
+    end
+    return { target = math.max(0, target), early = early, late = late, perfects = perfects }
 end
 
 -- The meter is a ping-pong: meterOffset rises to a peak and falls back
@@ -123,6 +167,17 @@ function Pure.moveFromRaw(c, s, dx, dz)
     local n = math.sqrt(c * c + s * s)
     if n < 1e-9 then return 0, 0 end
     return (c * dx - s * dz) / n, (s * dx + c * dz) / n
+end
+
+-- "Z, ZX ,c" -> { 'Z', 'ZX', 'C' }; only the keyboard dribble letters
+-- (Z X C V H, Keyboard L39-L61 and L215) are kept.
+function Pure.splitCombos(text)
+    local out = {}
+    for part in tostring(text or ''):gmatch('[^,]+') do
+        local combo = part:upper():gsub('[^ZXCVH]', '')
+        if combo ~= '' and #out < 8 then out[#out + 1] = combo end
+    end
+    return out
 end
 
 -- <<< PURE
@@ -267,9 +322,9 @@ end
 -- ================================================================
 --  AUTO RELEASE + AUTO TIMING
 --  Progress = magnitude of the server-driven meterOffset attribute on
---  your character. Targets are learned per BaseAnimation from the
---  game's own release grades; nothing about the green window is
---  assumed.
+--  your character (meter-type independent; the ping-pong shape was
+--  confirmed from shot traces). Learning is kept per BaseAnimation
+--  AND meter type, from the game's own release grades.
 -- ================================================================
 
 local ShootRemote    = resolve(GAME.ShootRemote)
@@ -280,15 +335,25 @@ local shot = {
     progress = 0, prevProgress = nil, prevAt = nil, rate = nil,
     releasedAt = nil, autoFired = false,
 }
-local targets = {}      -- [BaseAnimation] = effective progress to release at
-local peaks = {}        -- [BaseAnimation] = meterOffset magnitude at the top of the meter
-local lastFeedback = nil -- { grade, contest, key, releasedAt, auto }
+local learn = {}        -- [anim|meter] = { target, early, late, perfects = {...} }
+local peaks = {}        -- [anim|meter] = meterOffset magnitude at the top of the meter
+local lastFeedback = nil
 local contestScale = 1   -- learned: real contest / estimate at release
 local meterInfo = { meterType = nil, green = nil }
-local diag = { fired = 0, lastFire = 'none', lastError = nil, shots = 0 }
+local diag = { fired = 0, lastFire = 'none', lastError = nil, shots = 0, dt = 1 / 60 }
 local trace = { current = nil, last = nil }
 
--- ---------------- learned targets survive rejoins ----------------
+local function shotKey(model)
+    local base = model and attr(model, 'BaseAnimation')
+    return (base and tostring(base) or '?') .. '|' .. tostring(meterInfo.meterType or '?')
+end
+
+local function targetFor(key)
+    local st = learn[key]
+    return st and st.target or nil
+end
+
+-- ---------------- learned state survives rejoins ----------------
 local HttpService = game:GetService('HttpService')
 local TARGETS_FILE = 'YazuDumper/basketball_targets.json'
 
@@ -299,9 +364,13 @@ local function saveTargets()
             makefolder('YazuDumper')
         end
         writefile(TARGETS_FILE, HttpService:JSONEncode({
-            placeVersion = game.PlaceVersion, contestScale = contestScale, targets = targets, peaks = peaks,
+            version = 2, placeVersion = game.PlaceVersion, contestScale = contestScale, learn = learn, peaks = peaks,
         }))
     end)
+end
+
+local function finiteNum(v, lo, hi)
+    return type(v) == 'number' and v == v and v >= lo and v <= hi
 end
 
 local function loadTargets()
@@ -310,21 +379,29 @@ local function loadTargets()
         if not isfile(TARGETS_FILE) then return nil end
         return HttpService:JSONDecode(readfile(TARGETS_FILE))
     end)
-    if not ok or type(data) ~= 'table' then return end
-    if type(data.targets) == 'table' then
-        for k, v in pairs(data.targets) do
-            if type(k) == 'string' and type(v) == 'number' and v == v and v >= 0 and v < 100 then targets[k] = v end
+    if not ok or type(data) ~= 'table' or data.version ~= 2 then return end
+    if type(data.learn) == 'table' then
+        for k, st in pairs(data.learn) do
+            if type(k) == 'string' and type(st) == 'table' then
+                local clean = { perfects = {} }
+                if finiteNum(st.target, 0, 100) then clean.target = st.target end
+                if finiteNum(st.early, 0, 100) then clean.early = st.early end
+                if finiteNum(st.late, 0, 100) then clean.late = st.late end
+                if type(st.perfects) == 'table' then
+                    for _, p in ipairs(st.perfects) do
+                        if finiteNum(p, 0, 100) and #clean.perfects < 5 then clean.perfects[#clean.perfects + 1] = p end
+                    end
+                end
+                learn[k] = clean
+            end
         end
     end
     if type(data.peaks) == 'table' then
         for k, v in pairs(data.peaks) do
-            if type(k) == 'string' and type(v) == 'number' and v == v and v > 0 and v < 100 then peaks[k] = v end
+            if type(k) == 'string' and finiteNum(v, 0.01, 100) then peaks[k] = v end
         end
     end
-    if type(data.contestScale) == 'number' and data.contestScale == data.contestScale
-        and data.contestScale > 0.1 and data.contestScale < 10 then
-        contestScale = data.contestScale
-    end
+    if finiteNum(data.contestScale, 0.1, 10) then contestScale = data.contestScale end
 end
 loadTargets()
 
@@ -342,7 +419,7 @@ local function traceText(t)
     local out = {
         '-- Yazu basketball shot trace',
         'placeId=' .. tostring(game.PlaceId) .. ' placeVersion=' .. tostring(game.PlaceVersion),
-        'key(BaseAnimation)=' .. tostring(t.key) .. ' target=' .. tostring(t.target)
+        'key=' .. tostring(t.key) .. ' target=' .. tostring(t.target)
             .. ' meterType=' .. tostring(t.meterType) .. ' green=' .. tostring(t.green),
         'autoRelease=' .. tostring(t.auto) .. ' ping=' .. string.format('%.3f', t.ping or 0),
         '',
@@ -366,7 +443,7 @@ local function saveTrace(t)
     local text = traceText(t)
     if not text then return nil, 'no shot recorded yet' end
     if type(writefile) ~= 'function' then return nil, 'writefile missing' end
-    local path = 'YazuDumper/bb_shot_' .. tostring(os.time()) .. '.txt'
+    local path = 'YazuDumper/bb_shot_' .. tostring(os.time()) .. '_' .. tostring(diag.shots) .. '.txt'
     local ok, err = pcall(function()
         if type(isfolder) == 'function' and type(makefolder) == 'function' and not isfolder('YazuDumper') then
             makefolder('YazuDumper')
@@ -407,19 +484,19 @@ if FeedbackRemote then
         local myModel = modelOf(LocalPlayer)
         if not myModel or model ~= myModel then return end
         local gi = tonumber(grade)
-        local key = shot.key or (attr(myModel, 'BaseAnimation') and tostring(attr(myModel, 'BaseAnimation'))) or '?'
+        local key = shot.key or shotKey(myModel)
         lastFeedback = {
             grade = gi and Pure.GRADES[gi] or tostring(grade),
             contest = tonumber(contest), key = key,
             releasedAt = shot.releasedAt, auto = shot.autoFired,
         }
         if on('BB_AutoTiming') and gi then
-            -- After an auto release, correct the point we fired at (the server's
-            -- released value already includes network delay and would creep later
-            -- every shot). After a manual shot, start from where the server saw it.
-            local base = shot.autoFired and shot.firedAt or shot.releasedAt
-            if base then
-                targets[key] = Pure.nextTarget(base, gi, opt('BB_CalStep', 0.03))
+            -- After an auto release, learn from the point we aimed at (the server's
+            -- released value includes network delay). After a manual shot, from
+            -- where the server saw the release.
+            local x = shot.autoFired and shot.firedAt or shot.releasedAt
+            if x then
+                learn[key] = Pure.learn(learn[key], x, gi, opt('BB_CalStep', 0.03))
             end
         end
         local real = tonumber(contest)
@@ -427,8 +504,10 @@ if FeedbackRemote then
             local ratio = math.clamp((real / 100) / shot.estAtRelease, 0.2, 5)
             contestScale = contestScale + (ratio - contestScale) * 0.3
         end
+        local st = learn[key]
         traceEvent('feedback', { grade = lastFeedback.grade, contest = real, estimateAtRelease = shot.estAtRelease,
-            newTarget = targets[key], contestScale = contestScale })
+            newTarget = st and st.target, early = st and st.early, late = st and st.late,
+            perfects = st and #st.perfects, contestScale = contestScale })
         saveTargets()
         if on('BB_AutoSaveTrace') then
             local path = saveTrace(trace.current or trace.last)
@@ -438,7 +517,7 @@ if FeedbackRemote then
 end
 
 -- MeterService (Controllers.Meter L54-L98): which meter and green window the
--- server registered for your character. Recorded for the trace.
+-- server registered for your character.
 do
     local svc = resolve({ 'ReplicatedStorage', 'Aero', 'AeroRemoteServices', 'MeterService' })
     local reg = svc and svc:FindFirstChild('RegisterPacket')
@@ -447,6 +526,11 @@ do
         connect(reg.OnClientEvent, function(model, meterType, green)
             if model == modelOf(LocalPlayer) then
                 meterInfo.meterType, meterInfo.green = meterType, green
+                -- The packet can land just after the shot starts: re-key before any release.
+                if shot.active and not shot.autoFired and not shot.released then
+                    shot.key = shotKey(model)
+                    if trace.current then trace.current.key, trace.current.meterType = shot.key, meterType end
+                end
                 traceEvent('registerPacket', { meterType = meterType, green = green })
             end
         end)
@@ -470,10 +554,9 @@ local function stepShot(myModel)
         resetShot()
         shot.active = true
         diag.shots = diag.shots + 1
-        local base = attr(myModel, 'BaseAnimation')
-        shot.key = base and tostring(base) or '?'
+        shot.key = shotKey(myModel)
         trace.current = {
-            startedAt = os.clock(), key = shot.key, target = targets[shot.key],
+            startedAt = os.clock(), key = shot.key, target = targetFor(shot.key),
             meterType = meterInfo.meterType, green = meterInfo.green,
             auto = on('BB_AutoRelease'), ping = oneWayPing() * 2, samples = {}, events = {},
         }
@@ -524,13 +607,15 @@ local function stepShot(myModel)
     if shot.released or shot.autoFired or not on('BB_AutoRelease') then return end
     -- Goal: the learned target; before any learning, the top of the meter
     -- (learned peak, or the moment the meter turns if no peak is known yet).
-    local target = targets[shot.key] or peaks[shot.key]
+    local target = targetFor(shot.key) or peaks[shot.key]
     local lead = on('BB_PingComp') and oneWayPing() / 2 or 0
     lead = lead + opt('BB_ExtraLeadMs', 0) / 1000
     local eff = Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked)
+    local rate = math.abs(shot.rate or 0)
     local fire
     if target then
-        fire = Pure.shouldRelease(eff, math.abs(shot.rate or 0), lead, target)
+        -- Fire on whichever frame lands closest to the target, not the first frame past it.
+        fire = Pure.shouldRelease(eff, rate, lead, target, diag.dt / 2)
     else
         fire = shot.peaked
     end
@@ -543,6 +628,38 @@ local function stepShot(myModel)
             target and string.format('%.3f', target) or 'peak', math.floor(lead * 1000))
         traceEvent('autoRelease', { ok = ok, progress = shot.progress, effective = eff, rate = shot.rate, lead = lead, goal = target or 'peak' })
     end
+end
+
+-- React the moment the server changes the meter instead of waiting for the next Heartbeat.
+local meterHook = { model = nil, conn = nil }
+local function hookMeter(myModel)
+    if meterHook.model == myModel then return end
+    if meterHook.conn then meterHook.conn:Disconnect() end
+    meterHook.model, meterHook.conn = myModel, nil
+    if myModel then
+        local ok, sig = pcall(myModel.GetAttributeChangedSignal, myModel, 'meterOffset')
+        if ok and sig then
+            meterHook.conn = sig:Connect(function()
+                local okS, err = pcall(stepShot, myModel)
+                if not okS then diag.lastError = 'shot: ' .. tostring(err) end
+            end)
+        end
+    end
+end
+onCleanup(function() if meterHook.conn then meterHook.conn:Disconnect() end end)
+
+local function recalibrate(all)
+    if all then
+        learn, peaks = {}, {}
+    else
+        local key = shot.key or (lastFeedback and lastFeedback.key)
+        if not key then
+            local m = modelOf(LocalPlayer)
+            key = m and shotKey(m)
+        end
+        if key then learn[key], peaks[key] = nil, nil end
+    end
+    saveTargets()
 end
 
 -- ================================================================
@@ -662,8 +779,8 @@ local function drawMeter(myModel)
     else
         meter.live.Text = 'OPEN'
     end
-    local base = attr(myModel, 'BaseAnimation')
-    if on('BB_AutoRelease') and base and targets[tostring(base)] == nil and peaks[tostring(base)] == nil then
+    local key = shotKey(myModel)
+    if on('BB_AutoRelease') and targetFor(key) == nil and peaks[key] == nil then
         meter.last.Text = 'auto release: first shot fires at the top of the meter'
     elseif lastFeedback then
         meter.last.Text = string.format('last shot: %s%% contested, %s%s', lastFeedback.contest and tostring(math.floor(lastFeedback.contest + 0.5)) or '?',
@@ -807,11 +924,159 @@ local function stepAssist(myModel)
 end
 
 -- ================================================================
+--  DEFENSE / BALL AUTOMATION
+--  Steal, block and rebound are decided by the server from its own
+--  positions: the client only sends "pressed steal" / "jumped"
+--  (InputService.Steal:FireServer() with no arguments, InputService.Jump,
+--  Modules.Components.Input.Keyboard L231-L254). These features choose
+--  WHEN to press; they cannot change reach or hitboxes.
+-- ================================================================
+
+local StealRemote   = resolve({ 'ReplicatedStorage', 'Aero', 'AeroRemoteServices', 'InputService', 'Steal' })
+local JumpRemote    = resolve({ 'ReplicatedStorage', 'Aero', 'AeroRemoteServices', 'InputService', 'Jump' })
+local DribbleRemote = resolve({ 'ReplicatedStorage', 'Aero', 'AeroRemoteServices', 'InputService', 'Dribble' })
+
+local auto = { lastSteal = 0, lastJump = 0, blockedShots = {}, balls = {}, dribbleBusy = false, dribbleKeyWas = false }
+
+-- Same packets the keyboard sends for the Jump bind: Shoot{Shoot=true,
+-- Input='E', UseSpace=true} + Jump on press, Shoot{Shoot=false} on release.
+local function jumpPress(hold)
+    if not JumpRemote or not ShootRemote then return false end
+    pcall(function() ShootRemote:FireServer({ Shoot = true, Input = 'E', UseSpace = true }) end)
+    pcall(function() JumpRemote:FireServer() end)
+    task.delay(hold, function()
+        pcall(function() ShootRemote:FireServer({ Shoot = false }) end)
+    end)
+    return true
+end
+
+local function stepSteal(myModel, myRoot, now)
+    if not (on('BB_AutoSteal') and StealRemote and windowFocused) then return end
+    if attr(myModel, 'Basketball') then return end
+    if now - auto.lastSteal < opt('BB_StealCooldown', 0.8) then return end
+    local range = opt('BB_StealRange', 5)
+    local my = myRoot.Position
+    for _, p in ipairs(Players:GetPlayers()) do
+        local opp, model = isOpponent(p, myModel)
+        local root = opp and rootOfModel(model)
+        if root and attr(model, 'Basketball') then
+            local d = Pure.flatDist(my.X, my.Z, root.Position.X, root.Position.Z)
+            local okAction = not on('BB_StealOnlyDribble') or attr(model, 'Action') == 'Dribbling'
+            if d <= range and okAction then
+                pcall(function() StealRemote:FireServer() end)
+                auto.lastSteal = now
+                return
+            end
+        end
+    end
+end
+
+local function stepBlock(myModel, myRoot, now)
+    if not (on('BB_AutoBlock') and windowFocused) then return end
+    if attr(myModel, 'Basketball') or now - auto.lastJump < 0.9 then return end
+    local range = opt('BB_BlockRange', 7)
+    local my = myRoot.Position
+    for _, p in ipairs(Players:GetPlayers()) do
+        local opp, model = isOpponent(p, myModel)
+        local root = opp and rootOfModel(model)
+        if root and attr(model, 'Action') == GAME.ShootingAction then
+            local id = tostring(attr(model, 'ShotStartTime') or model.Name)
+            local d = Pure.flatDist(my.X, my.Z, root.Position.X, root.Position.Z)
+            if d <= range and not auto.blockedShots[model] then
+                auto.blockedShots[model] = id
+                auto.lastJump = now
+                task.delay(opt('BB_BlockDelayMs', 0) / 1000, function() jumpPress(0.25) end)
+                return
+            end
+        elseif auto.blockedShots[model] then
+            auto.blockedShots[model] = nil
+        end
+    end
+end
+
+local function stepRebound(myModel, myRoot, now)
+    local folder = workspace:FindFirstChild('Basketballs')
+    if not folder then return end
+    local my = myRoot.Position
+    local range = opt('BB_ReboundRange', 8)
+    for ball, _ in pairs(auto.balls) do
+        if ball.Parent ~= folder then auto.balls[ball] = nil end
+    end
+    for _, ball in ipairs(folder:GetChildren()) do
+        if ball:IsA('BasePart') and finiteVec(ball.Position) then
+            local rec = auto.balls[ball]
+            local pos = ball.Position
+            if rec and now > rec.t then
+                rec.vy = (pos.Y - rec.y) / (now - rec.t)
+            end
+            if not rec then
+                rec = {}
+                auto.balls[ball] = rec
+            end
+            rec.y, rec.t, rec.pos = pos.Y, now, pos
+            if on('BB_AutoRebound') and windowFocused and not attr(myModel, 'Basketball') and now - auto.lastJump > 1.0 then
+                local dh = Pure.flatDist(my.X, my.Z, pos.X, pos.Z)
+                local above = pos.Y - my.Y
+                if dh <= range and rec.vy and rec.vy < -2 and above > 2 and above < opt('BB_ReboundHeight', 10) then
+                    auto.lastJump = now
+                    jumpPress(0.2)
+                    return
+                end
+            end
+        end
+    end
+end
+
+-- Dribble macro: sends the combo strings the keyboard would send
+-- (Dribble:FireServer(combo, sprinting, lastMoveDirection), Keyboard L39-L61),
+-- one after another. Which move a combo makes is decided by the server
+-- from your own bindings/packages, so type the combos you use in game.
+local function currentMoveDir()
+    local controls = assist.controls or getControls()
+    if type(controls) ~= 'table' then return Vector3.zero end
+    local ok, v = pcall(function() return controls:GetMoveVector() end)
+    local c, s = cameraBasis()
+    if not ok or typeof(v) ~= 'Vector3' or not c then return Vector3.zero end
+    local wx, wz = Pure.rawFromMove(c, s, v.X, v.Z)
+    local ux, uz = Pure.unit(wx, wz)
+    return Vector3.new(ux, 0, uz)
+end
+
+local function runDribbleMacro()
+    if auto.dribbleBusy or not DribbleRemote then return end
+    local combos = Pure.splitCombos(opt('BB_DribbleCombo', ''))
+    if #combos == 0 then return end
+    auto.dribbleBusy = true
+    task.spawn(function()
+        for i, combo in ipairs(combos) do
+            if not windowFocused then break end
+            pcall(function() DribbleRemote:FireServer(combo, on('BB_DribbleSprint'), currentMoveDir()) end)
+            if i < #combos then task.wait(opt('BB_DribbleDelay', 0.35)) end
+        end
+        auto.dribbleBusy = false
+    end)
+end
+
+local function stepAuto(myModel)
+    local myRoot = rootOfModel(myModel)
+    if not myRoot then return end
+    local now = os.clock()
+    stepSteal(myModel, myRoot, now)
+    stepBlock(myModel, myRoot, now)
+    stepRebound(myModel, myRoot, now)
+    local held = keyHeld('BB_DribbleKey')
+    if held and not auto.dribbleKeyWas then runDribbleMacro() end
+    auto.dribbleKeyWas = held
+end
+
+-- ================================================================
 --  MAIN LOOP
 -- ================================================================
 
-connect(RunService.Heartbeat, function()
+connect(RunService.Heartbeat, function(dt)
+    if type(dt) == 'number' and dt > 0 and dt < 0.5 then diag.dt = diag.dt + (dt - diag.dt) * 0.1 end
     local myModel = modelOf(LocalPlayer)
+    hookMeter(myModel)
     if not myModel then
         if shot.active then resetShot() end
         assist.active, assist.dir = false, nil
@@ -821,6 +1086,8 @@ connect(RunService.Heartbeat, function()
     if not ok then diag.lastError = 'shot: ' .. tostring(err) end
     local okA, errA = pcall(stepAssist, myModel)
     if not okA then diag.lastError = 'assist: ' .. tostring(errA) end
+    local okX, errX = pcall(stepAuto, myModel)
+    if not okX then diag.lastError = 'auto: ' .. tostring(errX) end
 end)
 
 local lastDraw = 0
@@ -887,7 +1154,11 @@ local function drawDebug()
         add('BaseAnimation   : %s', tostring(attr(m, 'BaseAnimation')))
     end
     add('shot active     : %s  progress %.4f  rate %.3f/s', tostring(shot.active), shot.progress or 0, shot.rate or 0)
-    add('target / peak   : %s / %s   peaked %s', shot.key and tostring(targets[shot.key]) or '-', shot.key and tostring(peaks[shot.key]) or '-', tostring(shot.peaked))
+    local k = shot.key or (m and shotKey(m))
+    local st = k and learn[k]
+    add('key             : %s', tostring(k))
+    add('target / peak   : %s / %s   peaked %s', st and string.format('%.3f', st.target) or '-', k and peaks[k] and string.format('%.3f', peaks[k]) or '-', tostring(shot.peaked))
+    add('bounds          : early %s  late %s  perfects %d', st and st.early and string.format('%.3f', st.early) or '-', st and st.late and string.format('%.3f', st.late) or '-', st and #st.perfects or 0)
     add('meter (server)  : type %s  green %s', tostring(meterInfo.meterType), tostring(meterInfo.green))
     add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
     add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
@@ -917,15 +1188,19 @@ Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min =
 Shoot:AddSlider('BB_CalStep', { Text = 'Learning Step (uncalibrated)', Default = 0.03, Min = 0.005, Max = 0.2, Rounding = 3 })
 Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
     local parts = {}
-    for k, v in pairs(targets) do parts[#parts + 1] = string.format('%s=%.3f', k, v) end
+    for k, st in pairs(learn) do
+        parts[#parts + 1] = string.format('%s=%.3f (%d perfect)', k, st.target or -1, st.perfects and #st.perfects or 0)
+    end
     table.sort(parts)
     Library:Notify(#parts > 0 and table.concat(parts, '  ') or 'No targets yet: take a few shots with Auto Timing on', 8)
 end })
-Shoot:AddButton({ Text = 'Reset Learned Targets', Func = function()
-    targets = {}
-    peaks = {}
-    saveTargets()
-    Library:Notify('Learned targets cleared')
+Shoot:AddButton({ Text = 'Recalibrate (current shot + meter)', Func = function()
+    recalibrate(false)
+    Library:Notify('Recalibrating this jumpshot/meter: next shot fires at the top, then it re-learns', 6)
+end })
+Shoot:AddButton({ Text = 'Recalibrate All', Func = function()
+    recalibrate(true)
+    Library:Notify('All learned release points cleared')
 end })
 Shoot:AddDivider()
 Shoot:AddToggle('BB_Debug', { Text = 'Debug Panel', Default = false })
@@ -950,5 +1225,25 @@ local Info = Tab:AddRightGroupbox('Contest')
 Info:AddToggle('BB_ContestMeter', { Text = 'Contest Meter', Default = false })
 Info:AddSlider('BB_ContestRange', { Text = 'Estimate Range (studs)', Default = GAME.GuardReactRange, Min = 4, Max = 30, Rounding = 0 })
 Info:AddLabel('Top line is an estimate; "last shot" is the game\'s real contest % and grade.', true)
+
+local Ball = Tab:AddLeftGroupbox('Ball / Defense Automation')
+Ball:AddLabel('Server decides steals, blocks and rebounds; these only time the button press.', true)
+Ball:AddToggle('BB_AutoSteal', { Text = 'Auto Steal', Default = false })
+Ball:AddToggle('BB_StealOnlyDribble', { Text = 'Only during their dribble moves', Default = false })
+Ball:AddSlider('BB_StealRange', { Text = 'Steal Range (studs, uncalibrated)', Default = 5, Min = 2, Max = 12, Rounding = 1 })
+Ball:AddSlider('BB_StealCooldown', { Text = 'Steal Cooldown (s)', Default = 0.8, Min = 0.2, Max = 3, Rounding = 2 })
+Ball:AddDivider()
+Ball:AddToggle('BB_AutoBlock', { Text = 'Auto Block (jump on nearby shot)', Default = false })
+Ball:AddSlider('BB_BlockRange', { Text = 'Block Range (studs)', Default = 7, Min = 2, Max = 15, Rounding = 1 })
+Ball:AddSlider('BB_BlockDelayMs', { Text = 'Block Delay (ms)', Default = 0, Min = 0, Max = 500, Rounding = 0 })
+Ball:AddDivider()
+Ball:AddToggle('BB_AutoRebound', { Text = 'Auto Rebound (jump at falling ball)', Default = false })
+Ball:AddSlider('BB_ReboundRange', { Text = 'Rebound Range (studs)', Default = 8, Min = 2, Max = 20, Rounding = 1 })
+Ball:AddSlider('BB_ReboundHeight', { Text = 'Max Ball Height Above You', Default = 10, Min = 3, Max = 25, Rounding = 1 })
+Ball:AddDivider()
+Ball:AddInput('BB_DribbleCombo', { Default = 'Z,X', Text = 'Dribble Macro (combos, comma separated)', Placeholder = 'e.g. Z,ZX,C', Finished = true })
+Ball:AddSlider('BB_DribbleDelay', { Text = 'Delay Between Moves (s)', Default = 0.35, Min = 0.05, Max = 1.5, Rounding = 2 })
+Ball:AddToggle('BB_DribbleSprint', { Text = 'Send as Sprinting', Default = false })
+Ball:AddLabel('Dribble Macro Key'):AddKeyPicker('BB_DribbleKey', { Default = 'None', Text = 'Dribble Macro', Mode = 'Hold' })
 
 end -- return function
