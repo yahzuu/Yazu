@@ -309,6 +309,8 @@ local GAME = {
     -- Grade bands around the best point, in server-progress units, from the
     -- same traces: Perfects spread over ~0.04, Goods reached ~0.06 out.
     PerfectHalfWidth = 0.02, GoodHalfWidth = 0.06,
+    -- Releases measured outside this range are not learned from.
+    LearnMin = 0.75, LearnMax = 1.35,
     -- Normalised meter speed was 2.15 .. 2.7 tops/s in every trace; outside
     -- this a frame hitch spoiled the measurement and 2.5 is used.
     RateMin = 1.5, RateMax = 4, RateFallback = 2.5,
@@ -458,13 +460,22 @@ local function shotKey(model)
     return base and tostring(base) or '?'
 end
 
-local function targetFor(key)
+local function aimFor(key)
     local st = learn[key]
-    return st and st.target or nil
+    if on('BB_PerfectOnly') then return st and st.targetPerf or GAME.DefaultAim end
+    return st and st.target or GAME.DefaultAim
 end
 
-local function aimFor(key)
-    return targetFor(key) or GAME.DefaultAim
+-- Recompute both aims from the history: all grades, and Perfects only.
+local function refit(st)
+    st.perfects = 0
+    local perf = {}
+    for _, h in ipairs(st.hist) do
+        if h.g == 5 then st.perfects = st.perfects + 1; perf[#perf + 1] = h end
+    end
+    st.target = Pure.fitCenter(st.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth, nil, nil, GAME.DefaultAim)
+    st.targetPerf = Pure.fitCenter(perf, GAME.PerfectHalfWidth, GAME.GoodHalfWidth, nil, nil, GAME.DefaultAim)
+    return st
 end
 
 local function peakFor(meterType)
@@ -505,20 +516,18 @@ local function loadTargets()
                 local clean = { hist = {}, perfects = 0 }
                 if type(st.hist) == 'table' then
                     for _, h in ipairs(st.hist) do
-                        if type(h) == 'table' and finiteNum(h.x, 0, 3) and finiteNum(h.g, 1, 8) and #clean.hist < 15 then
+                        if type(h) == 'table' and finiteNum(h.x, GAME.LearnMin, GAME.LearnMax) and finiteNum(h.g, 1, 8) and #clean.hist < 15 then
                             clean.hist[#clean.hist + 1] = { x = h.x, g = math.floor(h.g) }
-                            if h.g == 5 then clean.perfects = clean.perfects + 1 end
                         end
                     end
                 end
-                clean.target = Pure.fitCenter(clean.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth, nil, nil, GAME.DefaultAim)
-                if clean.target then learn[k] = clean end
+                if #clean.hist > 0 then learn[k] = refit(clean) end
             end
         end
     end
     if type(data.peaks) == 'table' then
         for k, v in pairs(data.peaks) do
-            if type(k) == 'string' and finiteNum(v, 0.01, 100) then peaks[k] = v end
+            if type(k) == 'string' and not GAME.MeterPeaks[k] and finiteNum(v, 0.01, 100) then peaks[k] = v end
         end
     end
     if finiteNum(data.contestScale, 0.1, 10) then contestScale = data.contestScale end
@@ -617,12 +626,13 @@ if FeedbackRemote then
             -- ours (auto) or yours (the moment you let go of the shoot key).
             local st = learn[key] or { hist = {} }
             st.hist = st.hist or {}
-            st.hist[#st.hist + 1] = { x = learnX, g = gi }
-            while #st.hist > 15 do table.remove(st.hist, 1) end
-            st.target = Pure.fitCenter(st.hist, GAME.PerfectHalfWidth, GAME.GoodHalfWidth, nil, nil, GAME.DefaultAim)
-            st.perfects = 0
-            for _, h in ipairs(st.hist) do if h.g == 5 then st.perfects = st.perfects + 1 end end
-            learn[key] = st
+            -- Far outside any sweet spot = a mis-measured release (frame hitch,
+            -- meter reset): not learned.
+            if learnX >= GAME.LearnMin and learnX <= GAME.LearnMax then
+                st.hist[#st.hist + 1] = { x = learnX, g = gi }
+                while #st.hist > 15 do table.remove(st.hist, 1) end
+                learn[key] = refit(st)
+            end
         end
         local real = tonumber(contest)
         if real and shot.estAtRelease and shot.estAtRelease > 0.05 then
@@ -729,10 +739,14 @@ local function stepShot(myModel)
         shot.progress = p
         if p > shot.maxProgress then
             shot.maxProgress = p
-        elseif not shot.peaked and shot.maxProgress - p > 0.02 then
+        elseif not shot.peaked and shot.maxProgress - p > 0.02 and p >= shot.maxProgress * 0.5 then
+            -- A real turn at the top (a jump back toward 0 is the meter
+            -- resetting/hiding, not a peak, and is ignored).
             shot.peaked = true
             local mt = meterInfo.meterType
-            if mt then
+            -- Known meters keep their measured size (learning it from shots
+            -- that end early shrank Vertical to 1.10 in a user save file).
+            if mt and not GAME.MeterPeaks[mt] then
                 local old = peakFor(mt)
                 peaks[mt] = old and (old * 0.8 + shot.maxProgress * 0.2) or shot.maxProgress
             end
@@ -1384,6 +1398,7 @@ end)
 local Shoot = Tab:AddLeftGroupbox('Shooting')
 Shoot:AddToggle('BB_AutoRelease', { Text = 'Auto Release', Default = false })
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Auto Timing (learn from release grades)', Default = true })
+Shoot:AddToggle('BB_PerfectOnly', { Text = 'Train On Perfects Only', Default = true })
 Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = true })
 Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups (makes jellies)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
@@ -1392,7 +1407,7 @@ Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min =
 Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
     local parts = {}
     for k, st in pairs(learn) do
-        parts[#parts + 1] = string.format('%s=%.3f (%d perfect)', k, st.target or -1, st.perfects or 0)
+        parts[#parts + 1] = string.format('%s=%.3f (%d perfect)', k, aimFor(k), st.perfects or 0)
     end
     table.sort(parts)
     Library:Notify(#parts > 0 and table.concat(parts, '  ') or 'No targets yet: take a few shots with Auto Timing on', 8)
