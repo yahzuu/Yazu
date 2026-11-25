@@ -596,7 +596,7 @@ local function resetShot()
     shot.active, shot.released, shot.key = false, false, nil
     shot.progress, shot.prevProgress, shot.prevAt, shot.rate = 0, nil, nil, nil
     shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt, shot.fireMode = nil, false, nil, nil, nil
-    shot.manualAt = nil
+    shot.manualAt, shot.jelly = nil, nil
     shot.maxProgress, shot.peaked = 0, false
 end
 
@@ -688,16 +688,12 @@ local readContest -- defined in the contest section
 
 local meterWatch = { last = nil }
 local spaceKey = { down = false, at = -1 } -- Space Maker: see the input hooks below
--- Jelly finish: matched by animation name. The game's client code has no
--- "jelly" label, so the names are a setting (default is a guess: the
--- inside-hand finishes InsideHandLayup1L/R seen in your save file).
-local function isJellyShot(base)
-    local b = tostring(base or ''):lower()
-    for part in tostring(opt('BB_JellyAnims', 'InsideHand')):gmatch('[^,]+') do
-        local pat = part:gsub('^%s+', ''):gsub('%s+$', ''):lower()
-        if pat ~= '' and b:find(pat, 1, true) then return true end
-    end
-    return false
+-- Jelly: pressing shoot a second time (the game turns two quick taps into
+-- Input "EE", Input.Keyboard AddToTap L70-L100). A second E press inside
+-- the tap window, or any E press during a shot, marks a jelly.
+local jellyTap = { lastE = -1, at = -1 }
+local function isJellyShot()
+    return shot.jelly == true or os.clock() - jellyTap.at < 0.8
 end
 -- Where the server's meter is (in "of the top" units) if a release left now.
 serverProgressNow = function(peak)
@@ -793,7 +789,7 @@ local function stepShot(myModel)
     -- Releasing during a layup turns it into a jelly: layups only when asked.
     local base = attr(myModel, 'BaseAnimation')
     if isLayupShot(shot.action, base) then
-        if isJellyShot(base) then
+        if isJellyShot() then
             if not on('BB_AutoJelly') then return end
         elseif not on('BB_AutoLayup') then
             return
@@ -858,6 +854,14 @@ local MANUAL_KEYS = { E = true, Space = true, ButtonX = true, ButtonA = true }
 connect(UserInputService.InputBegan, function(input)
     local name = input and input.KeyCode and input.KeyCode.Name
     if name == 'Space' or name == 'ButtonA' then spaceKey.down, spaceKey.at = true, os.clock() end
+    if name == 'E' or name == 'ButtonX' then
+        local now = os.clock()
+        if shot.active or now - jellyTap.lastE < 0.45 then
+            jellyTap.at = now
+            if shot.active then shot.jelly = true end
+        end
+        jellyTap.lastE = now
+    end
 end)
 connect(UserInputService.InputEnded, function(input)
     local name = input and input.KeyCode and input.KeyCode.Name
@@ -1435,9 +1439,8 @@ Shoot:AddToggle('BB_SpaceSkip', { Text = 'Let Me Space Make (no auto release aft
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Per-Animation Learning (optional)', Default = false })
 Shoot:AddToggle('BB_PerfectOnly', { Text = 'Train On Perfects Only', Default = true })
 Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = false })
-Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = true })
-Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies', Default = false })
-Shoot:AddInput('BB_JellyAnims', { Default = 'InsideHand', Text = 'Jelly animations (comma separated)', Placeholder = 'e.g. InsideHand,Reverse', Finished = true })
+Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = false })
+Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies (double-tap shoot)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
 Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min = -100, Max = 150, Rounding = 0 })
