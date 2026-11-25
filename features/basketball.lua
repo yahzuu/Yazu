@@ -1515,7 +1515,7 @@ Shoot:AddToggle('BB_SpaceSkip', { Text = 'Let Me Space Make (no auto release aft
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Per-Animation Learning (optional)', Default = false })
 Shoot:AddToggle('BB_PerfectOnly', { Text = 'Train On Perfects Only', Default = true })
 Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = false })
-Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = false })
+Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = true })
 Shoot:AddToggle('BB_DropDupe', { Text = 'Drop My Extra Release (stops auto-layup jellies)', Default = true })
 Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies (double-tap shoot)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
