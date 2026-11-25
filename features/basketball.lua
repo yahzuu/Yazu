@@ -995,42 +995,45 @@ local function buildMeter()
     parent = parent or LocalPlayer:FindFirstChildOfClass('PlayerGui')
     if not parent then return end
 
-    local gui = Instance.new('ScreenGui')
+    -- Small billboard above your head (only you see it: it is created on
+    -- your client).
+    local gui = Instance.new('BillboardGui')
     gui.Name = 'YazuContestMeter'
     gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 1000
+    gui.AlwaysOnTop = true
+    gui.LightInfluence = 0
+    gui.Size = UDim2.fromOffset(130, 38)
+    gui.StudsOffset = Vector3.new(0, 3.4, 0)
+    gui.MaxDistance = 200
 
     local frame = Instance.new('Frame')
-    frame.AnchorPoint = Vector2.new(0.5, 1)
-    frame.Position = UDim2.new(0.5, 0, 1, -140)
-    frame.Size = UDim2.fromOffset(300, 52)
+    frame.Size = UDim2.fromScale(1, 1)
     frame.BackgroundColor3 = Color3.fromRGB(18, 18, 24)
-    frame.BackgroundTransparency = 0.15
+    frame.BackgroundTransparency = 0.25
     frame.BorderSizePixel = 0
     frame.Parent = gui
-    local c1 = Instance.new('UICorner'); c1.CornerRadius = UDim.new(0, 8); c1.Parent = frame
+    local c1 = Instance.new('UICorner'); c1.CornerRadius = UDim.new(0, 6); c1.Parent = frame
 
-    local function text(y, size, color)
+    local function text(y, h, size, color)
         local t = Instance.new('TextLabel')
         t.BackgroundTransparency = 1
-        t.Position = UDim2.fromOffset(8, y)
-        t.Size = UDim2.new(1, -16, 0, 16)
-        t.Font = Enum.Font.GothamMedium
+        t.Position = UDim2.fromOffset(4, y)
+        t.Size = UDim2.new(1, -8, 0, h)
+        t.Font = Enum.Font.GothamBold
         t.TextSize = size
         t.TextColor3 = color
-        t.TextXAlignment = Enum.TextXAlignment.Left
+        t.TextXAlignment = Enum.TextXAlignment.Center
         t.TextTruncate = Enum.TextTruncate.AtEnd
         t.Text = ''
         t.Parent = frame
         return t
     end
-    local live = text(3, 13, Color3.fromRGB(235, 235, 245))
-    local last = text(34, 12, Color3.fromRGB(160, 160, 180))
+    local live = text(2, 14, 12, Color3.fromRGB(240, 240, 248))
+    local last = text(24, 12, 10, Color3.fromRGB(170, 170, 190))
 
     local barBg = Instance.new('Frame')
-    barBg.Position = UDim2.fromOffset(8, 22)
-    barBg.Size = UDim2.new(1, -16, 0, 6)
+    barBg.Position = UDim2.fromOffset(6, 17)
+    barBg.Size = UDim2.new(1, -12, 0, 5)
     barBg.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
     barBg.BorderSizePixel = 0
     barBg.Parent = frame
@@ -1097,23 +1100,25 @@ local function drawMeter(myModel)
     end
     buildMeter()
     if not meter.gui then return end
-    meter.gui.Enabled = true
+    local root = rootOfModel(myModel)
+    if meter.gui.Adornee ~= root then meter.gui.Adornee = root end
+    meter.gui.Enabled = root ~= nil
     local rawScore, who, dist = readContest(myModel)
     local score = math.clamp(rawScore * contestScale, 0, 1)
     meter.fill.Size = UDim2.fromScale(score, 1)
     meter.fill.BackgroundColor3 = score < 0.34 and GREEN or (score < 0.67 and YELLOW or RED)
     if who then
-        meter.live.Text = string.format('EST. CONTEST %d%%  %s  %.1f studs  (x%.2f)', math.floor(score * 100 + 0.5), who.DisplayName, dist, contestScale)
+        meter.live.Text = string.format('%d%% %s', math.floor(score * 100 + 0.5), who.DisplayName)
     else
         meter.live.Text = 'OPEN'
     end
     if on('BB_AutoRelease') and peakFor(meterInfo.meterType) == nil and meterInfo.meterType ~= nil then
-        meter.last.Text = 'auto release: new meter type, first shot fires at the top'
+        meter.last.Text = 'new meter: top release'
     elseif lastFeedback then
-        meter.last.Text = string.format('last shot: %s%% contested, %s%s', lastFeedback.contest and tostring(math.floor(lastFeedback.contest + 0.5)) or '?',
-            tostring(lastFeedback.grade), lastFeedback.auto and ' (auto)' or '')
+        meter.last.Text = string.format('last: %s%% %s%s', lastFeedback.contest and tostring(math.floor(lastFeedback.contest + 0.5)) or '?',
+            tostring(lastFeedback.grade), '')
     else
-        meter.last.Text = 'last shot: none yet'
+        meter.last.Text = string.format('%.1f studs', dist or 0)
     end
 end
 
