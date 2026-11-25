@@ -656,6 +656,14 @@ end
 local readContest -- defined in the contest section
 
 local meterWatch = { last = nil }
+-- Layup-type shot: a layup action, or a "Shooting" action whose animation
+-- is a layup/floater (animation names from the dump: Layup1R, ReverseLayup1L,
+-- ClutchLayup1Front, Floater...).
+local function isLayupShot(action, base)
+    if action ~= GAME.ShootingAction then return true end
+    local b = tostring(base or ''):lower()
+    return b:find('layup', 1, true) ~= nil or b:find('floater', 1, true) ~= nil or b:find('dunk', 1, true) ~= nil
+end
 local function stepShot(myModel)
     local action = attr(myModel, 'Action')
     local p0 = progressOf(myModel)
@@ -727,6 +735,8 @@ local function stepShot(myModel)
     end
 
     if shot.released or shot.autoFired or not on('BB_AutoRelease') then return end
+    -- Releasing during a layup turns it into a jelly: layups only when asked.
+    if isLayupShot(shot.action, attr(myModel, 'BaseAnimation')) and not on('BB_AutoLayup') then return end
     local peak = peakFor(meterInfo.meterType)
     local fire, mode, aim, su, lead = false, nil, aimFor(shot.key), nil, 0
     if peak and peak > 0 then
@@ -1338,7 +1348,8 @@ end)
 local Shoot = Tab:AddLeftGroupbox('Shooting')
 Shoot:AddToggle('BB_AutoRelease', { Text = 'Auto Release', Default = false })
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Auto Timing (learn from release grades)', Default = true })
-Shoot:AddToggle('BB_AnyMeter', { Text = 'Any Meter (layups, space shots)', Default = true })
+Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups (makes jellies)', Default = false })
+Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
 Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min = -100, Max = 150, Rounding = 0 })
 Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
