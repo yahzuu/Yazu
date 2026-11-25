@@ -58,9 +58,11 @@ if placeId == 10266164381 then
     Tabs.bloodlines = Window:AddTab('bloodlines')
 end
 
--- Basketball: matches either the place id or the universe (game) id.
-local BASKETBALL_ID = 80681221431821
-local isBasketball = placeId == BASKETBALL_ID or game.GameId == BASKETBALL_ID
+-- Basketball: two place ids from the user; GameId 7529591378 is the universe of
+-- place 119587547774646 (dump manifest), so every subplace of that game matches.
+local BASKETBALL_PLACES = { [80681221431821] = true, [119587547774646] = true }
+local BASKETBALL_GAME_ID = 7529591378
+local isBasketball = BASKETBALL_PLACES[placeId] == true or game.GameId == BASKETBALL_GAME_ID
 if isBasketball then
     Tabs.Basketball = Window:AddTab('Basketball')
 end
