@@ -606,6 +606,32 @@ local function fireRelease()
     return ok
 end
 
+-- After our release, your own key-up sends a second Shoot{Shoot=false}
+-- (Input.Keyboard KeyUp L306-L318). During a layup/dunk a second shoot
+-- message is the "press shoot again" jelly, so that duplicate is dropped
+-- until the shot ends. Needs hookmetamethod; without it nothing changes.
+local dupe = { untilT = -1, enabled = true, hooked = false }
+onCleanup(function() dupe.enabled = false end)
+do
+    local hmm, gnm, cc = hookmetamethod, getnamecallmethod, checkcaller
+    if ShootRemote and type(hmm) == 'function' and type(gnm) == 'function' and type(cc) == 'function' then
+        local old
+        local okH = pcall(function()
+            old = hmm(game, '__namecall', function(self, ...)
+                if dupe.enabled and self == ShootRemote and os.clock() < dupe.untilT and not cc() then
+                    local okM, method = pcall(gnm)
+                    local a = ...
+                    if okM and method == 'FireServer' and type(a) == 'table' and a.Shoot == false then
+                        return nil
+                    end
+                end
+                return old(self, ...)
+            end)
+        end)
+        dupe.hooked = okH and old ~= nil
+    end
+end
+
 local function oneWayPing()
     local ok, rtt = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if ok and type(rtt) == 'number' and rtt == rtt and rtt >= 0 and rtt < 2 then return rtt end
@@ -736,6 +762,7 @@ local function stepShot(myModel)
         }
     elseif not shooting and shot.active then
         shot.active = false
+        if dupe.untilT == math.huge then dupe.untilT = os.clock() + 0.3 end
         trace.last, trace.current = trace.current, nil
     end
     if not shot.active then return end
@@ -816,6 +843,7 @@ local function stepShot(myModel)
     end
     if fire then
         local ok = fireRelease()
+        if ok and on('BB_DropDupe') then dupe.untilT = math.huge end
         shot.autoFired = ok
         shot.firedAt = su
         shot.fireMode = mode
@@ -1415,6 +1443,7 @@ local function drawDebug()
     add('meter (server)  : type %s  green %s', tostring(meterInfo.meterType), tostring(meterInfo.green))
     add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
     add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
+    add('extra release   : %s', dupe.hooked and (os.clock() < dupe.untilT and 'dropping (shot in progress)' or 'ready') or 'hook unavailable')
     if lastFeedback then add('last grade      : %s, %s%% contested', tostring(lastFeedback.grade), tostring(lastFeedback.contest)) end
     add('contest scale   : x%.2f', contestScale)
     add('last error      : %s', tostring(diag.lastError or 'none'))
@@ -1440,6 +1469,7 @@ Shoot:AddToggle('BB_AutoTiming', { Text = 'Per-Animation Learning (optional)', D
 Shoot:AddToggle('BB_PerfectOnly', { Text = 'Train On Perfects Only', Default = true })
 Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = false })
 Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = false })
+Shoot:AddToggle('BB_DropDupe', { Text = 'Drop My Extra Release (stops auto-layup jellies)', Default = true })
 Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies (double-tap shoot)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
