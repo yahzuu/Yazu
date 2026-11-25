@@ -259,6 +259,23 @@ function Pure.fitCenter(history, w, W, lo, hi, prior)
     return pick
 end
 
+-- Least-squares line through points {t=, p=}: returns a, b with p = a + b*t.
+-- The meter rises in a straight line, so this gives its speed far more
+-- steadily than frame-to-frame differences (those swung 2.1 .. 3.9 within
+-- single shots in the traces because sample arrival times jitter).
+function Pure.linearFit(pts)
+    local n = #pts
+    if n < 2 then return nil end
+    local st, sp, stt, stp = 0, 0, 0, 0
+    for _, q in ipairs(pts) do
+        st, sp, stt, stp = st + q.t, sp + q.p, stt + q.t * q.t, stp + q.t * q.p
+    end
+    local den = n * stt - st * st
+    if math.abs(den) < 1e-12 then return nil end
+    local b = (n * stp - st * sp) / den
+    return (sp - b * st) / n, b
+end
+
 -- Exponential smoothing factor for a time step: 0 = no change, 1 = jump.
 function Pure.smoothAlpha(dt, tau)
     if tau <= 0 then return 1 end
@@ -598,6 +615,7 @@ local function resetShot()
     shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt, shot.fireMode = nil, false, nil, nil, nil
     shot.manualAt, shot.jelly = nil, nil
     shot.maxProgress, shot.peaked = 0, false
+    shot.pts, shot.t0, shot.fitA, shot.fitB = {}, nil, nil, nil
 end
 
 local function fireRelease()
@@ -723,10 +741,22 @@ local function isJellyShot()
 end
 -- Where the server's meter is (in "of the top" units) if a release left now.
 serverProgressNow = function(peak)
-    local rateU = math.abs(shot.rate or 0) / peak
-    if rateU < GAME.RateMin or rateU > GAME.RateMax then rateU = GAME.RateFallback end
     local lead = (on('BB_PingComp') and oneWayPing() or 0) + opt('BB_ExtraLeadMs', 0) / 1000
-    local u = Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked) / peak
+    local rate, p = math.abs(shot.rate or 0), Pure.effectiveProgress(shot.progress, shot.maxProgress, shot.peaked)
+    if on('BB_Smooth') and shot.fitB and not shot.peaked and shot.t0 then
+        -- Where the meter is right now on its line, not where the last
+        -- (already old) sample said: lets the release land between frames.
+        rate = shot.fitB
+        local now = os.clock() - shot.t0
+        local last = shot.pts[#shot.pts]
+        local ahead = last and math.min(now - last.t, 0.05) or 0
+        local fitP = shot.fitA + rate * (last and last.t or now)
+        if math.abs(fitP - p) < 0.05 then p = fitP end
+        p = p + rate * ahead
+    end
+    local rateU = rate / peak
+    if rateU < GAME.RateMin or rateU > GAME.RateMax then rateU = GAME.RateFallback end
+    local u = p / peak
     return Pure.serverProgress(u, rateU, lead), u, rateU, lead
 end
 -- Layup-type shot: a layup action, or a "Shooting" action whose animation
@@ -772,6 +802,17 @@ local function stepShot(myModel)
         local now = os.clock()
         if shot.prevProgress ~= p then
             shot.rate = Pure.updateRate(shot.rate, shot.prevProgress, p, shot.prevAt and now - shot.prevAt or 0, 0.5)
+            -- rising samples feed the straight-line fit (last 10)
+            if not shot.peaked and (shot.prevProgress == nil or p > shot.prevProgress) then
+                shot.t0 = shot.t0 or now
+                local pts = shot.pts
+                pts[#pts + 1] = { t = now - shot.t0, p = p }
+                if #pts > 10 then table.remove(pts, 1) end
+                if #pts >= 4 then
+                    local a, b = Pure.linearFit(pts)
+                    if a and b and b > 0 then shot.fitA, shot.fitB = a, b end
+                end
+            end
             shot.prevProgress, shot.prevAt = p, now
         end
         shot.progress = p
@@ -1370,6 +1411,12 @@ connect(RunService.Heartbeat, function(dt)
     if not okX then diag.lastError = 'auto: ' .. tostring(errX) end
 end)
 
+-- More checks per second = release lands closer to the exact moment.
+-- setfpscap is an executor function; without it this does nothing.
+local function applyFps()
+    if type(setfpscap) == 'function' then pcall(setfpscap, on('BB_FpsUnlock') and 240 or 60) end
+end
+
 local lastDraw = 0
 connect(RunService.RenderStepped, function()
     local now = os.clock()
@@ -1473,6 +1520,10 @@ Shoot:AddToggle('BB_DropDupe', { Text = 'Drop My Extra Release (stops auto-layup
 Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies (double-tap shoot)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
+Shoot:AddToggle('BB_Smooth', { Text = 'Between-Frame Timing', Default = true })
+Shoot:AddToggle('BB_FpsUnlock', { Text = 'Unlock FPS (240) for timing', Default = true })
+if Toggles.BB_FpsUnlock and Toggles.BB_FpsUnlock.OnChanged then Toggles.BB_FpsUnlock:OnChanged(applyFps) end
+applyFps()
 Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min = -100, Max = 150, Rounding = 0 })
 Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
     local parts = {}
