@@ -273,6 +273,94 @@ local shot = {
 }
 local targets = {}      -- [BaseAnimation] = progress to release at
 local lastFeedback = nil -- { grade, contest, key, releasedAt, auto }
+local contestScale = 1   -- learned: real contest / estimate at release
+local meterInfo = { meterType = nil, green = nil }
+local diag = { fired = 0, lastFire = 'none', lastError = nil, shots = 0 }
+local trace = { current = nil, last = nil }
+
+-- ---------------- learned targets survive rejoins ----------------
+local HttpService = game:GetService('HttpService')
+local TARGETS_FILE = 'YazuDumper/basketball_targets.json'
+
+local function saveTargets()
+    if type(writefile) ~= 'function' then return end
+    pcall(function()
+        if type(isfolder) == 'function' and type(makefolder) == 'function' and not isfolder('YazuDumper') then
+            makefolder('YazuDumper')
+        end
+        writefile(TARGETS_FILE, HttpService:JSONEncode({
+            placeVersion = game.PlaceVersion, contestScale = contestScale, targets = targets,
+        }))
+    end)
+end
+
+local function loadTargets()
+    if type(readfile) ~= 'function' or type(isfile) ~= 'function' then return end
+    local ok, data = pcall(function()
+        if not isfile(TARGETS_FILE) then return nil end
+        return HttpService:JSONDecode(readfile(TARGETS_FILE))
+    end)
+    if not ok or type(data) ~= 'table' then return end
+    if type(data.targets) == 'table' then
+        for k, v in pairs(data.targets) do
+            if type(k) == 'string' and type(v) == 'number' and v == v and v >= 0 and v < 100 then targets[k] = v end
+        end
+    end
+    if type(data.contestScale) == 'number' and data.contestScale == data.contestScale
+        and data.contestScale > 0.1 and data.contestScale < 10 then
+        contestScale = data.contestScale
+    end
+end
+loadTargets()
+
+-- ---------------- shot trace (what the game did, frame by frame) --
+local function traceEvent(kind, fields)
+    local t = trace.current or trace.last
+    if not t then return end
+    local e = { t = os.clock() - t.startedAt, kind = kind }
+    for k, v in pairs(fields or {}) do e[k] = v end
+    if #t.events < 200 then t.events[#t.events + 1] = e end
+end
+
+local function traceText(t)
+    if not t then return nil end
+    local out = {
+        '-- Yazu basketball shot trace',
+        'placeId=' .. tostring(game.PlaceId) .. ' placeVersion=' .. tostring(game.PlaceVersion),
+        'key(BaseAnimation)=' .. tostring(t.key) .. ' target=' .. tostring(t.target)
+            .. ' meterType=' .. tostring(t.meterType) .. ' green=' .. tostring(t.green),
+        'autoRelease=' .. tostring(t.auto) .. ' ping=' .. string.format('%.3f', t.ping or 0),
+        '',
+        '-- samples: t(s) action progress meterOffset released',
+    }
+    for _, smp in ipairs(t.samples) do
+        out[#out + 1] = string.format('%.3f  %s  %.4f  %s  %s', smp.t, tostring(smp.action), smp.progress or -1, tostring(smp.raw), tostring(smp.released))
+    end
+    out[#out + 1] = ''
+    out[#out + 1] = '-- events'
+    for _, e in ipairs(t.events) do
+        local parts = {}
+        for k, v in pairs(e) do if k ~= 't' and k ~= 'kind' then parts[#parts + 1] = k .. '=' .. tostring(v) end end
+        table.sort(parts)
+        out[#out + 1] = string.format('%.3f  %s  %s', e.t, e.kind, table.concat(parts, ' '))
+    end
+    return table.concat(out, '\n')
+end
+
+local function saveTrace(t)
+    local text = traceText(t)
+    if not text then return nil, 'no shot recorded yet' end
+    if type(writefile) ~= 'function' then return nil, 'writefile missing' end
+    local path = 'YazuDumper/bb_shot_' .. tostring(os.time()) .. '.txt'
+    local ok, err = pcall(function()
+        if type(isfolder) == 'function' and type(makefolder) == 'function' and not isfolder('YazuDumper') then
+            makefolder('YazuDumper')
+        end
+        writefile(path, text)
+    end)
+    if not ok then return nil, tostring(err) end
+    return path
+end
 
 local function progressOf(model)
     local v = attr(model, 'meterOffset')
@@ -283,7 +371,7 @@ end
 local function resetShot()
     shot.active, shot.released, shot.key = false, false, nil
     shot.progress, shot.prevProgress, shot.prevAt, shot.rate = 0, nil, nil, nil
-    shot.releasedAt, shot.autoFired = nil, false
+    shot.releasedAt, shot.autoFired, shot.estAtRelease, shot.firedAt = nil, false, nil, nil
 end
 
 local function fireRelease()
@@ -309,11 +397,55 @@ if FeedbackRemote then
             contest = tonumber(contest), key = key,
             releasedAt = shot.releasedAt, auto = shot.autoFired,
         }
-        if on('BB_AutoTiming') and gi and shot.releasedAt then
-            targets[key] = Pure.nextTarget(shot.releasedAt, gi, opt('BB_CalStep', 0.03))
+        if on('BB_AutoTiming') and gi then
+            -- After an auto release, correct the point we fired at (the server's
+            -- released value already includes network delay and would creep later
+            -- every shot). After a manual shot, start from where the server saw it.
+            local base = shot.autoFired and shot.firedAt or shot.releasedAt
+            if base then
+                targets[key] = Pure.nextTarget(base, gi, opt('BB_CalStep', 0.03))
+            end
+        end
+        local real = tonumber(contest)
+        if real and shot.estAtRelease and shot.estAtRelease > 0.05 then
+            local ratio = math.clamp((real / 100) / shot.estAtRelease, 0.2, 5)
+            contestScale = contestScale + (ratio - contestScale) * 0.3
+        end
+        traceEvent('feedback', { grade = lastFeedback.grade, contest = real, estimateAtRelease = shot.estAtRelease,
+            newTarget = targets[key], contestScale = contestScale })
+        saveTargets()
+        if on('BB_AutoSaveTrace') then
+            local path = saveTrace(trace.current or trace.last)
+            if path then Library:Notify('Shot trace: ' .. path, 4) end
         end
     end)
 end
+
+-- MeterService (Controllers.Meter L54-L98): which meter and green window the
+-- server registered for your character. Recorded for the trace.
+do
+    local svc = resolve({ 'ReplicatedStorage', 'Aero', 'AeroRemoteServices', 'MeterService' })
+    local reg = svc and svc:FindFirstChild('RegisterPacket')
+    local upd = svc and svc:FindFirstChild('UpdateGreenWindow')
+    if reg then
+        connect(reg.OnClientEvent, function(model, meterType, green)
+            if model == modelOf(LocalPlayer) then
+                meterInfo.meterType, meterInfo.green = meterType, green
+                traceEvent('registerPacket', { meterType = meterType, green = green })
+            end
+        end)
+    end
+    if upd then
+        connect(upd.OnClientEvent, function(model, green)
+            if model == modelOf(LocalPlayer) then
+                meterInfo.green = green
+                traceEvent('greenWindow', { green = green })
+            end
+        end)
+    end
+end
+
+local readContest -- defined in the contest section
 
 local function stepShot(myModel)
     local action = attr(myModel, 'Action')
@@ -321,10 +453,17 @@ local function stepShot(myModel)
     if shooting and not shot.active then
         resetShot()
         shot.active = true
+        diag.shots = diag.shots + 1
         local base = attr(myModel, 'BaseAnimation')
         shot.key = base and tostring(base) or '?'
+        trace.current = {
+            startedAt = os.clock(), key = shot.key, target = targets[shot.key],
+            meterType = meterInfo.meterType, green = meterInfo.green,
+            auto = on('BB_AutoRelease'), ping = oneWayPing() * 2, samples = {}, events = {},
+        }
     elseif not shooting and shot.active then
         shot.active = false
+        trace.last, trace.current = trace.current, nil
     end
     if not shot.active then return end
 
@@ -338,9 +477,22 @@ local function stepShot(myModel)
         shot.progress = p
     end
 
+    local t = trace.current
+    if t and #t.samples < 600 then
+        local last = t.samples[#t.samples]
+        local released = attr(myModel, 'ReleasedShot')
+        if not last or last.progress ~= p or last.released ~= released or last.action ~= action then
+            t.samples[#t.samples + 1] = { t = os.clock() - t.startedAt, action = action, progress = p,
+                raw = attr(myModel, 'meterOffset'), released = released }
+        end
+    end
+
     if attr(myModel, 'ReleasedShot') == true and not shot.released then
         shot.released = true
         shot.releasedAt = shot.progress
+        local okC, est = pcall(function() return (readContest(myModel)) end)
+        shot.estAtRelease = okC and est or nil
+        traceEvent('serverReleased', { progress = shot.progress, rate = shot.rate, estimate = shot.estAtRelease })
         return
     end
 
@@ -349,7 +501,12 @@ local function stepShot(myModel)
     local lead = on('BB_PingComp') and oneWayPing() / 2 or 0
     lead = lead + opt('BB_ExtraLeadMs', 0) / 1000
     if Pure.shouldRelease(shot.progress, shot.rate or 0, lead, target) then
-        if fireRelease() then shot.autoFired = true end
+        local ok = fireRelease()
+        shot.autoFired = ok
+        shot.firedAt = target
+        diag.fired = diag.fired + 1
+        diag.lastFire = string.format('%s at %.3f (target %.3f, lead %dms)', ok and 'sent' or 'FAILED', shot.progress, target, math.floor(lead * 1000))
+        traceEvent('autoRelease', { ok = ok, progress = shot.progress, rate = shot.rate, lead = lead, target = target })
     end
 end
 
@@ -427,7 +584,7 @@ onCleanup(destroyMeter)
 
 local GREEN, YELLOW, RED = Color3.fromRGB(80, 220, 120), Color3.fromRGB(240, 200, 70), Color3.fromRGB(240, 80, 80)
 
-local function readContest(myModel)
+readContest = function(myModel)
     local myRoot = rootOfModel(myModel)
     if not myRoot then return 0, nil, nil end
     local range = opt('BB_ContestRange', GAME.GuardReactRange)
@@ -461,15 +618,19 @@ local function drawMeter(myModel)
     buildMeter()
     if not meter.gui then return end
     meter.gui.Enabled = true
-    local score, who, dist = readContest(myModel)
+    local rawScore, who, dist = readContest(myModel)
+    local score = math.clamp(rawScore * contestScale, 0, 1)
     meter.fill.Size = UDim2.fromScale(score, 1)
     meter.fill.BackgroundColor3 = score < 0.34 and GREEN or (score < 0.67 and YELLOW or RED)
     if who then
-        meter.live.Text = string.format('EST. CONTEST %d%%  %s  %.1f studs', math.floor(score * 100 + 0.5), who.DisplayName, dist)
+        meter.live.Text = string.format('EST. CONTEST %d%%  %s  %.1f studs  (x%.2f)', math.floor(score * 100 + 0.5), who.DisplayName, dist, contestScale)
     else
         meter.live.Text = 'OPEN'
     end
-    if lastFeedback then
+    local base = attr(myModel, 'BaseAnimation')
+    if on('BB_AutoRelease') and base and targets[tostring(base)] == nil then
+        meter.last.Text = 'auto release: learning ' .. tostring(base) .. ', shoot normally'
+    elseif lastFeedback then
         meter.last.Text = string.format('last shot: %s%% contested, %s%s', lastFeedback.contest and tostring(math.floor(lastFeedback.contest + 0.5)) or '?',
             tostring(lastFeedback.grade), lastFeedback.auto and ' (auto)' or '')
     else
@@ -621,8 +782,10 @@ connect(RunService.Heartbeat, function()
         assist.active, assist.dir = false, nil
         return
     end
-    pcall(stepShot, myModel)
-    pcall(stepAssist, myModel)
+    local ok, err = pcall(stepShot, myModel)
+    if not ok then diag.lastError = 'shot: ' .. tostring(err) end
+    local okA, errA = pcall(stepAssist, myModel)
+    if not okA then diag.lastError = 'assist: ' .. tostring(errA) end
 end)
 
 local lastDraw = 0
@@ -632,6 +795,79 @@ connect(RunService.RenderStepped, function()
     lastDraw = now
     local myModel = modelOf(LocalPlayer)
     if myModel then pcall(drawMeter, myModel) elseif meter.gui then meter.gui.Enabled = false end
+end)
+
+-- ================================================================
+--  DEBUG PANEL
+-- ================================================================
+
+local dbg = {}
+local function buildDebug()
+    if dbg.gui then return end
+    local parent
+    if type(gethui) == 'function' then
+        local ok, h = pcall(gethui)
+        if ok then parent = h end
+    end
+    parent = parent or LocalPlayer:FindFirstChildOfClass('PlayerGui')
+    if not parent then return end
+    local gui = Instance.new('ScreenGui')
+    gui.Name = 'YazuBBDebug'
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 1001
+    local t = Instance.new('TextLabel')
+    t.Position = UDim2.fromOffset(12, 60)
+    t.Size = UDim2.fromOffset(460, 230)
+    t.BackgroundColor3 = Color3.fromRGB(12, 12, 16)
+    t.BackgroundTransparency = 0.2
+    t.BorderSizePixel = 0
+    t.Font = Enum.Font.Code
+    t.TextSize = 13
+    t.TextColor3 = Color3.fromRGB(230, 230, 240)
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.TextYAlignment = Enum.TextYAlignment.Top
+    t.TextWrapped = true
+    t.Parent = gui
+    gui.Parent = parent
+    dbg.gui, dbg.text = gui, t
+end
+onCleanup(function() if dbg.gui then pcall(function() dbg.gui:Destroy() end) end dbg = {} end)
+
+local function drawDebug()
+    if not on('BB_Debug') then
+        if dbg.gui then dbg.gui.Enabled = false end
+        return
+    end
+    buildDebug()
+    if not dbg.gui then return end
+    dbg.gui.Enabled = true
+    local m = modelOf(LocalPlayer)
+    local lines = {}
+    local function add(...) lines[#lines + 1] = string.format(...) end
+    add('character model : %s', m and m:GetFullName() or 'NOT FOUND in workspace.Characters')
+    add('shoot remote    : %s   feedback: %s', ShootRemote and 'ok' or 'MISSING', FeedbackRemote and 'ok' or 'MISSING')
+    if m then
+        add('Action          : %q   ReleasedShot: %s', tostring(attr(m, 'Action')), tostring(attr(m, 'ReleasedShot')))
+        add('meterOffset     : %s', tostring(attr(m, 'meterOffset')))
+        add('BaseAnimation   : %s', tostring(attr(m, 'BaseAnimation')))
+    end
+    add('shot active     : %s  progress %.4f  rate %.3f/s', tostring(shot.active), shot.progress or 0, shot.rate or 0)
+    add('target          : %s', shot.key and tostring(targets[shot.key]) or '(no shot yet)')
+    add('meter (server)  : type %s  green %s', tostring(meterInfo.meterType), tostring(meterInfo.green))
+    add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
+    add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
+    if lastFeedback then add('last grade      : %s, %s%% contested', tostring(lastFeedback.grade), tostring(lastFeedback.contest)) end
+    add('contest scale   : x%.2f', contestScale)
+    add('last error      : %s', tostring(diag.lastError or 'none'))
+    dbg.text.Text = table.concat(lines, '\n')
+end
+
+local lastDbg = 0
+connect(RunService.RenderStepped, function()
+    local now = os.clock()
+    if now - lastDbg < 0.1 then return end
+    lastDbg = now
+    pcall(drawDebug)
 end)
 
 -- ================================================================
@@ -652,7 +888,15 @@ Shoot:AddButton({ Text = 'Show Learned Targets', Func = function()
 end })
 Shoot:AddButton({ Text = 'Reset Learned Targets', Func = function()
     targets = {}
+    saveTargets()
     Library:Notify('Learned targets cleared')
+end })
+Shoot:AddDivider()
+Shoot:AddToggle('BB_Debug', { Text = 'Debug Panel', Default = false })
+Shoot:AddToggle('BB_AutoSaveTrace', { Text = 'Auto-save shot traces', Default = false })
+Shoot:AddButton({ Text = 'Save Last Shot Trace', Func = function()
+    local path, err = saveTrace(trace.last or trace.current)
+    Library:Notify(path and ('Saved workspace/' .. path) or ('Trace: ' .. tostring(err)), 6)
 end })
 Shoot:AddLabel('Auto Release needs a learned target: shoot normally a few times with Auto Timing on, then enable it.', true)
 if not ShootRemote then Shoot:AddLabel('!! InputService.Shoot remote not found; Auto Release is off', true) end
