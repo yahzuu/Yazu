@@ -688,6 +688,17 @@ local readContest -- defined in the contest section
 
 local meterWatch = { last = nil }
 local spaceKey = { down = false, at = -1 } -- Space Maker: see the input hooks below
+-- Jelly finish: matched by animation name. The game's client code has no
+-- "jelly" label, so the names are a setting (default is a guess: the
+-- inside-hand finishes InsideHandLayup1L/R seen in your save file).
+local function isJellyShot(base)
+    local b = tostring(base or ''):lower()
+    for part in tostring(opt('BB_JellyAnims', 'InsideHand')):gmatch('[^,]+') do
+        local pat = part:gsub('^%s+', ''):gsub('%s+$', ''):lower()
+        if pat ~= '' and b:find(pat, 1, true) then return true end
+    end
+    return false
+end
 -- Where the server's meter is (in "of the top" units) if a release left now.
 serverProgressNow = function(peak)
     local rateU = math.abs(shot.rate or 0) / peak
@@ -780,7 +791,14 @@ local function stepShot(myModel)
 
     if shot.released or shot.autoFired or not on('BB_AutoRelease') then return end
     -- Releasing during a layup turns it into a jelly: layups only when asked.
-    if isLayupShot(shot.action, attr(myModel, 'BaseAnimation')) and not on('BB_AutoLayup') then return end
+    local base = attr(myModel, 'BaseAnimation')
+    if isLayupShot(shot.action, base) then
+        if isJellyShot(base) then
+            if not on('BB_AutoJelly') then return end
+        elseif not on('BB_AutoLayup') then
+            return
+        end
+    end
     -- Space pressed during/just before the shot: let your Space Maker happen.
     if on('BB_SpaceSkip') and (spaceKey.down or os.clock() - spaceKey.at < 0.5) then return end
     local peak = peakFor(meterInfo.meterType)
@@ -1417,7 +1435,9 @@ Shoot:AddToggle('BB_SpaceSkip', { Text = 'Let Me Space Make (no auto release aft
 Shoot:AddToggle('BB_AutoTiming', { Text = 'Per-Animation Learning (optional)', Default = false })
 Shoot:AddToggle('BB_PerfectOnly', { Text = 'Train On Perfects Only', Default = true })
 Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = false })
-Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups (makes jellies)', Default = true })
+Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups', Default = true })
+Shoot:AddToggle('BB_AutoJelly', { Text = 'Auto Release Jellies', Default = false })
+Shoot:AddInput('BB_JellyAnims', { Default = 'InsideHand', Text = 'Jelly animations (comma separated)', Placeholder = 'e.g. InsideHand,Reverse', Finished = true })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
 Shoot:AddSlider('BB_ExtraLeadMs', { Text = 'Extra Lead (ms)', Default = 0, Min = -100, Max = 150, Rounding = 0 })
