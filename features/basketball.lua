@@ -302,10 +302,12 @@ local GAME = {
     MeterPeaks = { Funnel = 0.982, Funnel2 = 0.982, Pill = 0.982, Bat = 0.982, Hoop = 0.982,
         Arrow = 0.953, None = 0.943, Tube = 0.913, Diamond = 0.913, Roblox = 0.913, Rocket = 0.914,
         Vertical = 1.467 },
-    -- Starting aim in server-progress units before anything is learned
-    -- (middle of the Perfect spread 1.000 .. 1.039 above). Each jumpshot
-    -- animation then learns its own.
-    DefaultAim = 1.02,
+    -- One aim for every shot, in server-progress units: the point that
+    -- covers the most Perfects (37 of 48 within +-0.02) across 13 animations
+    -- in the user's traces and save file (jumpers, fades, layups, close
+    -- shots). No training needed. Optional per-animation learning can
+    -- still refine it (Auto Timing, off by default).
+    DefaultAim = 1.035,
     -- Grade bands around the best point, in server-progress units, from the
     -- same traces: Perfects spread over ~0.04, Goods reached ~0.06 out.
     PerfectHalfWidth = 0.02, GoodHalfWidth = 0.06,
@@ -461,6 +463,7 @@ local function shotKey(model)
 end
 
 local function aimFor(key)
+    if not on('BB_AutoTiming') then return GAME.DefaultAim end
     local st = learn[key]
     if on('BB_PerfectOnly') then return st and st.targetPerf or GAME.DefaultAim end
     return st and st.target or GAME.DefaultAim
@@ -684,6 +687,7 @@ end
 local readContest -- defined in the contest section
 
 local meterWatch = { last = nil }
+local spaceKey = { down = false, at = -1 } -- Space Maker: see the input hooks below
 -- Where the server's meter is (in "of the top" units) if a release left now.
 serverProgressNow = function(peak)
     local rateU = math.abs(shot.rate or 0) / peak
@@ -777,6 +781,8 @@ local function stepShot(myModel)
     if shot.released or shot.autoFired or not on('BB_AutoRelease') then return end
     -- Releasing during a layup turns it into a jelly: layups only when asked.
     if isLayupShot(shot.action, attr(myModel, 'BaseAnimation')) and not on('BB_AutoLayup') then return end
+    -- Space pressed during/just before the shot: let your Space Maker happen.
+    if on('BB_SpaceSkip') and (spaceKey.down or os.clock() - spaceKey.at < 0.5) then return end
     local peak = peakFor(meterInfo.meterType)
     local fire, mode, aim, su, lead = false, nil, aimFor(shot.key), nil, 0
     if peak and peak > 0 then
@@ -829,6 +835,16 @@ onCleanup(function() if meterHook.conn then meterHook.conn:Disconnect() end end)
 -- or jump key goes up (Input.Keyboard KeyUp handler, L306-L318), so that
 -- instant is when your release left. Remembered for learning.
 local MANUAL_KEYS = { E = true, Space = true, ButtonX = true, ButtonA = true }
+-- Space Maker (badge ability): pressing jump while shooting. Remember when
+-- space went down so a shot started from space can be left to you.
+connect(UserInputService.InputBegan, function(input)
+    local name = input and input.KeyCode and input.KeyCode.Name
+    if name == 'Space' or name == 'ButtonA' then spaceKey.down, spaceKey.at = true, os.clock() end
+end)
+connect(UserInputService.InputEnded, function(input)
+    local name = input and input.KeyCode and input.KeyCode.Name
+    if name == 'Space' or name == 'ButtonA' then spaceKey.down = false end
+end)
 connect(UserInputService.InputEnded, function(input)
     local name = input and input.KeyCode and input.KeyCode.Name
     if not MANUAL_KEYS[name] or not shot.active or shot.released or shot.autoFired or shot.manualAt then return end
@@ -1397,9 +1413,10 @@ end)
 
 local Shoot = Tab:AddLeftGroupbox('Shooting')
 Shoot:AddToggle('BB_AutoRelease', { Text = 'Auto Release', Default = false })
-Shoot:AddToggle('BB_AutoTiming', { Text = 'Auto Timing (learn from release grades)', Default = true })
+Shoot:AddToggle('BB_SpaceSkip', { Text = 'Let Me Space Make (no auto release after Space)', Default = true })
+Shoot:AddToggle('BB_AutoTiming', { Text = 'Per-Animation Learning (optional)', Default = false })
 Shoot:AddToggle('BB_PerfectOnly', { Text = 'Train On Perfects Only', Default = true })
-Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = true })
+Shoot:AddToggle('BB_LearnManual', { Text = 'Learn From My Releases', Default = false })
 Shoot:AddToggle('BB_AutoLayup', { Text = 'Auto Release Layups (makes jellies)', Default = false })
 Shoot:AddToggle('BB_AnyMeter', { Text = 'Track Unknown Meter Actions', Default = false })
 Shoot:AddToggle('BB_PingComp', { Text = 'Prefire for Ping', Default = true })
@@ -1427,7 +1444,7 @@ Shoot:AddButton({ Text = 'Save Last Shot Trace', Func = function()
     local path, err = saveTrace(trace.last or trace.current)
     Library:Notify(path and ('Saved workspace/' .. path) or ('Trace: ' .. tostring(err)), 6)
 end })
-Shoot:AddLabel('Prefires by your ping like a manual player. Works on every meter type; timing is learned per jumpshot/layup animation and saved to YazuDumper/basketball_targets.json, so it carries over between executes.', true)
+Shoot:AddLabel('Prefires by your ping like a manual player, on every meter type, with one aim measured from your Perfects. No training needed. Use Extra Lead (ms) to nudge: + releases earlier, - later.', true)
 if not ShootRemote then Shoot:AddLabel('!! InputService.Shoot remote not found; Auto Release is off', true) end
 if not FeedbackRemote then Shoot:AddLabel('!! InterfaceService.ShowFeedback not found; Auto Timing cannot learn', true) end
 
