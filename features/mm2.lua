@@ -103,6 +103,20 @@ function Pure.pickServer(servers, mode, currentJobId, rand)
     local r = rand or math.random
     return ok[r(1, #ok)]
 end
+-- Role for one player. data = the round table entry from
+-- Remotes.Gameplay.GetCurrentPlayerData ({ Role=, Dead= }); hasKnife / hasGun =
+-- a tool named Knife / Gun in their Backpack or character. Tools win when the
+-- round data is missing or stale (the Hero picks up the gun mid-round).
+function Pure.roleOf(data, hasKnife, hasGun)
+    if hasKnife then return 'Murderer' end
+    local r = type(data) == 'table' and data.Role or nil
+    if hasGun then
+        if r == 'Sheriff' then return 'Sheriff' end
+        return 'Hero'
+    end
+    if r == 'Murderer' or r == 'Sheriff' or r == 'Hero' or r == 'Innocent' then return r end
+    return 'Innocent'
+end
 -- <<< PURE
 
 return function(State, Tabs, Services, Library)
@@ -432,6 +446,210 @@ local function applyBoost()
 end
 if Toggles.MM2_FpsBoost then Toggles.MM2_FpsBoost:OnChanged(applyBoost) end
 onCleanup(function() if on('MM2_FpsBoost') then Toggles.MM2_FpsBoost:SetValue(false) end end)
+
+-- ================================================================
+--  ROUND: roles, ESP, dropped gun, round panel
+-- ================================================================
+-- Remotes.Gameplay.GetCurrentPlayerData  RemoteFunction -> { [playerName] = { Role, Dead, Perk, CodeName, Color } }
+-- Remotes.Gameplay.PlayerDataChanged     RemoteEvent (same table) (Modules.CurrentRoundClient L9-L35)
+-- Tools named "Knife" / "Gun" sit in the holder's Backpack or character (dump: Players.<name>.Backpack.Knife / .Gun)
+-- workspace.RoundTimerPart attributes Time, RoundLength
+-- Dropped gun name "GunDrop": UNCONFIRMED (no round was mid-drop in the dump)
+local round = { data = {}, roles = {}, lastAnnounce = nil, gunDropSeen = false }
+
+task.spawn(function()
+    local r = RepStorage:WaitForChild('Remotes', 20)
+    local g = r and r:WaitForChild('Gameplay', 20)
+    if not g then return end
+    local getData = g:WaitForChild('GetCurrentPlayerData', 20)
+    local changed = g:WaitForChild('PlayerDataChanged', 20)
+    if changed then connect(changed.OnClientEvent, function(d) if type(d) == 'table' then round.data = d end end) end
+    if getData then
+        local ok, d = pcall(getData.InvokeServer, getData)
+        if ok and type(d) == 'table' then round.data = d end
+    end
+end)
+
+local function hasTool(p, name)
+    local bp = p:FindFirstChildOfClass('Backpack')
+    if bp and bp:FindFirstChild(name) then return true end
+    local c = p.Character
+    return c ~= nil and c:FindFirstChild(name) ~= nil
+end
+
+local ROLE_COL = { Murderer = Color3.fromRGB(255, 50, 50), Sheriff = Color3.fromRGB(60, 140, 255),
+    Hero = Color3.fromRGB(255, 220, 60), Innocent = Color3.fromRGB(90, 255, 120) }
+
+local espFolder = Instance.new('Folder')
+espFolder.Name = 'ESP'
+espFolder.Parent = screen
+local esp = {}
+local function clearEsp(p)
+    local e = esp[p]
+    if e then pcall(function() e.hl:Destroy() end); pcall(function() e.bb:Destroy() end); esp[p] = nil end
+end
+connect(Players.PlayerRemoving, clearEsp)
+onCleanup(function() for p in pairs(esp) do clearEsp(p) end end)
+
+local function drawPlayer(p, role, dead)
+    local c = p.Character
+    local hrp = c and c:FindFirstChild('HumanoidRootPart')
+    local want = hrp and not (dead and not on('MM2_ShowDead'))
+        and ((role == 'Murderer' and on('MM2_MurdererESP')) or ((role == 'Sheriff' or role == 'Hero') and on('MM2_SheriffESP'))
+        or (role == 'Innocent' and on('MM2_InnocentESP')))
+    if not want then clearEsp(p) return end
+    local e = esp[p]
+    if not e then
+        local hl = Instance.new('Highlight')
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.FillTransparency = 0.65
+        hl.Parent = espFolder
+        local bb = Instance.new('BillboardGui')
+        bb.AlwaysOnTop = true
+        bb.Size = UDim2.fromOffset(150, 30)
+        bb.StudsOffset = Vector3.new(0, 3.2, 0)
+        local l = Instance.new('TextLabel')
+        l.BackgroundTransparency = 1
+        l.Size = UDim2.fromScale(1, 1)
+        l.Font = Enum.Font.GothamBold
+        l.TextSize = 13
+        l.TextStrokeTransparency = 0.3
+        l.Parent = bb
+        bb.Parent = espFolder
+        e = { hl = hl, bb = bb, label = l }
+        esp[p] = e
+    end
+    local col = dead and Color3.fromRGB(130, 130, 130) or ROLE_COL[role]
+    e.hl.Adornee = c
+    e.hl.FillColor, e.hl.OutlineColor = col, col
+    e.bb.Adornee = hrp
+    local me = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild('HumanoidRootPart')
+    local d = me and math.floor((me.Position - hrp.Position).Magnitude + 0.5)
+    e.label.TextColor3 = col
+    e.label.Text = string.format('%s  %s%s%s', p.DisplayName, role, dead and ' (dead)' or '', d and (' [' .. d .. ']') or '')
+end
+
+-- dropped gun
+local gunMark
+local function findGunDrop()
+    local direct = workspace:FindFirstChild('GunDrop', true)
+    if direct then return direct end
+    return nil
+end
+
+-- round panel
+local roundBox = Instance.new('TextLabel')
+roundBox.Position = UDim2.fromOffset(16, 260)
+roundBox.Size = UDim2.fromOffset(260, 10)
+roundBox.AutomaticSize = Enum.AutomaticSize.Y
+roundBox.BackgroundColor3 = Color3.fromRGB(16, 14, 22)
+roundBox.BackgroundTransparency = 0.2
+roundBox.Font = Enum.Font.Code
+roundBox.TextSize = 14
+roundBox.RichText = true
+roundBox.TextWrapped = true
+roundBox.TextXAlignment = Enum.TextXAlignment.Left
+roundBox.TextYAlignment = Enum.TextYAlignment.Top
+roundBox.TextColor3 = Color3.fromRGB(235, 235, 245)
+roundBox.Active = true
+roundBox.Draggable = true
+roundBox.Visible = false
+roundBox.Parent = screen
+do
+    local c = Instance.new('UICorner'); c.CornerRadius = UDim.new(0, 8); c.Parent = roundBox
+    local pd = Instance.new('UIPadding'); pd.PaddingLeft = UDim.new(0, 8); pd.PaddingTop = UDim.new(0, 6); pd.PaddingBottom = UDim.new(0, 6); pd.Parent = roundBox
+end
+local function hex(c) return string.format('%02x%02x%02x', math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5)) end
+
+local RoundGrp = Tab:AddLeftGroupbox('Round ESP')
+RoundGrp:AddToggle('MM2_MurdererESP', { Text = 'Murderer ESP', Default = true })
+RoundGrp:AddToggle('MM2_SheriffESP', { Text = 'Sheriff / Hero ESP', Default = true })
+RoundGrp:AddToggle('MM2_InnocentESP', { Text = 'Innocent ESP', Default = false })
+RoundGrp:AddToggle('MM2_ShowDead', { Text = 'Keep ESP on dead players', Default = false })
+RoundGrp:AddToggle('MM2_GunESP', { Text = 'Dropped gun ESP + alert', Default = true,
+    Tooltip = 'Looks for a part or model named GunDrop. That name is UNCONFIRMED from the dump.' })
+RoundGrp:AddToggle('MM2_RoleNotify', { Text = 'Announce roles when found', Default = true })
+RoundGrp:AddToggle('MM2_RoundPanel', { Text = 'Round panel (who has what, timer)', Default = true })
+
+local acc = 0
+connect(game:GetService('RunService').Heartbeat, function(dt)
+    acc = acc + dt
+    if acc < 0.2 then return end
+    acc = 0
+
+    local murderer, sheriff, alive, total = nil, nil, 0, 0
+    local rows = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        local d = round.data[p.Name]
+        local role = Pure.roleOf(d, hasTool(p, 'Knife'), hasTool(p, 'Gun'))
+        local dead = type(d) == 'table' and d.Dead == true
+        round.roles[p] = role
+        if type(d) == 'table' then
+            total = total + 1
+            if not dead then alive = alive + 1 end
+        end
+        if role == 'Murderer' then murderer = p end
+        if role == 'Sheriff' or role == 'Hero' then sheriff = p end
+        if role ~= 'Innocent' then rows[#rows + 1] = { p, role, dead } end
+        if p ~= LocalPlayer then pcall(drawPlayer, p, role, dead) end
+    end
+
+    -- announce once per new pair
+    local key = (murderer and murderer.Name or '-') .. '|' .. (sheriff and sheriff.Name or '-')
+    if key ~= round.lastAnnounce and (murderer or sheriff) then
+        round.lastAnnounce = key
+        if on('MM2_RoleNotify') then
+            notify(string.format('Murderer: %s   Sheriff: %s', murderer and murderer.DisplayName or '?', sheriff and sheriff.DisplayName or '?'), 6)
+        end
+    end
+
+    -- gun drop
+    local drop = on('MM2_GunESP') and findGunDrop()
+    local dropPart = drop and (drop:IsA('BasePart') and drop or drop:FindFirstChildWhichIsA('BasePart', true))
+    if dropPart then
+        if not gunMark then
+            gunMark = Instance.new('BillboardGui')
+            gunMark.AlwaysOnTop = true
+            gunMark.Size = UDim2.fromOffset(120, 26)
+            local l = Instance.new('TextLabel')
+            l.BackgroundTransparency = 1
+            l.Size = UDim2.fromScale(1, 1)
+            l.Font = Enum.Font.GothamBlack
+            l.TextSize = 14
+            l.TextColor3 = Color3.fromRGB(255, 220, 60)
+            l.TextStrokeTransparency = 0.2
+            l.Text = 'GUN'
+            l.Parent = gunMark
+            gunMark.Parent = espFolder
+        end
+        gunMark.Adornee = dropPart
+        if not round.gunDropSeen then
+            round.gunDropSeen = true
+            notify('The gun was dropped!', 5)
+        end
+    else
+        if gunMark then gunMark:Destroy(); gunMark = nil end
+        round.gunDropSeen = false
+    end
+
+    -- panel
+    roundBox.Visible = on('MM2_RoundPanel')
+    if roundBox.Visible then
+        local L = {}
+        local t = workspace:FindFirstChild('RoundTimerPart')
+        local left = t and t:GetAttribute('Time')
+        L[#L + 1] = '<b>Round</b>' .. (left and string.format('   %d:%02d left', math.floor(left) // 60, math.floor(left) % 60) or '')
+        local mine = round.roles[LocalPlayer]
+        if mine then L[#L + 1] = 'You: <font color="#' .. hex(ROLE_COL[mine]) .. '">' .. mine .. '</font>' end
+        if total > 0 then L[#L + 1] = string.format('Alive: %d / %d', alive, total) end
+        for _, r in ipairs(rows) do
+            L[#L + 1] = string.format('<font color="#%s">%s</font>  %s%s', hex(ROLE_COL[r[2]]), r[2], r[1].DisplayName,
+                r[3] and ' (dead)' or (hasTool(r[1], 'Knife') and '  [knife]' or (hasTool(r[1], 'Gun') and '  [gun]' or '')))
+        end
+        if dropPart then L[#L + 1] = '<font color="#ffdc3c">Gun is on the ground</font>' end
+        roundBox.Text = table.concat(L, '\n')
+    end
+end)
 
 notify('Yazu MM2 loaded', 3)
 
