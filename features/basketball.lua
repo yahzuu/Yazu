@@ -332,6 +332,19 @@ function Pure.smoothAlpha(dt, tau)
     return 1 - math.exp(-math.max(dt, 0) / tau)
 end
 
+-- Velocity from two flat positions. Other players' roots are Anchored on
+-- your client (Controllers.Replication L371-373) and moved by CFrame, so
+-- their AssemblyLinearVelocity is always 0; speed has to come from how
+-- far they moved. Returns the smoothed (vx, vz). A jump faster than
+-- maxSpeed is a teleport/reset and is ignored.
+function Pure.velStep(vx, vz, ox, oz, nx, nz, dt, tau, maxSpeed)
+    if dt <= 0 then return vx, vz end
+    local rx, rz = (nx - ox) / dt, (nz - oz) / dt
+    if rx * rx + rz * rz > maxSpeed * maxSpeed then return vx, vz end
+    local a = Pure.smoothAlpha(dt, tau)
+    return vx + (rx - vx) * a, vz + (rz - vz) * a
+end
+
 -- <<< PURE
 
 return function(State, Tabs, Services, Library)
@@ -494,6 +507,33 @@ local function isOpponent(player, myModel)
     local myTeam = tonumber(myModel and attr(myModel, 'Team')) or 0
     local theirTeam = tonumber(attr(theirs, 'Team')) or 0
     return Pure.isOpponentTeam(myTeam, theirTeam), theirs
+end
+
+-- Real speed of a root part, also for anchored (replicated) ones.
+local velTrack = setmetatable({}, { __mode = 'k' })
+local function trackVelocities()
+    local now = os.clock()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then
+            local m = modelOf(p)
+            local root = m and rootOfModel(m)
+            if root then
+                local pos = root.Position
+                local t = velTrack[root]
+                if not t or now - t.t > 0.5 then
+                    velTrack[root] = { x = pos.X, z = pos.Z, t = now, vx = 0, vz = 0 }
+                elseif now - t.t >= 1 / 90 then
+                    t.vx, t.vz = Pure.velStep(t.vx, t.vz, t.x, t.z, pos.X, pos.Z, now - t.t, 0.08, 60)
+                    t.x, t.z, t.t = pos.X, pos.Z, now
+                end
+            end
+        end
+    end
+end
+local function velOf(root)
+    if not root.Anchored then return root.AssemblyLinearVelocity end
+    local t = velTrack[root]
+    return t and Vector3.new(t.vx, 0, t.vz) or Vector3.zero
 end
 
 -- ================================================================
@@ -1115,7 +1155,7 @@ readContest = function(myModel)
                 -- contests from farther away; fading away adds space).
                 local useDist = dist
                 if on('BB_ContestPredict') then
-                    local mv, dv = myRoot.AssemblyLinearVelocity, root.AssemblyLinearVelocity
+                    local mv, dv = myRoot.AssemblyLinearVelocity, velOf(root)
                     local t = opt('BB_ContestLookMs', 350) / 1000
                     if typeof(mv) == 'Vector3' and typeof(dv) == 'Vector3' then
                         useDist = math.min(dist, Pure.predictDist(my.X, my.Z, mv.X, mv.Z, d.X, d.Z, dv.X, dv.Z, t))
@@ -1543,12 +1583,15 @@ end
 
 auto.lastAutoDribble = 0
 local function stepAutoDribble(myModel, myRoot, now)
-    if not on('BB_AutoDribble') or auto.dribbleBusy or not DribbleRemote then return end
+    local function why(s) diag.dribbleWhy = s end
+    if not on('BB_AutoDribble') then return why('off') end
+    if not DribbleRemote then return why('dribble remote not found') end
+    if auto.dribbleBusy then return why('one-key move running') end
     local kp = Options and Options.BB_AutoDribbleKey
-    if kp and kp.Value and kp.Value ~= 'None' and not keyHeld('BB_AutoDribbleKey') then return end
-    if not attr(myModel, 'Basketball') then return end
+    if kp and kp.Value and kp.Value ~= 'None' and not keyHeld('BB_AutoDribbleKey') then return why('hold key not held') end
+    if not attr(myModel, 'Basketball') then return why('no ball') end
     local action = attr(myModel, 'Action')
-    if action ~= '' and action ~= 'Dribbling' and action ~= 'Moving' and action ~= nil then return end
+    if action ~= '' and action ~= 'Dribbling' and action ~= 'Moving' and action ~= nil then return why('busy: ' .. tostring(action)) end
     if now - auto.lastAutoDribble < math.max(opt('BB_DribbleDelay', 0.35), opt('BB_AutoDribbleGap', 0.7)) then return end
     local my = myRoot.Position
     local best, bestD
@@ -1560,12 +1603,16 @@ local function stepAutoDribble(myModel, myRoot, now)
             if not bestD or d < bestD then best, bestD = root, d end
         end
     end
-    if not best then return end
-    local dv = best.AssemblyLinearVelocity
-    if typeof(dv) ~= 'Vector3' then return end
+    if not best then return why('no opponent found') end
+    local dv = velOf(best)
+    local range = opt('BB_AutoDribbleRange', 9)
+    if bestD > range then return why(string.format('closest defender %.1f studs (range %d)', bestD, range)) end
     local kind, side = Pure.dribbleDecision(my.X, my.Z, best.Position.X, best.Position.Z, dv.X, dv.Z,
-        opt('BB_AutoDribbleRange', 9), opt('BB_BiteSpeed', 6), 8, 5)
-    if not kind then return end
+        range, opt('BB_BiteSpeed', 6), 8, 5)
+    if not kind then
+        local ux0, uz0 = Pure.unit(best.Position.X - my.X, best.Position.Z - my.Z)
+        return why(string.format('watching: side speed %.1f / bite %.1f', math.abs(dv.X * -uz0 + dv.Z * ux0), opt('BB_BiteSpeed', 6)))
+    end
     local rx, rz = best.Position.X - my.X, best.Position.Z - my.Z
     local ux, uz = Pure.unit(rx, rz)
     local dirX, dirZ, combo, sprint
@@ -1583,16 +1630,17 @@ local function stepAutoDribble(myModel, myRoot, now)
     -- never dribble toward out of bounds: test ~7 studs along the move
     local boxes = courtBoxes()
     if not Pure.insideBoxes(my.X + dirX * 7, my.Z + dirZ * 7, boxes) then
-        if kind ~= 'cross' then return end
+        if kind ~= 'cross' then return why('stepback blocked: out of bounds') end
         -- try the other side instead
         local px, pz = uz * side, -ux * side
         dirX, dirZ = Pure.unit(px + ux * 0.4, pz + uz * 0.4)
-        if not Pure.insideBoxes(my.X + dirX * 7, my.Z + dirZ * 7, boxes) then return end
+        if not Pure.insideBoxes(my.X + dirX * 7, my.Z + dirZ * 7, boxes) then return why('cross blocked: out of bounds both ways') end
         combo = combo == 'Z' and 'C' or 'Z'
     end
     auto.lastAutoDribble = now
     pcall(function() DribbleRemote:FireServer(combo, sprint, Vector3.new(dirX, 0, dirZ)) end)
     diag.lastDribble = string.format('%s %s (%.1f studs)', kind, combo, bestD)
+    why('fired ' .. kind)
 end
 
 local function stepAuto(myModel)
@@ -1631,6 +1679,7 @@ connect(RunService.Heartbeat, function(dt)
     if not ok then diag.lastError = 'shot: ' .. tostring(err) end
     local okA, errA = pcall(stepAssist, myModel)
     if not okA then diag.lastError = 'assist: ' .. tostring(errA) end
+    pcall(trackVelocities)
     local okX, errX = pcall(stepAuto, myModel)
     if not okX then diag.lastError = 'auto: ' .. tostring(errX) end
 end)
@@ -1715,6 +1764,7 @@ local function drawDebug()
     add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
     add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
     add('auto dribble    : %s', tostring(diag.lastDribble or 'none'))
+    add('dribble status  : %s', tostring(diag.dribbleWhy or '-'))
     add('extra release   : %s', dupe.hooked and (os.clock() < dupe.untilT and 'dropping (shot in progress)' or 'ready') or 'hook unavailable')
     if lastFeedback then add('last grade      : %s, %s%% contested', tostring(lastFeedback.grade), tostring(lastFeedback.contest)) end
     add('contest scale   : x%.2f', contestScale)
