@@ -66,6 +66,12 @@ local isBasketball = BASKETBALL_PLACES[placeId] == true or game.GameId == BASKET
 if isBasketball then
     Tabs.Basketball = Window:AddTab('Basketball')
 end
+
+-- Murder mystery: PlaceId 142823291, GameId 66654135 (dump manifest).
+local isMM2 = placeId == 142823291 or game.GameId == 66654135
+if isMM2 then
+    Tabs.MM2 = Window:AddTab('MM2')
+end
 -- UI Settings must always be last
 Tabs['UI Settings'] = Window:AddTab('UI Settings')
 
@@ -112,6 +118,10 @@ end
 
 if isBasketball then
     safeLoad('features/basketball.lua')
+end
+
+if isMM2 then
+    safeLoad('features/mm2.lua')
 end
 
 -- ── 6. UI Settings tab ────────────────────────────────────────
