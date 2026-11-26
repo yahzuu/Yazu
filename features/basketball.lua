@@ -290,6 +290,42 @@ function Pure.isMovingShot(name)
     return b:find('fade', 1, true) ~= nil or b:find('moving', 1, true) ~= nil
 end
 
+-- Auto dribble decision from the closest defender (all flat, studs and
+-- studs/s). Returns nil, or a move kind and the side to go:
+--   'cross', side  : defender drifting sideways ("biting") faster than
+--                    biteSpeed -> cross the other way (side = -1 left / 1 right
+--                    of the line from you to the defender)
+--   'stepback'     : defender closing in fast and already close
+-- Soul Snatcher (Config.Enum): defenders stumble more "when biting the
+-- wrong way", which is what 'cross' waits for.
+function Pure.dribbleDecision(mx, mz, dx, dz, dvx, dvz, range, biteSpeed, closeSpeed, closeDist)
+    local rx, rz = dx - mx, dz - mz
+    local dist = math.sqrt(rx * rx + rz * rz)
+    if dist < 1e-3 or dist > range then return nil end
+    local ux, uz = rx / dist, rz / dist
+    local px, pz = -uz, ux -- right-hand side of you->defender
+    local lateral = dvx * px + dvz * pz
+    local closing = -(dvx * ux + dvz * uz)
+    if closing > closeSpeed and dist < closeDist then return 'stepback', 0, dist end
+    if math.abs(lateral) > biteSpeed then return 'cross', lateral > 0 and -1 or 1, dist end
+    return nil
+end
+
+-- Is a flat point inside any of the court's bound boxes
+-- (workspace.Assets.CourtBounds, the same check as
+-- Characters.Character:IsInCourtBounds L698-L720, ignoring height)?
+-- boxes = { {cx=, cz=, rx=, rz=, hx=, hz=} } with r = unit right axis.
+function Pure.insideBoxes(x, z, boxes)
+    if #boxes == 0 then return true end
+    for _, b in ipairs(boxes) do
+        local ox, oz = x - b.cx, z - b.cz
+        local lx = ox * b.rx + oz * b.rz
+        local lz = -ox * b.rz + oz * b.rx
+        if math.abs(lx) <= b.hx and math.abs(lz) <= b.hz then return true end
+    end
+    return false
+end
+
 -- Exponential smoothing factor for a time step: 0 = no change, 1 = jump.
 function Pure.smoothAlpha(dt, tau)
     if tau <= 0 then return 1 end
@@ -1482,6 +1518,83 @@ local function runMove(move, myModel)
     end)
 end
 
+-- Court boxes, refreshed every few seconds.
+local courtCache = { at = -10, boxes = {} }
+local function courtBoxes()
+    local now = os.clock()
+    if now - courtCache.at < 5 then return courtCache.boxes end
+    courtCache.at = now
+    local boxes = {}
+    local assets = workspace:FindFirstChild('Assets')
+    local cb = assets and assets:FindFirstChild('CourtBounds')
+    if cb then
+        for _, part in ipairs(cb:GetChildren()) do
+            if part:IsA('BasePart') then
+                local r = part.CFrame.RightVector
+                local rx, rz = Pure.unit(r.X, r.Z)
+                boxes[#boxes + 1] = { cx = part.Position.X, cz = part.Position.Z, rx = rx, rz = rz,
+                    hx = part.Size.X / 2, hz = part.Size.Z / 2 }
+            end
+        end
+    end
+    courtCache.boxes = boxes
+    return boxes
+end
+
+auto.lastAutoDribble = 0
+local function stepAutoDribble(myModel, myRoot, now)
+    if not on('BB_AutoDribble') or auto.dribbleBusy or not DribbleRemote then return end
+    local kp = Options and Options.BB_AutoDribbleKey
+    if kp and kp.Value and kp.Value ~= 'None' and not keyHeld('BB_AutoDribbleKey') then return end
+    if not attr(myModel, 'Basketball') then return end
+    local action = attr(myModel, 'Action')
+    if action ~= '' and action ~= 'Dribbling' and action ~= 'Moving' and action ~= nil then return end
+    if now - auto.lastAutoDribble < math.max(opt('BB_DribbleDelay', 0.35), opt('BB_AutoDribbleGap', 0.7)) then return end
+    local my = myRoot.Position
+    local best, bestD
+    for _, p in ipairs(Players:GetPlayers()) do
+        local opp, model = isOpponent(p, myModel)
+        local root = opp and rootOfModel(model)
+        if root then
+            local d = Pure.flatDist(my.X, my.Z, root.Position.X, root.Position.Z)
+            if not bestD or d < bestD then best, bestD = root, d end
+        end
+    end
+    if not best then return end
+    local dv = best.AssemblyLinearVelocity
+    if typeof(dv) ~= 'Vector3' then return end
+    local kind, side = Pure.dribbleDecision(my.X, my.Z, best.Position.X, best.Position.Z, dv.X, dv.Z,
+        opt('BB_AutoDribbleRange', 9), opt('BB_BiteSpeed', 6), 8, 5)
+    if not kind then return end
+    local rx, rz = best.Position.X - my.X, best.Position.Z - my.Z
+    local ux, uz = Pure.unit(rx, rz)
+    local dirX, dirZ, combo, sprint
+    if kind == 'cross' then
+        -- sideways (away from where they bit) and a bit forward past them
+        local px, pz = -uz * side, ux * side
+        dirX, dirZ = Pure.unit(px + ux * 0.4, pz + uz * 0.4)
+        local leftSide = side < 0
+        if on('BB_SwapCross') then leftSide = not leftSide end
+        combo, sprint = leftSide and 'Z' or 'C', true
+    else
+        dirX, dirZ = -ux, -uz
+        combo, sprint = (on('BB_AutoDribbleSnatch') and 'XX' or 'VV'), true
+    end
+    -- never dribble toward out of bounds: test ~7 studs along the move
+    local boxes = courtBoxes()
+    if not Pure.insideBoxes(my.X + dirX * 7, my.Z + dirZ * 7, boxes) then
+        if kind ~= 'cross' then return end
+        -- try the other side instead
+        local px, pz = uz * side, -ux * side
+        dirX, dirZ = Pure.unit(px + ux * 0.4, pz + uz * 0.4)
+        if not Pure.insideBoxes(my.X + dirX * 7, my.Z + dirZ * 7, boxes) then return end
+        combo = combo == 'Z' and 'C' or 'Z'
+    end
+    auto.lastAutoDribble = now
+    pcall(function() DribbleRemote:FireServer(combo, sprint, Vector3.new(dirX, 0, dirZ)) end)
+    diag.lastDribble = string.format('%s %s (%.1f studs)', kind, combo, bestD)
+end
+
 local function stepAuto(myModel)
     local myRoot = rootOfModel(myModel)
     if not myRoot then return end
@@ -1489,6 +1602,7 @@ local function stepAuto(myModel)
     stepSteal(myModel, myRoot, now)
     stepBlock(myModel, myRoot, now)
     stepRebound(myModel, myRoot, now)
+    stepAutoDribble(myModel, myRoot, now)
     local held = keyHeld('BB_DribbleKey')
     if held and not auto.dribbleKeyWas then runDribbleMacro() end
     auto.dribbleKeyWas = held
@@ -1600,6 +1714,7 @@ local function drawDebug()
     add('meter (server)  : type %s  green %s', tostring(meterInfo.meterType), tostring(meterInfo.green))
     add('auto release    : %s   fired %d   last: %s', on('BB_AutoRelease') and 'ON' or 'off', diag.fired, diag.lastFire)
     add('shots seen      : %d   ping %dms', diag.shots, math.floor(oneWayPing() * 2000))
+    add('auto dribble    : %s', tostring(diag.lastDribble or 'none'))
     add('extra release   : %s', dupe.hooked and (os.clock() < dupe.untilT and 'dropping (shot in progress)' or 'ready') or 'hook unavailable')
     if lastFeedback then add('last grade      : %s, %s%% contested', tostring(lastFeedback.grade), tostring(lastFeedback.contest)) end
     add('contest scale   : x%.2f', contestScale)
@@ -1701,6 +1816,14 @@ Ball:AddInput('BB_DribbleCombo', { Default = 'Z,X', Text = 'Dribble Macro (combo
 Ball:AddSlider('BB_DribbleDelay', { Text = 'Delay Between Moves (s)', Default = 0.35, Min = 0.05, Max = 1.5, Rounding = 2 })
 Ball:AddToggle('BB_DribbleSprint', { Text = 'Send as Sprinting', Default = false })
 Ball:AddLabel('Dribble Macro Key'):AddKeyPicker('BB_DribbleKey', { Default = 'None', Text = 'Dribble Macro', Mode = 'Hold' })
+Ball:AddDivider()
+Ball:AddToggle('BB_AutoDribble', { Text = 'Auto Dribble (cross when they bite)', Default = false })
+Ball:AddLabel('Auto Dribble Key (optional)'):AddKeyPicker('BB_AutoDribbleKey', { Default = 'None', Text = 'Auto Dribble (hold)', Mode = 'Hold' })
+Ball:AddSlider('BB_BiteSpeed', { Text = 'Bite Speed (studs/s)', Default = 6, Min = 2, Max = 16, Rounding = 1 })
+Ball:AddSlider('BB_AutoDribbleRange', { Text = 'Defender Range (studs)', Default = 9, Min = 3, Max = 20, Rounding = 1 })
+Ball:AddSlider('BB_AutoDribbleGap', { Text = 'Min Time Between Moves (s)', Default = 0.7, Min = 0.2, Max = 2, Rounding = 2 })
+Ball:AddToggle('BB_AutoDribbleSnatch', { Text = 'Use Snatchback (else Stepback) on closeouts', Default = false })
+Ball:AddToggle('BB_SwapCross', { Text = 'Swap Crossover Sides', Default = false })
 Ball:AddDivider()
 Ball:AddLabel('One-key moves (set a key for each):', true)
 for _, mv in ipairs(MOVES) do
